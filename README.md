@@ -6,7 +6,12 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
 
 ## What works
 
-- resizable projects sidebar with the real local Canopy checkout and worktree;
+- empty-state onboarding with the native macOS folder picker;
+- attaching and detaching folders or Git repositories, persisted in the app data directory;
+- live discovery with `git worktree list --porcelain` and a project/worktree sidebar;
+- creating a new branch and worktree under `~/canopy/worktrees`;
+- preflighted removal of non-main worktrees, with dirty, unpublished-commit,
+  and submodule warnings before explicit force consent;
 - worktree-local tab lists and remembered active tab;
 - dynamically allocated terminal sessions, limited by host resources rather
   than an application constant;
@@ -14,12 +19,9 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
 - terminal focus, input, resize, scrollback, selection, ANSI colors, and rendering
   handled by Native SDK's `libghostty-vt` integration;
 - opening, activating, and closing terminal tabs;
-- window geometry restore and hidden-inset native macOS chrome.
-
-The fixture paths are intentionally explicit in `src/main.zig` so this first PoC
-boots against the exact local checkouts it was made to evaluate. Project picker,
-Git worktree discovery, persistence, and safe worktree mutations belong to the
-next slice.
+- window geometry restore and hidden-inset native macOS chrome;
+- terminal shutdown fencing: removal/detach waits for every owned PTY exit
+  before mutating Git state or hiding the project.
 
 ## Run
 
@@ -60,6 +62,29 @@ emulation behind each numeric key. Tabs from another worktree remain alive but
 are filtered from the current tab strip, so switching worktrees restores that
 worktree's last active tab.
 
+Attached directory paths are stored under the platform app-data directory. At
+startup missing paths are discarded, repositories are rediscovered, and plain
+folders remain valid projects. Detach changes only Canopy state; it never
+deletes project files or Git worktrees.
+
+Persistence writes are serialized, coalesced to the newest snapshot, and use
+Native SDK's atomic file replacement inside the permitted app-data root. The
+folder picker stays disabled until the startup snapshot has been restored.
+
+Worktree creation validates the branch name, rejects an existing target or
+local branch, creates the branch, then checks it out. If checkout fails, the
+branch is deliberately retained and Git state is refreshed; avoiding automatic
+branch deletion is safer when other Git clients may be active concurrently.
+Removal accepts only a discovered, non-main worktree and keeps its branch.
+After the user confirms removal, owned PTYs are closed and the complete safety
+preflight runs again; any changed result returns to the confirmation dialog.
+
+All Git subprocesses share one zero-backlog execution lane. A command retains
+the lane until its matching exit result is delivered; UI mutations are disabled
+in the meantime and extra requests are rejected instead of queued. Native SDK
+does not impose an app-side process timeout, so slow Git operations can finish
+naturally without spawning polling or retry work on the host.
+
 Native SDK/CLI is pinned to `0.10.1` by `package-lock.json`. The reproducible
 patch in `patches/` replaces its fixed four-session tables with dynamic stores
 and serves every macOS PTY from one `kqueue` reactor. Ghostty remains pinned to
@@ -71,19 +96,18 @@ and serves every macOS PTY from one `kqueue` reactor. Ghostty remains pinned to
   become a maintained fork or upstream contribution.
 - `ptySpawn` has no public `cwd` option. The PoC passes the worktree as a separate
   argv item to a small `zsh` bootstrap, avoiding path interpolation.
-- Project/worktree fixtures are local constants; no `git worktree add/remove` is
-  performed.
 - Tab metadata is not persisted yet; terminal processes are intentionally not
   restorable sessions.
+- Worktree creation currently covers new local branches only; attaching an
+  existing branch and choosing a base branch are not implemented yet.
 - Closing a live tab keeps it in `closing` until Native SDK confirms process-tree
   shutdown. Dynamic transport and emulator entries are then retired without
   imposing a new application-level session limit.
 
 ## Next production slice
 
-1. folder picker plus `git -C <repo> worktree list --porcelain` discovery;
-2. persistent project and per-worktree tab metadata;
-3. preflighted worktree create/remove commands;
-4. reopen-closed-tab history;
-5. virtualized tab chrome, keyboard shortcuts, and tab reordering;
-6. split panes and cross-platform epoll/IOCP reactors.
+1. persistent per-worktree tab metadata and lazy session restore;
+2. existing/base branch choices during worktree creation;
+3. reopen-closed-tab history;
+4. virtualized tab chrome, keyboard shortcuts, and tab reordering;
+5. split panes and cross-platform epoll/IOCP reactors.

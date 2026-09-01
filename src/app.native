@@ -1,4 +1,5 @@
 <!-- Canopy's project -> worktree -> tabs shape, rendered entirely by Native SDK. -->
+<stack grow="1">
 <column grow="1" background="background">
   <row height="52" padding="10" gap="8" cross="center" background="surface" window-drag="true" label="Canopy title bar">
     <spacer width="{chrome_leading}" />
@@ -7,50 +8,45 @@
     <badge variant="secondary">Native SDK PoC</badge>
     <spacer grow="1" />
     <text size="sm" foreground="text_muted">{activeWorkspaceName}</text>
-    <button size="sm" variant="primary" icon="plus" on-press="open_active_terminal" label="New terminal">Terminal</button>
+    <button size="sm" variant="ghost" icon="folder-open" on-press="open_folder" label="Attach folder" disabled="{attachDisabled}">Attach</button>
+    <if test="{hasProjects}"><button size="sm" variant="primary" icon="plus" on-press="open_active_terminal" label="New terminal">Terminal</button></if>
   </row>
   <separator />
 
-  <split grow="1" value="{sidebar_fraction}" on-resize="sidebar_resized" gap="1">
+  <if test="{hasProjects}">
+    <split grow="1" value="{sidebar_fraction}" on-resize="sidebar_resized" gap="1">
     <column min-width="230" background="surface">
       <row height="42" padding="12" cross="center">
         <text grow="1">Projects</text>
-        <badge>3 workspaces</badge>
+        <badge>{projectCount}</badge>
       </row>
       <separator />
       <scroll grow="1" label="Projects and worktrees">
         <tree padding="8" gap="2">
-          <row height="28" padding="6" gap="7" cross="center" role="treeitem" expanded="true" label="Canopy Desktop project">
-            <icon name="folder-open" width="15" height="15" foreground="accent" />
-            <text>Canopy Desktop</text>
-          </row>
-          <for each="canopyWorkspaces" key="id" as="w">
-            <list-item height="44" padding="7" gap="7" cross="center" tree-level="2" role="treeitem" selected="{w.id == active_workspace_id}" on-press="select_workspace:{w.id}" label="{w.name}">
-              <spacer width="10" />
-              <icon name="git-branch" width="14" height="14" foreground="text_muted" />
-              <column grow="1" gap="2">
-                <text wrap="false">{w.name}</text>
-                <text size="sm" foreground="text_muted" wrap="false">{w.branch} · {w.kind}</text>
-              </column>
-              <button width="26" height="26" size="icon" variant="ghost" icon="terminal" on-press="open_terminal:{w.id}" label="Open terminal"></button>
-            </list-item>
-          </for>
-
-          <spacer height="8" />
-          <row height="28" padding="6" gap="7" cross="center" role="treeitem" expanded="true" label="Native SDK PoC project">
-            <icon name="folder-open" width="15" height="15" foreground="accent" />
-            <text>Native SDK PoC</text>
-          </row>
-          <for each="nativeWorkspaces" key="id" as="w">
-            <list-item height="44" padding="7" gap="7" cross="center" tree-level="2" role="treeitem" selected="{w.id == active_workspace_id}" on-press="select_workspace:{w.id}" label="{w.name}">
-              <spacer width="10" />
-              <icon name="git-branch" width="14" height="14" foreground="text_muted" />
-              <column grow="1" gap="2">
-                <text wrap="false">{w.name}</text>
-                <text size="sm" foreground="text_muted" wrap="false">{w.branch} · {w.kind}</text>
-              </column>
-              <button width="26" height="26" size="icon" variant="ghost" icon="terminal" on-press="open_terminal:{w.id}" label="Open terminal"></button>
-            </list-item>
+          <for each="sidebarRows" key="key" as="row">
+            <if test="{row.kind == 'project'}">
+              <list-item height="38" padding="6" gap="7" cross="center" role="treeitem" expanded="true" label="{row.name}">
+                <icon name="folder-open" width="15" height="15" foreground="accent" />
+                <column grow="1" gap="1">
+                  <text wrap="false">{row.name}</text>
+                  <text size="sm" foreground="text_muted">{row.detail}</text>
+                </column>
+                <if test="{row.is_git}"><button width="26" height="26" size="icon" variant="ghost" icon="plus" on-press="begin_create_worktree:{row.project_id}" label="New worktree" disabled="{gitBusy}"></button></if>
+                <button width="26" height="26" size="icon" variant="ghost" icon="x" on-press="request_detach_project:{row.project_id}" label="Detach project" disabled="{gitBusy}"></button>
+              </list-item>
+            </if>
+            <if test="{row.kind == 'worktree'}">
+              <list-item height="44" padding="7" gap="7" cross="center" tree-level="2" role="treeitem" selected="{row.selected}" on-press="select_workspace:{row.workspace_id}" label="{row.name}">
+                <spacer width="10" />
+                <icon name="git-branch" width="14" height="14" foreground="text_muted" />
+                <column grow="1" gap="2">
+                  <text wrap="false">{row.name}</text>
+                  <text size="sm" foreground="text_muted" wrap="false">{row.detail}</text>
+                </column>
+                <if test="{row.can_remove}"><button width="26" height="26" size="icon" variant="ghost" icon="trash" on-press="request_remove_worktree:{row.workspace_id}" label="Remove worktree" disabled="{gitBusy}"></button></if>
+                <button width="26" height="26" size="icon" variant="ghost" icon="terminal" on-press="open_terminal:{row.workspace_id}" label="Open terminal"></button>
+              </list-item>
+            </if>
           </for>
         </tree>
       </scroll>
@@ -113,7 +109,82 @@
         </column>
       </else>
     </column>
-  </split>
+    </split>
+  </if>
+  <else>
+    <column grow="1" main="center" cross="center" gap="12" padding="40">
+      <icon name="folder-open" width="42" height="42" foreground="text_muted" />
+      <text size="heading">Attach your first project</text>
+      <text foreground="text_muted">Choose a folder or Git repository to start working.</text>
+      <button variant="primary" size="lg" icon="folder-open" on-press="open_folder" autofocus="true" disabled="{attachDisabled}">Open Folder...</button>
+    </column>
+  </else>
 
   <status-bar>{status_text} · Native PTY / libghostty-vt · host-limited sessions</status-bar>
 </column>
+
+<if test="{create_dialog_open}">
+  <panel background="scrim" on-press="cancel_create_worktree" label="Create worktree backdrop">
+    <column grow="1" main="center" cross="center">
+      <dialog width="440" height="220" label="Create Worktree">
+        <column padding="20" gap="12">
+          <text size="heading">New worktree</text>
+          <text size="sm" foreground="text_muted">Create a new branch and checkout for {createProjectName}.</text>
+          <text-field text="{createBranchText}" placeholder="feature/my-change" autofocus="true" on-input="edit_create_branch" on-submit="confirm_create_worktree" label="Branch name" />
+          <spacer grow="1" />
+          <row gap="8" main="end">
+            <button variant="ghost" on-press="cancel_create_worktree">Cancel</button>
+            <button variant="primary" on-press="confirm_create_worktree" disabled="{createDisabled}">Create</button>
+          </row>
+        </column>
+      </dialog>
+    </column>
+  </panel>
+</if>
+
+<if test="{remove_dialog_open}">
+  <panel background="scrim" on-press="cancel_remove_worktree" label="Remove worktree backdrop">
+    <column grow="1" main="center" cross="center">
+      <dialog width="460" height="280" label="Remove Worktree">
+        <column padding="20" gap="12">
+          <text size="heading">Remove {removeWorktreeName}?</text>
+          <text size="sm" foreground="text_muted" wrap="true">{removeWorktreePath}</text>
+          <if test="{removeHasWarnings}">
+            <alert variant="destructive" text="This worktree needs explicit force consent.">
+              <column gap="4">
+                <if test="{removeDirty}"><text size="sm">It contains uncommitted changes.</text></if>
+                <if test="{removeHasSubmodules}"><text size="sm">It contains submodule configuration that Git may refuse to remove safely.</text></if>
+                <if test="{removeUnmergedCount > 0}"><text size="sm">{removeUnmergedCount} commit(s) are not present on any remote.</text></if>
+              </column>
+            </alert>
+          </if>
+          <else><text size="sm">The checkout is clean. Its branch will be kept.</text></else>
+          <spacer grow="1" />
+          <row gap="8" main="end">
+            <button variant="ghost" on-press="cancel_remove_worktree">Cancel</button>
+            <button variant="destructive" on-press="confirm_remove_worktree" disabled="{gitBusy}">Remove</button>
+          </row>
+        </column>
+      </dialog>
+    </column>
+  </panel>
+</if>
+
+<if test="{detach_dialog_open}">
+  <panel background="scrim" on-press="cancel_detach_project" label="Detach project backdrop">
+    <column grow="1" main="center" cross="center">
+      <dialog width="430" height="210" label="Detach Project">
+        <column padding="20" gap="12">
+          <text size="heading">Detach {detachProjectName}?</text>
+          <text wrap="true" foreground="text_muted">Open terminals owned by this project will be closed. No project files or Git worktrees will be deleted.</text>
+          <spacer grow="1" />
+          <row gap="8" main="end">
+            <button variant="ghost" on-press="cancel_detach_project">Cancel</button>
+            <button variant="primary" on-press="confirm_detach_project" disabled="{gitBusy}">Detach</button>
+          </row>
+        </column>
+      </dialog>
+    </column>
+  </panel>
+</if>
+</stack>
