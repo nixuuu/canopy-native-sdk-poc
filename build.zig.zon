@@ -1,0 +1,19 @@
+.{
+    .name = .canopy_native_sdk_poc,
+    .fingerprint = 0xe9b8ba015a707070,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .native_sdk = .{
+            // npm pins the exact SDK/CLI build and patch-package applies
+            // Canopy's dynamic PTY reactor patch reproducibly at install.
+            .path = "node_modules/@native-sdk/cli",
+        },
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/7aa9591746ffa4d2eee458960c76554352832595.tar.gz",
+            .hash = "ghostty-1.3.2-dev-5UdBC-edJAVXTdYsgHOzIqgAI7hE8VqpmriEi8zgufw2",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.json" },
+}

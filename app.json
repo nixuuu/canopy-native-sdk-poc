@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.native-sdk.dev/app/v1.json",
+  "id": "tech.itsol.canopy.native-poc",
+  "name": "canopy-native-sdk-poc",
+  "display_name": "Canopy Native PoC",
+  "description": "A native Canopy shell with project worktrees and terminal tabs.",
+  "version": "0.1.0",
+  "icons": ["assets/icon.png"],
+  "platforms": ["macos"],
+  "permissions": ["view", "command"],
+  "capabilities": ["native_views", "gpu_surfaces"],
+  "shell": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Canopy",
+        "width": 1180,
+        "height": 760,
+        "min_width": 860,
+        "min_height": 560,
+        "restore_policy": "center_on_primary",
+        "titlebar": "hidden_inset_tall",
+        "views": [
+          {
+            "label": "main-canvas",
+            "kind": "gpu_surface",
+            "fill": true,
+            "role": "Canopy workspace",
+            "accessibility_label": "Canopy",
+            "gpu_backend": "metal",
+            "gpu_pixel_format": "bgra8_unorm",
+            "gpu_present_mode": "timer",
+            "gpu_alpha_mode": "opaque",
+            "gpu_color_space": "srgb",
+            "gpu_vsync": true
+          }
+        ]
+      }
+    ]
+  },
+  "security": {
+    "navigation": {
+      "allowed_origins": ["zero://app", "zero://inline"],
+      "external_links": { "action": "deny" }
+    }
+  },
+  "web_engine": "system"
+}

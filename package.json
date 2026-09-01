@@ -1,0 +1,33 @@
+{
+  "name": "canopy-native-sdk-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Canopy desktop proof of concept built with Native SDK and native terminal sessions.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "postinstall": "patch-package",
+    "dev": "native dev --yes",
+    "dev:automation": "native dev --yes -Dautomation=true",
+    "check": "native check --strict",
+    "test": "native test --yes",
+    "build": "native build --yes",
+    "doctor": "native doctor --strict --manifest app.json",
+    "format": "zig fmt build.zig src/*.zig",
+    "format:check": "zig fmt --check build.zig src/*.zig",
+    "verify": "npm run format:check && npm run check && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@native-sdk/cli": "0.10.1",
+    "patch-package": "8.0.1"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "packageManager": "npm@11.12.1",
+  "volta": {
+    "node": "24.15.0",
+    "npm": "11.12.1"
+  }
+}

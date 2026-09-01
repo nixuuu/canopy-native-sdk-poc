@@ -1,0 +1,1116 @@
+diff --git a/node_modules/@native-sdk/cli/src/runtime/core.zig b/node_modules/@native-sdk/cli/src/runtime/core.zig
+index e780399..45a7ce4 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/core.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/core.zig
+@@ -931,7 +931,7 @@ pub const Runtime = struct {
+     pub const gpuSurfaceFrame = CanvasFrameMethods.gpuSurfaceFrame;
+     pub const setCanvasFrameBudget = CanvasFrameMethods.setCanvasFrameBudget;
+     pub const setGpuSurfaceInputLatencyBudget = CanvasFrameMethods.setGpuSurfaceInputLatencyBudget;
+-    const requestCanvasFrameForView = CanvasFrameMethods.requestCanvasFrameForView;
++    pub const requestCanvasFrameForView = CanvasFrameMethods.requestCanvasFrameForView;
+     const invalidateForCanvasChanges = CanvasFrameMethods.invalidateForCanvasChanges;
+ 
+     const CanvasImageMethods = runtime_canvas_images.RuntimeCanvasImages(Runtime);
+diff --git a/node_modules/@native-sdk/cli/src/runtime/effects.zig b/node_modules/@native-sdk/cli/src/runtime/effects.zig
+index ce420b0..55de6d9 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/effects.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/effects.zig
+@@ -1102,12 +1102,16 @@ pub const max_effect_channel_pending: usize = 32;
+ /// occupancy like a channel, not a run-to-completion worker slot. One
+ /// live terminal surface plus a background job or two is the realistic
+ /// shape; a fifth spawn is refused loudly (reason `.rejected`).
+-pub const max_effect_ptys: usize = 4;
++/// PTY occupancies are dynamically allocated. This nullable export keeps the
++/// public capability discoverable without imposing an application limit.
++pub const max_effect_ptys: ?usize = null;
+ /// Longest one delivered pty output record: one Msg payload, one
+ /// journal blob. Output arriving between drains coalesces into batches
+ /// of at most this size — `cat largefile` journals per-drain batches,
+ /// never per-read records.
+-pub const max_effect_pty_chunk_bytes: usize = 64 * 1024;
++/// UI-side delivery quantum. The staging ring remains 256 KiB and lossless;
++/// 4 KiB keeps one terminal flood from monopolizing a Debug-frame VT parse.
++pub const max_effect_pty_chunk_bytes: usize = 4 * 1024;
+ /// The cross-thread output staging ring per pty. When it fills, the io
+ /// thread stops reading the parent end until the loop drains — kernel
+ /// back-pressure to the child, a terminal's native flow control. Bytes
+@@ -2453,8 +2457,6 @@ fn ptyStageOutput(shared: *PtyShared, generation: u64, bytes: []const u8) void {
+                     _ = owner.pending.fetchAdd(1, .seq_cst);
+                     stamped = true;
+                 }
+-            } else if (take > 0) {
+-                stamped = true;
+             }
+         }
+     }
+@@ -2544,6 +2546,247 @@ fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation
+     }
+ }
+ 
++/// One stable registration in the Darwin kqueue reactor. Registrations are
++/// retained until reactor teardown so a queued kernel event can never point at
++/// freed memory; `active` and `generation` make stale events inert.
++const PtyReactorEntry = struct {
++    active: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
++    reclaim_after: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    shared: *PtyShared,
++    transport: pty_transport.Pty,
++    generation: u64,
++};
++
++const PtyReactor = struct {
++    allocator: std.mem.Allocator,
++    platform: pty_transport.Reactor,
++    mutex: SpinMutex = .{},
++    entries: std.ArrayListUnmanaged(*PtyReactorEntry) = .empty,
++    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
++    epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
++    thread: std.Thread,
++
++    fn create(allocator: std.mem.Allocator) ?*PtyReactor {
++        if (comptime !pty_transport.reactor_supported) return null;
++        const reactor = allocator.create(PtyReactor) catch return null;
++        const reactor_platform = pty_transport.Reactor.init() catch {
++            allocator.destroy(reactor);
++            return null;
++        };
++        reactor.* = .{
++            .allocator = allocator,
++            .platform = reactor_platform,
++            .thread = undefined,
++        };
++        reactor.thread = std.Thread.spawn(.{}, run, .{reactor}) catch {
++            reactor.platform.deinit();
++            allocator.destroy(reactor);
++            return null;
++        };
++        return reactor;
++    }
++
++    fn destroy(self: *PtyReactor) void {
++        self.shutdown.store(true, .release);
++        self.platform.wake();
++        self.thread.join();
++        for (self.entries.items) |entry| self.allocator.destroy(entry);
++        self.entries.deinit(self.allocator);
++        self.platform.deinit();
++        const allocator = self.allocator;
++        allocator.destroy(self);
++    }
++
++    fn add(self: *PtyReactor, shared: *PtyShared, transport: pty_transport.Pty, generation: u64) ?*PtyReactorEntry {
++        const entry = self.allocator.create(PtyReactorEntry) catch return null;
++        entry.* = .{ .shared = shared, .transport = transport, .generation = generation };
++        self.mutex.lock();
++        self.entries.append(self.allocator, entry) catch {
++            self.mutex.unlock();
++            self.allocator.destroy(entry);
++            return null;
++        };
++        self.mutex.unlock();
++        if (!self.platform.register(transport, @ptrCast(entry))) {
++            entry.active.store(false, .release);
++            return null;
++        }
++        self.platform.wake();
++        return entry;
++    }
++
++    fn remove(self: *PtyReactor, entry: *PtyReactorEntry) void {
++        if (entry.active.swap(false, .acq_rel)) self.platform.remove(entry.transport);
++        // Two completed kevent batches fence every event that could still
++        // carry this udata pointer. Reclamation may wait longer while idle,
++        // but never races a stale kernel event.
++        entry.reclaim_after.store(self.epoch.load(.acquire) + 2, .release);
++        self.platform.wake();
++    }
++
++    fn resumeRead(self: *PtyReactor, entry: *PtyReactorEntry) void {
++        if (!entry.active.load(.acquire)) return;
++        self.platform.setReadable(entry.transport, true, @ptrCast(entry));
++        self.platform.wake();
++    }
++
++    fn enableWrite(self: *PtyReactor, entry: *PtyReactorEntry) void {
++        if (!entry.active.load(.acquire)) return;
++        self.platform.setWritable(entry.transport, true, @ptrCast(entry));
++        self.platform.wake();
++    }
++
++    fn notify(self: *PtyReactor) void {
++        self.platform.wake();
++    }
++
++    fn run(self: *PtyReactor) void {
++        var events: [64]pty_transport.ReactorEvent = undefined;
++        while (!self.shutdown.load(.acquire)) {
++            const count = self.platform.wait(&events);
++            if (self.shutdown.load(.acquire)) break;
++            var index: usize = 0;
++            while (index < count) : (index += 1) {
++                const event = events[index];
++                if (event.control) {
++                    self.sweepControl();
++                    continue;
++                }
++                const raw = event.token orelse continue;
++                const entry: *PtyReactorEntry = @ptrCast(@alignCast(raw));
++                if (!entry.active.load(.acquire)) continue;
++                self.service(entry, event);
++            }
++            const epoch = self.epoch.fetchAdd(1, .acq_rel) + 1;
++            self.reclaim(epoch);
++        }
++    }
++
++    fn reclaim(self: *PtyReactor, epoch: u64) void {
++        self.mutex.lock();
++        defer self.mutex.unlock();
++        var index: usize = 0;
++        while (index < self.entries.items.len) {
++            const entry = self.entries.items[index];
++            const after = entry.reclaim_after.load(.acquire);
++            if (after == 0 or after > epoch) {
++                index += 1;
++                continue;
++            }
++            _ = self.entries.swapRemove(index);
++            self.allocator.destroy(entry);
++        }
++    }
++
++    fn sweepControl(self: *PtyReactor) void {
++        self.mutex.lock();
++        defer self.mutex.unlock();
++        for (self.entries.items) |entry| {
++            if (!entry.active.load(.acquire)) continue;
++            const shared = entry.shared;
++            shared.mutex.lock();
++            const stop = shared.shutdown or shared.kill_requested or shared.generation != entry.generation;
++            const has_output_room = if (shared.staging) |staging| staging.len < max_effect_pty_staging_bytes else false;
++            const wants_write = shared.out_len > 0;
++            if (has_output_room) shared.reader_parked = false;
++            shared.mutex.unlock();
++            if (stop) {
++                self.finish(entry);
++            } else {
++                if (has_output_room) self.platform.setReadable(entry.transport, true, @ptrCast(entry));
++                self.platform.setWritable(entry.transport, wants_write, @ptrCast(entry));
++            }
++        }
++    }
++
++    fn service(self: *PtyReactor, entry: *PtyReactorEntry, event: pty_transport.ReactorEvent) void {
++        const shared = entry.shared;
++        shared.mutex.lock();
++        const stop = shared.shutdown or shared.kill_requested or shared.generation != entry.generation;
++        const staged = if (shared.staging) |staging| staging.len else max_effect_pty_staging_bytes;
++        const room = max_effect_pty_staging_bytes - staged;
++        if (room == 0 and !stop) shared.reader_parked = true;
++        shared.mutex.unlock();
++        if (stop) return self.finish(entry);
++
++        if (event.writable) {
++            ptyFlushOutbound(shared, entry.transport, entry.generation);
++            shared.mutex.lock();
++            const pending = shared.out_len > 0;
++            shared.mutex.unlock();
++            if (!pending) self.platform.setWritable(entry.transport, false, @ptrCast(entry));
++        }
++
++        if (event.readable and room > 0) {
++            var local: [16 * 1024]u8 = undefined;
++            const take = @min(local.len, room);
++            const read = entry.transport.read(local[0..take]) catch |err| switch (err) {
++                error.WouldBlock => return,
++                error.ReadFailed => return self.finish(entry),
++            };
++            if (read == 0) return self.finish(entry);
++            ptyStageOutput(shared, entry.generation, local[0..read]);
++            return;
++        }
++        if (room == 0) {
++            self.platform.setReadable(entry.transport, false, @ptrCast(entry));
++            return;
++        }
++        if (event.hangup) self.finish(entry);
++    }
++
++    fn finish(self: *PtyReactor, entry: *PtyReactorEntry) void {
++        if (!entry.active.swap(false, .acq_rel)) return;
++        self.platform.remove(entry.transport);
++        const thread = std.Thread.spawn(.{}, reapAndStage, .{entry}) catch {
++            // Resource exhaustion while ending a session must not strand its
++            // key. Reap synchronously as the rare fallback.
++            return reapAndStage(entry);
++        };
++        thread.detach();
++    }
++
++    fn reapAndStage(entry: *PtyReactorEntry) void {
++        const shared = entry.shared;
++        const generation = entry.generation;
++        const transport = entry.transport;
++        shared.mutex.lock();
++        if (shared.generation == generation) shared.reaping = true;
++        shared.mutex.unlock();
++        const exit = transport.reapEnding();
++        pty_transport.reapSurrendered();
++        const late_exec_failure = transport.lateExecFailure();
++        shared.mutex.lock();
++        if (shared.open and shared.generation == generation) {
++            if (shared.out_len > 0) {
++                shared.dropped_writes +|= @intCast(shared.out_write_count);
++                shared.out_len = 0;
++                shared.out_write_count = 0;
++                shared.out_front_sent = 0;
++            }
++            const cancelled = shared.kill_requested;
++            shared.exit_reason = if (cancelled)
++                .cancelled
++            else if (late_exec_failure)
++                .spawn_failed
++            else if (exit.signal != 0)
++                .signaled
++            else
++                .exited;
++            shared.exit_signal = if (shared.exit_reason == .signaled) exit.signal else 0;
++            shared.exit_code = if (shared.exit_reason == .exited) exit.code else effect_error_exit_code;
++            shared.exit_staged = true;
++            if (shared.owner) |owner| {
++                shared.exit_seq = owner.seq.fetchAdd(1, .seq_cst);
++                _ = owner.pending.fetchAdd(1, .seq_cst);
++            }
++        }
++        if (shared.generation == generation) shared.io_done = true;
++        shared.mutex.unlock();
++        ChannelHandle.requestHostWake(&shared.wake, generation);
++    }
++};
++
+ /// `std.Io.Threaded` (the real executor's io) does not exist on
+ /// freestanding targets — the docs' live-preview wasm host compiles
+ /// this runtime to wasm32-freestanding. There the executor io compiles
+@@ -3496,6 +3739,8 @@ pub fn Effects(comptime Msg: type) type {
+             transport: if (pty_transport.supported) ?pty_transport.Pty else void =
+                 if (pty_transport.supported) null else {},
+             io_thread: ?WorkerThread = null,
++            reactor_entry: if (pty_transport.reactor_supported) ?*PtyReactorEntry else void =
++                if (pty_transport.reactor_supported) null else {},
+             /// The io thread's nudge pipe: [read, write]. Written by
+             /// the loop (outbound bytes staged, drain freed staging
+             /// room, shutdown); poll()'d by the io thread.
+@@ -5026,7 +5271,12 @@ pub fn Effects(comptime Msg: type) type {
+         /// occupancies beside the channel table. Loop-thread only —
+         /// the thread-shared half of each slot lives behind its
+         /// `PtySlot.shared` header.
+-        pty_slots: [max_effect_ptys]PtySlot = [_]PtySlot{.{}} ** max_effect_ptys,
++        pty_slots: std.ArrayListUnmanaged(PtySlot) = .empty,
++        /// macOS serves all live PTYs from one kqueue thread. Other hosts keep
++        /// the existing per-session transport path until their epoll/IOCP
++        /// reactors are implemented.
++        pty_reactor: if (pty_transport.reactor_supported) ?*PtyReactor else void =
++            if (pty_transport.reactor_supported) null else {},
+         /// Monotonic stamp shared by every pty's staged output backlog
+         /// and exit marker — the channels' `channel_seq`, pty-shaped:
+         /// cross-pty delivery order and the drain boundary's causality
+@@ -5273,7 +5523,7 @@ pub fn Effects(comptime Msg: type) type {
+             // teaching warning: everything it can still reach (the
+             // shared header, its staging ring, the transport fds) is
+             // process-lived or deliberately leaked with it.
+-            for (&self.pty_slots) |*pty_slot| {
++            for (self.pty_slots.items) |*pty_slot| {
+                 // Wind down a running REAL pty: kill and wait (bounded)
+                 // for the io thread to stage its exit, then retire or
+                 // abandon it. A fake or unsupported occupancy just
+@@ -5298,7 +5548,11 @@ pub fn Effects(comptime Msg: type) type {
+                         } else if (pty_slot.transport) |transport| {
+                             transport.kill(false);
+                         }
+-                        pty_transport.nudge(pty_slot.wake_pipe[1]);
++                        if (comptime pty_transport.reactor_supported) {
++                            if (self.pty_reactor) |reactor| reactor.notify();
++                        } else {
++                            pty_transport.nudge(pty_slot.wake_pipe[1]);
++                        }
+                         var io_done = pty_slot.shared == null;
+                         if (pty_slot.shared) |shared| {
+                             const start_ns = runtime_clock.monotonicNanoseconds();
+@@ -5376,6 +5630,12 @@ pub fn Effects(comptime Msg: type) type {
+                     pty_slot.on_event = null;
+                 }
+             }
++            if (comptime pty_transport.reactor_supported) {
++                if (self.pty_reactor) |reactor| reactor.destroy();
++                self.pty_reactor = null;
++            }
++            self.pty_slots.deinit(self.allocator);
++            self.pty_slots = .empty;
+             self.pty_pending_count.store(0, .release);
+             // Settle any surrendered reap whose child has since died —
+             // teardown is the last cheap moment before the process
+@@ -6029,7 +6289,7 @@ pub fn Effects(comptime Msg: type) type {
+                 // `bindServices`, which the standard startup order
+                 // never does; contained here regardless.)
+                 if (comptime pty_transport.supported) {
+-                    for (&self.pty_slots) |*pty_slot| {
++                    for (self.pty_slots.items) |*pty_slot| {
+                         if (!(pty_slot.state == .running and !pty_slot.fake)) continue;
+                         const shared = pty_slot.shared orelse continue;
+                         shared.mutex.lock();
+@@ -6039,7 +6299,11 @@ pub fn Effects(comptime Msg: type) type {
+                             if (pty_slot.transport) |transport| transport.kill(false);
+                         }
+                         shared.mutex.unlock();
+-                        pty_transport.nudge(pty_slot.wake_pipe[1]);
++                        if (comptime pty_transport.reactor_supported) {
++                            if (self.pty_reactor) |reactor| reactor.notify();
++                        } else {
++                            pty_transport.nudge(pty_slot.wake_pipe[1]);
++                        }
+                         const start_ns = runtime_clock.monotonicNanoseconds();
+                         var io_done = false;
+                         while (true) {
+@@ -6133,7 +6397,7 @@ pub fn Effects(comptime Msg: type) type {
+             }
+             // Ptys arm the same producer-wake seam: a running REAL
+             // occupancy's io thread wakes through its shared header.
+-            for (&self.pty_slots) |*slot| {
++            for (self.pty_slots.items) |*slot| {
+                 if (slot.state == .running and !slot.fake and slot.shared != null) return true;
+             }
+             return false;
+@@ -8004,12 +8268,12 @@ pub fn Effects(comptime Msg: type) type {
+         /// second producer beside a live io thread.
+         pub fn feedPtyOutput(self: *Self, key: u64, bytes: []const u8) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, PtyChunkTooLarge, ReplayDamagedRecord }!void {
+             const slot_index = blk: {
+-                for (&self.pty_slots, 0..) |*slot, index| {
++                for (self.pty_slots.items, 0..) |*slot, index| {
+                     if (slot.state != .idle and slot.key == key) break :blk index;
+                 }
+                 return error.EffectNotFound;
+             };
+-            const slot = &self.pty_slots[slot_index];
++            const slot = &self.pty_slots.items[slot_index];
+             if (!slot.fake) return error.PtyLiveFeed;
+             if (slot.park_state == .terminated) {
+                 if (comptime builtin.os.tag != .freestanding) {
+@@ -8072,12 +8336,12 @@ pub fn Effects(comptime Msg: type) type {
+         /// ride the completion queue and retire the slot at delivery.
+         pub fn feedPtyExit(self: *Self, key: u64, code: i32, signal: i32, reason: EffectExitReason, dropped_writes: u32) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, ReplayDamagedRecord }!void {
+             const slot_index = blk: {
+-                for (&self.pty_slots, 0..) |*slot, index| {
++                for (self.pty_slots.items, 0..) |*slot, index| {
+                     if (slot.state != .idle and slot.key == key) break :blk index;
+                 }
+                 return error.EffectNotFound;
+             };
+-            const slot = &self.pty_slots[slot_index];
++            const slot = &self.pty_slots.items[slot_index];
+             if (!slot.fake) return error.PtyLiveFeed;
+             // Normalize the tuple to the EffectPtyEvent contract the live
+             // io loop guarantees, so a fake (test or replay) can never
+@@ -8204,7 +8468,7 @@ pub fn Effects(comptime Msg: type) type {
+         /// Number of recorded (still-active) fake pty spawns.
+         pub fn pendingPtyCount(self: *Self) usize {
+             var count: usize = 0;
+-            for (&self.pty_slots) |*slot| {
++            for (self.pty_slots.items) |*slot| {
+                 if (slot.fake and slot.state == .running) count += 1;
+             }
+             return count;
+@@ -8215,7 +8479,7 @@ pub fn Effects(comptime Msg: type) type {
+         /// valid until the occupancy retires.
+         pub fn pendingPtyAt(self: *Self, index: usize) ?PtyRequest {
+             var seen: usize = 0;
+-            for (&self.pty_slots) |*slot| {
++            for (self.pty_slots.items) |*slot| {
+                 if (!(slot.fake and slot.state == .running)) continue;
+                 if (seen == index) {
+                     return .{
+@@ -8292,15 +8556,10 @@ pub fn Effects(comptime Msg: type) type {
+             // would hand the child a different TERM than requested.
+             if (std.mem.indexOfScalar(u8, options.term, 0) != null) return self.rejectPty(options.key, options.on_event, true);
+             if (self.keyOccupiedUntilDelivery(options.key)) return self.rejectPty(options.key, options.on_event, true);
+-            const slot_index = self.findIdlePtySlot() orelse return self.rejectPty(options.key, options.on_event, true);
+-            // Table capacity obeys the replay-hold invariant, the
+-            // channel argument verbatim: executor-truth start failures
+-            // park a real slot under replay until the journaled
+-            // terminal feeds, so live holds the open counted through
+-            // the staged window too.
+-            if (self.idlePtySlotCount() <= self.stagedPtyReservationCount()) {
+-                return self.rejectPty(options.key, options.on_event, true);
+-            }
++            // Grow on demand. Allocation failure is executor truth for this
++            // host and rejects only the requested session; existing PTYs keep
++            // running.
++            const slot_index = self.claimIdlePtySlot() orelse return self.rejectPty(options.key, options.on_event, false);
+             // A build without a pty transport (a libc-free Linux
+             // build; a target outside the support matrix) refuses up
+             // front. Unlike
+@@ -8317,7 +8576,7 @@ pub fn Effects(comptime Msg: type) type {
+                 if (self.executor != .fake) return self.rejectPty(options.key, options.on_event, false);
+             }
+ 
+-            const slot = &self.pty_slots[slot_index];
++            const slot = &self.pty_slots.items[slot_index];
+             const generation = self.nextChannelGeneration();
+             slot.* = .{
+                 .state = .running,
+@@ -8496,7 +8755,13 @@ pub fn Effects(comptime Msg: type) type {
+                 break :accepted true;
+             };
+             shared.mutex.unlock();
+-            if (accepted) pty_transport.nudge(slot.wake_pipe[1]);
++            if (accepted) {
++                if (comptime pty_transport.reactor_supported) {
++                    if (slot.reactor_entry) |entry| if (self.pty_reactor) |reactor| reactor.enableWrite(entry);
++                } else {
++                    pty_transport.nudge(slot.wake_pipe[1]);
++                }
++            }
+             return accepted;
+         }
+ 
+@@ -8574,7 +8839,11 @@ pub fn Effects(comptime Msg: type) type {
+                 if (slot.transport) |transport| transport.kill(false);
+             }
+             shared.mutex.unlock();
+-            pty_transport.nudge(slot.wake_pipe[1]);
++            if (comptime pty_transport.reactor_supported) {
++                if (self.pty_reactor) |reactor| reactor.notify();
++            } else {
++                pty_transport.nudge(slot.wake_pipe[1]);
++            }
+         }
+ 
+         /// Ask the desktop host to show a system notification. This is
+@@ -11444,7 +11713,7 @@ pub fn Effects(comptime Msg: type) type {
+                 shared.wake.pending.store(false, .seq_cst);
+                 shared.wake.mutex.unlock();
+             }
+-            for (&self.pty_slots) |*slot| {
++            for (self.pty_slots.items) |*slot| {
+                 const shared = slot.shared orelse continue;
+                 shared.wake.mutex.lock();
+                 shared.wake.pending.store(false, .seq_cst);
+@@ -11779,7 +12048,7 @@ pub fn Effects(comptime Msg: type) type {
+                             // still lands in the delivered count.
+                             var event = entry.event;
+                             if (entry.retire_slot) |slot_index| {
+-                                const parked = &self.pty_slots[slot_index];
++                                const parked = &self.pty_slots.items[slot_index];
+                                 if (parked.state != .idle and parked.generation == entry.retire_generation) {
+                                     event.dropped_writes +|= parked.dropped_writes;
+                                     self.retirePtySlot(parked);
+@@ -12377,7 +12646,7 @@ pub fn Effects(comptime Msg: type) type {
+                             self.drain_heap_line = heap;
+                             entry.heap_line = null;
+                         }
+-                        const pty_slot = &self.pty_slots[entry.slot_index];
++                        const pty_slot = &self.pty_slots.items[entry.slot_index];
+                         if (pty_slot.state == .idle or entry.channel_generation != pty_slot.generation) continue;
+                         const on_event = pty_slot.on_event;
+                         // The delivered drop count reads AT DELIVERY, the
+@@ -12556,7 +12825,7 @@ pub fn Effects(comptime Msg: type) type {
+             var best_index: ?usize = null;
+             var best_seq: u64 = std.math.maxInt(u64);
+             var best_exit = false;
+-            for (&self.pty_slots, 0..) |*slot, index| {
++            for (self.pty_slots.items, 0..) |*slot, index| {
+                 if (slot.state == .idle) continue;
+                 const shared = slot.shared orelse continue;
+                 shared.mutex.lock();
+@@ -12603,7 +12872,7 @@ pub fn Effects(comptime Msg: type) type {
+                 }
+             }
+             const index = best_index orelse return null;
+-            const slot = &self.pty_slots[index];
++            const slot = &self.pty_slots.items[index];
+             const shared = slot.shared.?;
+             const on_event = slot.on_event;
+             var event: EffectPtyEvent = .{ .key = slot.key };
+@@ -12641,7 +12910,6 @@ pub fn Effects(comptime Msg: type) type {
+                 staging.head = (staging.head + take) % max_effect_pty_staging_bytes;
+                 staging.len -= take;
+                 const emptied = staging.len == 0;
+-                var rewake = false;
+                 if (emptied) {
+                     shared.data_seq_valid = false;
+                 } else if (shared.owner) |owner| {
+@@ -12654,7 +12922,6 @@ pub fn Effects(comptime Msg: type) type {
+                     // stamp would let one pass deliver without bound and
+                     // starve every other platform event.
+                     shared.data_seq = owner.seq.fetchAdd(1, .seq_cst);
+-                    rewake = true;
+                 }
+                 if (shared.reader_parked) {
+                     shared.reader_parked = false;
+@@ -12662,9 +12929,12 @@ pub fn Effects(comptime Msg: type) type {
+                 }
+                 shared.mutex.unlock();
+                 if (emptied) _ = self.pty_pending_count.fetchSub(1, .seq_cst);
+-                if (rewake) ChannelHandle.requestHostWake(&shared.wake, slot.generation);
+                 if (resume_reader and comptime pty_transport.supported) {
+-                    pty_transport.nudge(slot.wake_pipe[1]);
++                    if (comptime pty_transport.reactor_supported) {
++                        if (slot.reactor_entry) |entry| if (self.pty_reactor) |reactor| reactor.resumeRead(entry);
++                    } else {
++                        pty_transport.nudge(slot.wake_pipe[1]);
++                    }
+                 }
+                 event.bytes = self.pty_drain_scratch[0..take];
+                 self.journalNote(.{
+@@ -13857,22 +14127,23 @@ pub fn Effects(comptime Msg: type) type {
+         }
+ 
+         fn findPtySlot(self: *Self, key: u64) ?*PtySlot {
+-            for (&self.pty_slots) |*slot| {
++            for (self.pty_slots.items) |*slot| {
+                 if (slot.state != .idle and slot.key == key) return slot;
+             }
+             return null;
+         }
+ 
+-        fn findIdlePtySlot(self: *Self) ?usize {
+-            for (&self.pty_slots, 0..) |*slot, index| {
++        fn claimIdlePtySlot(self: *Self) ?usize {
++            for (self.pty_slots.items, 0..) |*slot, index| {
+                 if (slot.state == .idle) return index;
+             }
+-            return null;
++            self.pty_slots.append(self.allocator, .{}) catch return null;
++            return self.pty_slots.items.len - 1;
+         }
+ 
+         fn idlePtySlotCount(self: *Self) usize {
+             var count: usize = 0;
+-            for (&self.pty_slots) |*slot| {
++            for (self.pty_slots.items) |*slot| {
+                 if (slot.state == .idle) count += 1;
+             }
+             return count;
+@@ -13937,6 +14208,10 @@ pub fn Effects(comptime Msg: type) type {
+         /// wait on child I/O). The `PtyShared` header stays allocated
+         /// forever, the channel headers' bounded-leak invariant.
+         fn retirePtySlot(self: *Self, slot: *PtySlot) void {
++            if (comptime pty_transport.reactor_supported) {
++                if (slot.reactor_entry) |entry| if (self.pty_reactor) |reactor| reactor.remove(entry);
++                slot.reactor_entry = null;
++            }
+             if (slot.shared) |shared| {
+                 shared.mutex.lock();
+                 shared.open = false;
+@@ -14057,11 +14332,14 @@ pub fn Effects(comptime Msg: type) type {
+                 return self.failPtyStart(slot, options);
+             };
+             outbound.* = .{};
+-            const pipe = pty_transport.pipePair() catch {
+-                self.channel_storage_allocator.destroy(outbound);
+-                self.channel_storage_allocator.destroy(staging);
+-                return self.failPtyStart(slot, options);
+-            };
++            const pipe: [2]c_int = if (comptime pty_transport.reactor_supported)
++                .{ -1, -1 }
++            else
++                pty_transport.pipePair() catch {
++                    self.channel_storage_allocator.destroy(outbound);
++                    self.channel_storage_allocator.destroy(staging);
++                    return self.failPtyStart(slot, options);
++                };
+             var env_buffer: [pty_transport.max_env_entries]pty_transport.EnvVar = undefined;
+             // The decoded-name/value byte pool behind the Windows
+             // environment snapshot; zero-length (and untouched) where
+@@ -14152,6 +14430,45 @@ pub fn Effects(comptime Msg: type) type {
+                 }
+                 if (self.hasPending()) self.wakeHost();
+             }
++            if (comptime pty_transport.reactor_supported) {
++                const reactor = self.pty_reactor orelse created: {
++                    const created = PtyReactor.create(self.allocator) orelse {
++                        shared.mutex.lock();
++                        shared.open = false;
++                        shared.staging = null;
++                        shared.outbound = null;
++                        shared.owner = null;
++                        shared.mutex.unlock();
++                        revokeChannelWake(&shared.wake);
++                        self.channel_storage_allocator.destroy(staging);
++                        self.channel_storage_allocator.destroy(outbound);
++                        transport.kill(false);
++                        _ = transport.reapEnding();
++                        transport.close();
++                        return self.failPtyStart(slot, options);
++                    };
++                    self.pty_reactor = created;
++                    break :created created;
++                };
++                const entry = reactor.add(shared, transport, generation) orelse {
++                    shared.mutex.lock();
++                    shared.open = false;
++                    shared.staging = null;
++                    shared.outbound = null;
++                    shared.owner = null;
++                    shared.mutex.unlock();
++                    revokeChannelWake(&shared.wake);
++                    self.channel_storage_allocator.destroy(staging);
++                    self.channel_storage_allocator.destroy(outbound);
++                    transport.kill(false);
++                    _ = transport.reapEnding();
++                    transport.close();
++                    return self.failPtyStart(slot, options);
++                };
++                slot.transport = transport;
++                slot.reactor_entry = entry;
++                return;
++            }
+             const thread = std.Thread.spawn(.{}, ptyIoLoop, .{ shared, transport, pipe[0], generation }) catch {
+                 shared.mutex.lock();
+                 shared.open = false;
+diff --git a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
+index a92c59f..2884462 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
+@@ -136,15 +136,13 @@ test "pty admission: every refused spawn delivers exactly one rejected exit" {
+     fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
+     _ = try expectExit(&fx, 6, .rejected);
+ 
+-    // Table exhaustion: the table already holds key 6; filling the
+-    // remaining slots leaves the next spawn refused.
++    // Dynamic growth: the table already holds key 6 and accepts a burst
++    // far beyond the historical fixed capacity.
+     var key: u64 = 7;
+-    while (key < 7 + effects_mod.max_effect_ptys - 1) : (key += 1) {
++    while (key < 71) : (key += 1) {
+         fx.ptySpawn(.{ .key = key, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
+     }
+-    fx.ptySpawn(.{ .key = 99, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
+-    _ = try expectExit(&fx, 99, .rejected);
+-    try testing.expectEqual(@as(usize, effects_mod.max_effect_ptys), fx.pendingPtyCount());
++    try testing.expectEqual(@as(usize, 65), fx.pendingPtyCount());
+ }
+ 
+ test "fake pty write capture, resize mirror, and kill mirror" {
+diff --git a/node_modules/@native-sdk/cli/src/runtime/pty.zig b/node_modules/@native-sdk/cli/src/runtime/pty.zig
+index 4ed1f37..b4165cc 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/pty.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/pty.zig
+@@ -963,6 +963,15 @@ const c = struct {
+     extern "c" fn pipe2(fds: *[2]c_int, flags: c_uint) c_int;
+     extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+     extern "c" fn poll(fds: [*]Pollfd, nfds: c_uint, timeout: c_int) c_int;
++    extern "c" fn kqueue() c_int;
++    extern "c" fn kevent(
++        kq: c_int,
++        changelist: ?[*]const Kevent,
++        nchanges: c_int,
++        eventlist: ?[*]Kevent,
++        nevents: c_int,
++        timeout: ?*const anyopaque,
++    ) c_int;
+     extern "c" fn __error() *c_int; // Darwin errno
+     extern "c" fn __errno_location() *c_int; // Linux errno (glibc/musl)
+     extern "c" fn __errno() *c_int; // Bionic errno
+@@ -1087,6 +1096,124 @@ pub const Ready = struct {
+     nudged: bool = false,
+ };
+ 
++/// Darwin readiness reactor used by the effects layer to serve every live PTY
++/// from one blocking thread. kqueue registration and wake calls are safe from
++/// the loop thread while another thread is inside `kevent`.
++pub const reactor_supported = builtin.os.tag == .macos;
++
++pub const ReactorEvent = struct {
++    token: ?*anyopaque = null,
++    readable: bool = false,
++    writable: bool = false,
++    hangup: bool = false,
++    control: bool = false,
++};
++
++pub const Reactor = if (reactor_supported) struct {
++    fd: c_int,
++
++    const control_ident: usize = 1;
++
++    pub fn init() error{ReactorInitFailed}!Reactor {
++        const fd = c.kqueue();
++        if (fd < 0) return error.ReactorInitFailed;
++        var changes = [1]Kevent{.{
++            .ident = control_ident,
++            .filter = evfilt_user,
++            .flags = ev_add | ev_clear,
++            .fflags = 0,
++            .data = 0,
++            .udata = null,
++        }};
++        if (c.kevent(fd, changes[0..].ptr, 1, null, 0, null) < 0) {
++            _ = c.close(fd);
++            return error.ReactorInitFailed;
++        }
++        return .{ .fd = fd };
++    }
++
++    pub fn deinit(self: *Reactor) void {
++        if (self.fd >= 0) _ = c.close(self.fd);
++        self.fd = -1;
++    }
++
++    pub fn register(self: *Reactor, transport: Pty, token: *anyopaque) bool {
++        var changes = [2]Kevent{
++            .{ .ident = @intCast(transport.parent), .filter = evfilt_read, .flags = ev_add | ev_enable, .fflags = 0, .data = 0, .udata = token },
++            .{ .ident = @intCast(transport.parent), .filter = evfilt_write, .flags = ev_add | ev_disable, .fflags = 0, .data = 0, .udata = token },
++        };
++        return c.kevent(self.fd, changes[0..].ptr, @intCast(changes.len), null, 0, null) == 0;
++    }
++
++    pub fn remove(self: *Reactor, transport: Pty) void {
++        var changes = [2]Kevent{
++            .{ .ident = @intCast(transport.parent), .filter = evfilt_read, .flags = ev_delete, .fflags = 0, .data = 0, .udata = null },
++            .{ .ident = @intCast(transport.parent), .filter = evfilt_write, .flags = ev_delete, .fflags = 0, .data = 0, .udata = null },
++        };
++        _ = c.kevent(self.fd, changes[0..].ptr, @intCast(changes.len), null, 0, null);
++    }
++
++    pub fn setReadable(self: *Reactor, transport: Pty, enabled: bool, token: *anyopaque) void {
++        var changes = [1]Kevent{.{ .ident = @intCast(transport.parent), .filter = evfilt_read, .flags = if (enabled) ev_enable else ev_disable, .fflags = 0, .data = 0, .udata = token }};
++        _ = c.kevent(self.fd, changes[0..].ptr, 1, null, 0, null);
++    }
++
++    pub fn setWritable(self: *Reactor, transport: Pty, enabled: bool, token: *anyopaque) void {
++        var changes = [1]Kevent{.{ .ident = @intCast(transport.parent), .filter = evfilt_write, .flags = if (enabled) ev_enable else ev_disable, .fflags = 0, .data = 0, .udata = token }};
++        _ = c.kevent(self.fd, changes[0..].ptr, 1, null, 0, null);
++    }
++
++    pub fn wake(self: *Reactor) void {
++        var changes = [1]Kevent{.{ .ident = control_ident, .filter = evfilt_user, .flags = 0, .fflags = note_trigger, .data = 0, .udata = null }};
++        _ = c.kevent(self.fd, changes[0..].ptr, 1, null, 0, null);
++    }
++
++    pub fn wait(self: *Reactor, out: []ReactorEvent) usize {
++        var events: [64]Kevent = undefined;
++        const capacity = @min(events.len, out.len);
++        const count = c.kevent(self.fd, null, 0, events[0..].ptr, @intCast(capacity), null);
++        if (count <= 0) return 0;
++        var index: usize = 0;
++        while (index < @as(usize, @intCast(count))) : (index += 1) {
++            const event = events[index];
++            const control = event.filter == evfilt_user and event.ident == control_ident;
++            out[index] = .{
++                .token = event.udata,
++                .readable = event.filter == evfilt_read,
++                .writable = event.filter == evfilt_write,
++                .hangup = event.flags & (ev_eof | ev_error) != 0,
++                .control = control,
++            };
++        }
++        return @intCast(count);
++    }
++} else struct {
++    pub fn init() error{ReactorInitFailed}!Reactor {
++        return error.ReactorInitFailed;
++    }
++};
++
++const Kevent = extern struct {
++    ident: usize,
++    filter: i16,
++    flags: u16,
++    fflags: u32,
++    data: isize,
++    udata: ?*anyopaque,
++};
++
++const evfilt_read: i16 = -1;
++const evfilt_write: i16 = -2;
++const evfilt_user: i16 = -10;
++const ev_add: u16 = 0x0001;
++const ev_delete: u16 = 0x0002;
++const ev_enable: u16 = 0x0004;
++const ev_disable: u16 = 0x0008;
++const ev_eof: u16 = 0x8000;
++const ev_error: u16 = 0x4000;
++const ev_clear: u16 = 0x0020;
++const note_trigger: u32 = 0x01000000;
++
+ /// Block until the transport is readable (`want_read`), writable
+ /// (`want_write`), hung up, or the nudge pipe fires. A caller wanting
+ /// NEITHER direction (a parked reader with nothing to write) waits on
+diff --git a/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig b/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
+index 808265e..875093f 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
+@@ -41,8 +41,9 @@ const term_vt = @import("terminal_vt");
+ 
+ pub const enabled = term_vt.enabled;
+ 
+-/// One session per pty slot: the effects engine's own table bound.
+-pub const max_sessions: usize = effects.max_effect_ptys;
++/// Emulators are allocated on demand; rendering capacity is independent from
++/// the number of live PTY transports.
++pub const max_sessions: ?usize = null;
+ 
+ /// The journaled pty verbs the store drives, type-erased so this module
+ /// never names the Msg-generic engine: the app loop wraps its engine.
+@@ -167,7 +168,8 @@ const EnabledStore = struct {
+     /// for a stable address; built on first session create so apps with
+     /// no `<terminal>` pay nothing.
+     threaded: ?*std.Io.Threaded = null,
+-    entries: [max_sessions]Entry = @splat(.{}),
++    entries: std.ArrayListUnmanaged(Entry) = .empty,
++    visible_keys: std.ArrayListUnmanaged(u64) = .empty,
+     gateway: ?PtyGateway = null,
+     /// The tokens the CURRENT build resolves snapshots with, stamped by
+     /// `beginBuild` (the palette's theme mapping needs them). Valid for
+@@ -184,10 +186,14 @@ const EnabledStore = struct {
+     }
+ 
+     pub fn deinit(self: *EnabledStore) void {
+-        for (&self.entries) |*entry| {
++        for (self.entries.items) |*entry| {
+             if (entry.session) |session| session.destroy();
+             entry.* = .{};
+         }
++        self.entries.deinit(self.allocator);
++        self.entries = .empty;
++        self.visible_keys.deinit(self.allocator);
++        self.visible_keys = .empty;
+         if (self.threaded) |threaded| {
+             threaded.deinit();
+             self.allocator.destroy(threaded);
+@@ -201,6 +207,7 @@ const EnabledStore = struct {
+ 
+     pub fn beginBuild(self: *EnabledStore, tokens: canvas.DesignTokens) void {
+         self.tokens = tokens;
++        self.visible_keys.clearRetainingCapacity();
+     }
+ 
+     /// The builder seam (`Ui.terminal_lookup`): finalize resolves each
+@@ -214,6 +221,14 @@ const EnabledStore = struct {
+     fn resolveOpaque(context: *anyopaque, pty: u64) ?*const canvas.TerminalGrid {
+         const self: *EnabledStore = @ptrCast(@alignCast(context));
+         const session = self.ensureSession(pty) orelse return null;
++        var visible = false;
++        for (self.visible_keys.items) |key| {
++            if (key == pty) {
++                visible = true;
++                break;
++            }
++        }
++        if (!visible) self.visible_keys.append(self.allocator, pty) catch {};
+         if (session.snapshot_dirty) {
+             session.rebuildSnapshot(self.tokens) catch return &session.grid;
+         }
+@@ -231,7 +246,7 @@ const EnabledStore = struct {
+ 
+     fn find(self: *EnabledStore, pty: u64) ?*Session {
+         if (pty == 0) return null;
+-        for (&self.entries) |*entry| {
++        for (self.entries.items) |*entry| {
+             if (entry.key == pty) return entry.session;
+         }
+         return null;
+@@ -240,19 +255,17 @@ const EnabledStore = struct {
+     fn ensureSession(self: *EnabledStore, pty: u64) ?*Session {
+         if (pty == 0) return null;
+         if (self.find(pty)) |session| return session;
+-        for (&self.entries) |*entry| {
+-            if (entry.session != null) continue;
+-            const session_io = self.io() orelse return null;
+-            const session = Session.create(self.allocator, session_io, 80, 24) catch return null;
+-            entry.* = .{ .key = pty, .session = session };
+-            return session;
+-        }
+-        return null;
++        self.entries.append(self.allocator, .{}) catch return null;
++        const entry = &self.entries.items[self.entries.items.len - 1];
++        const session_io = self.io() orelse return null;
++        const session = Session.create(self.allocator, session_io, 80, 24) catch return null;
++        entry.* = .{ .key = pty, .session = session };
++        return session;
+     }
+ 
+     pub fn hasSession(self: *const EnabledStore, pty: u64) bool {
+         if (pty == 0) return false;
+-        for (&self.entries) |*entry| {
++        for (self.entries.items) |*entry| {
+             if (entry.key == pty and entry.session != null) return true;
+         }
+         return false;
+@@ -449,9 +462,17 @@ const EnabledStore = struct {
+     /// caller's re-emit trigger.
+     pub fn refreshDirty(self: *EnabledStore) bool {
+         var any = false;
+-        for (&self.entries) |*entry| {
++        for (self.entries.items) |*entry| {
+             const session = entry.session orelse continue;
+             if (!session.snapshot_dirty) continue;
++            var visible = false;
++            for (self.visible_keys.items) |key| {
++                if (key == entry.key) {
++                    visible = true;
++                    break;
++                }
++            }
++            if (!visible) continue;
+             any = true;
+             session.rebuildSnapshot(self.tokens) catch {};
+         }
+@@ -465,7 +486,7 @@ const EnabledStore = struct {
+     /// whether any bytes moved.
+     pub fn flushPending(self: *EnabledStore) bool {
+         var moved = false;
+-        for (&self.entries) |*entry| {
++        for (self.entries.items) |*entry| {
+             const session = entry.session orelse continue;
+             if (session.ended) continue;
+             if (session.outbound_len == 0 and session.response_len == 0) continue;
+diff --git a/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig b/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
+index becd14f..063c209 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
+@@ -718,7 +718,7 @@ pub fn TsCoreHost(comptime core: type) type {
+         var images: [runtime_effects.max_effects]ImageEntry = @splat(.{});
+         var channels: [runtime_effects.max_effect_channels]ChannelEntry = @splat(.{});
+         var audio_captures: [runtime_effects.max_effect_channels]AudioCaptureEntry = @splat(.{});
+-        var ptys: [runtime_effects.max_effect_ptys]PtyEntry = @splat(.{});
++        var ptys: std.ArrayListUnmanaged(PtyEntry) = .empty;
+         var dbs: [runtime_effects.max_db_effects]DbEntry = @splat(.{});
+         /// The platform caches directory for URL image sources, the
+         /// audio cache dir's twin (`setImageCacheDir` / `TsUiApp`'s
+@@ -800,7 +800,7 @@ pub fn TsCoreHost(comptime core: type) type {
+             images = @splat(.{});
+             channels = @splat(.{});
+             audio_captures = @splat(.{});
+-            ptys = @splat(.{});
++            for (ptys.items) |*entry| entry.* = .{};
+             dbs = @splat(.{});
+             clip_write_counter = 0;
+             audio_cache_dir_len = 0;
+@@ -2647,7 +2647,7 @@ pub fn TsCoreHost(comptime core: type) type {
+                 fx.stageLoopMsg(msgFromTagPty(event_tag, fx.stageLoopKey(key), true, .{ .key = 0, .kind = .exit, .reason = .rejected }));
+                 return;
+             };
+-            const entry = &ptys[index];
++            const entry = &ptys.items[index];
+             entry.used = true;
+             entry.key_len = key.len;
+             @memcpy(entry.key[0..key.len], key);
+@@ -2700,17 +2700,18 @@ pub fn TsCoreHost(comptime core: type) type {
+ 
+         fn findPty(key: []const u8) ?usize {
+             if (key.len == 0) return null;
+-            for (&ptys, 0..) |*entry, index| {
++            for (ptys.items, 0..) |*entry, index| {
+                 if (entry.used and std.mem.eql(u8, entry.wireKey(), key)) return index;
+             }
+             return null;
+         }
+ 
+         fn freePtyIndex() ?usize {
+-            for (&ptys, 0..) |*entry, index| {
++            for (ptys.items, 0..) |*entry, index| {
+                 if (!entry.used) return index;
+             }
+-            return null;
++            ptys.append(std.heap.page_allocator, .{}) catch return null;
++            return ptys.items.len - 1;
+         }
+ 
+         /// `PtyMsgFn` for pty sessions: every event routes the entry's
+@@ -2722,10 +2723,10 @@ pub fn TsCoreHost(comptime core: type) type {
+                 @panic("ts core host: a pty event arrived outside the bridge's pty key namespace");
+             }
+             const index = event.key - pty_key_base;
+-            if (index >= ptys.len or !ptys[index].used) {
++            if (index >= ptys.items.len or !ptys.items[index].used) {
+                 @panic("ts core host: a pty event arrived for a session the bridge is not tracking");
+             }
+-            const entry = &ptys[index];
++            const entry = &ptys.items[index];
+             const wire_key = entry.wireKey();
+             if (event.kind == .exit) entry.used = false;
+             // Live delivery is same-frame, so the key rides the frame arena.
+diff --git a/node_modules/@native-sdk/cli/src/runtime/ui_app.zig b/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
+index 02589cb..3913738 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
+@@ -1321,8 +1321,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+         /// the nested rebuild each dispatch runs reconciles to the same
+         /// state and produces nothing new (`terminal_state_draining`
+         /// makes that one level a hard guarantee).
+-        terminal_state_pending: [terminal_session.max_sessions]PendingTerminalState = @splat(.{}),
+-        terminal_state_pending_count: usize = 0,
++        terminal_state_pending: std.ArrayListUnmanaged(PendingTerminalState) = .empty,
+         terminal_state_draining: bool = false,
+         /// Live model-declared secondary windows (`Options.windows_fn`),
+         /// keyed by window label.
+@@ -1447,6 +1446,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             // memory only and never touches the dead platform.
+             self.effects.deinit();
+             self.terminal_sessions.deinit();
++            self.terminal_state_pending.deinit(self.backing);
+             self.arenas[0].deinit();
+             self.arenas[1].deinit();
+             self.markup_arenas[0].deinit();
+@@ -1779,6 +1779,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+                     if (rebuild_error == null) rebuild_error = err;
+                 };
+             }
++            if (self.effects.hasPending()) {
++                if (runtime.findViewIndex(self.canvas_window_id, self.options.canvas_label)) |view_index| {
++                    runtime.requestCanvasFrameForView(view_index) catch {};
++                }
++            }
+             if (rebuild_error) |err| return err;
+             // A Msg dispatched FROM a secondary window still rebuilt the
+             // main canvas above (one model, every window's view derives
+@@ -1822,7 +1827,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             // an earlier dispatch, so replay's file-order feed always
+             // finds the parked request (see Effects.DrainBoundary).
+             var boundary = self.effects.drainBoundary();
+-            while (self.effects.takeMsgWithin(&boundary)) |msg| {
++            // Bound one UI transaction even when many PTYs are producing.
++            // Remaining work is paced by a requested GPU frame below, keeping
++            // pointer/keyboard/window events responsive under terminal floods.
++            const max_effect_messages_per_frame: usize = 64;
++            var delivered: usize = 0;
++            while (delivered < max_effect_messages_per_frame) : (delivered += 1) {
++                const msg = self.effects.takeMsgWithin(&boundary) orelse break;
+                 self.applyMsg(msg);
+                 dispatched = true;
+             }
+@@ -2231,13 +2242,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+                     proposed.y,
+                 ) orelse continue;
+                 applied = true;
+-                if (self.terminal_state_pending_count < self.terminal_state_pending.len) {
+-                    self.terminal_state_pending[self.terminal_state_pending_count] = .{
+-                        .id = node.widget.id,
+-                        .state = state,
+-                    };
+-                    self.terminal_state_pending_count += 1;
+-                }
++                self.terminal_state_pending.append(self.backing, .{
++                    .id = node.widget.id,
++                    .state = state,
++                }) catch {};
+             }
+             // An applied change moved the published snapshot AFTER this
+             // rebuild handed its layout over: refresh the retained
+@@ -2270,13 +2278,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+         fn drainTerminalStates(self: *Self, runtime: *Runtime, window_id: platform.WindowId) anyerror!void {
+             if (comptime !terminal_session.enabled) return;
+             if (self.terminal_state_draining) return;
+-            if (self.terminal_state_pending_count == 0) return;
++            if (self.terminal_state_pending.items.len == 0) return;
+             self.terminal_state_draining = true;
+             defer self.terminal_state_draining = false;
+-            while (self.terminal_state_pending_count > 0) {
+-                self.terminal_state_pending_count -= 1;
+-                const pending = self.terminal_state_pending[self.terminal_state_pending_count];
+-                self.terminal_state_pending[self.terminal_state_pending_count] = .{};
++            while (self.terminal_state_pending.pop()) |pending| {
+                 const tree = self.tree orelse continue;
+                 if (tree.msgForTerminal(pending.id, pending.state)) |msg| {
+                     try self.dispatch(runtime, window_id, msg);
