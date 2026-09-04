@@ -40,11 +40,21 @@ fn copy(comptime T: type, allocator: std.mem.Allocator, value: T) !T {
                 inline else => |payload, tag| return @unionInit(T, @tagName(tag), try copy(@TypeOf(payload), allocator, payload)),
             }
         },
-        else => return value,
+        .bool => return value,
+        .int => return value,
+        .array => |info| {
+            if (info.child != u8) @compileError("Git request arrays must contain owned bytes");
+            return value;
+        },
+        .optional => return if (value) |payload| try copy(@TypeOf(payload), allocator, payload) else null,
+        else => @compileError("Git request copying needs an explicit ownership rule for " ++ @typeName(T)),
     }
 }
 
 pub const Host = struct {
+    pub fn busy(self: *const Host) bool {
+        return self.job != null;
+    }
     job: ?*Job = null,
     thread: ?std.Thread = null,
     channel_key: ?u64 = null,
@@ -75,7 +85,7 @@ pub const Host = struct {
         if (!job.ready.load(.acquire)) return null;
         host.thread.?.join();
         host.thread = null;
-        return .{ .key = job.key, .outcome = job.response.outcome, .output = job.response.output.items };
+        return .{ .key = job.key, .value = job.response.value };
     }
 
     pub fn release(host: *Host) void {

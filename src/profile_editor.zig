@@ -2,6 +2,7 @@
 
 const native_sdk = @import("native_sdk");
 const std = @import("std");
+const fields = @import("profile_fields.zig");
 const profiles = @import("profiles.zig");
 
 const canvas = native_sdk.canvas;
@@ -22,6 +23,7 @@ pub const TextField = enum {
 };
 
 pub const Draft = struct {
+    extra_json: profiles.LongPrefText = .{},
     runtime_id: u64 = 0,
     agent_type: profiles.AgentType = .claude,
     is_new: bool = false,
@@ -45,18 +47,7 @@ pub const Draft = struct {
 
     pub fn applyTextEdit(draft: *Draft, field: TextField, edit: canvas.TextInputEvent) void {
         switch (field) {
-            .name => draft.name.apply(edit),
-            .model => draft.model.apply(edit),
-            .permission_mode => draft.permission_mode.apply(edit),
-            .effort_level => draft.effort_level.apply(edit),
-            .provider => draft.provider.apply(edit),
-            .approval_mode => draft.approval_mode.apply(edit),
-            .sandbox => draft.sandbox.apply(edit),
-            .base_url => draft.base_url.apply(edit),
-            .append_system_prompt => draft.append_system_prompt.apply(edit),
-            .custom_env => draft.custom_env.apply(edit),
-            .settings_json => draft.settings_json.apply(edit),
-            .profile => draft.profile.apply(edit),
+            inline else => |tag| @field(draft, @tagName(tag)).apply(edit),
         }
     }
 
@@ -69,19 +60,9 @@ pub const Draft = struct {
         };
         draft.database_id.set(source.id.slice());
         draft.name.set(source.name.slice());
-        draft.model.set(source.prefs.model.slice());
-        draft.custom_env.set(source.prefs.custom_env.slice());
-        draft.settings_json.set(source.prefs.settings_json.slice());
-        draft.permission_mode.set(source.prefs.permission_mode.slice());
-        draft.effort_level.set(source.prefs.effort_level.slice());
-        draft.append_system_prompt.set(source.prefs.append_system_prompt.slice());
-        draft.base_url.set(source.prefs.base_url.slice());
-        draft.provider.set(source.prefs.provider.slice());
-        draft.approval_mode.set(source.prefs.approval_mode.slice());
-        draft.sandbox.set(source.prefs.sandbox.slice());
-        draft.full_auto = source.prefs.full_auto;
-        draft.dangerously_bypass_approvals_and_sandbox = source.prefs.dangerously_bypass_approvals_and_sandbox;
-        draft.profile.set(source.prefs.profile.slice());
+        inline for (fields.text) |field| @field(draft, field.name).set(@field(source.prefs, field.name).slice());
+        inline for (fields.boolean) |field| @field(draft, field.name) = @field(source.prefs, field.name);
+        draft.extra_json = source.prefs.extra_json;
     }
 
     pub fn create(draft: *Draft, agent_type: profiles.AgentType, name: []const u8, sort_index: i64, database_id: []const u8) void {
@@ -91,40 +72,21 @@ pub const Draft = struct {
     }
 
     pub fn toPrefs(draft: *const Draft) profiles.Prefs {
-        var prefs: profiles.Prefs = .{};
-        _ = prefs.model.set(draft.model.text());
-        _ = prefs.custom_env.set(draft.custom_env.text());
-        _ = prefs.settings_json.set(draft.settings_json.text());
-        _ = prefs.permission_mode.set(draft.permission_mode.text());
-        _ = prefs.effort_level.set(draft.effort_level.text());
-        _ = prefs.append_system_prompt.set(draft.append_system_prompt.text());
-        _ = prefs.base_url.set(draft.base_url.text());
-        _ = prefs.provider.set(draft.provider.text());
-        _ = prefs.approval_mode.set(draft.approval_mode.text());
-        _ = prefs.sandbox.set(draft.sandbox.text());
-        prefs.full_auto = draft.full_auto;
-        prefs.dangerously_bypass_approvals_and_sandbox = draft.dangerously_bypass_approvals_and_sandbox;
-        _ = prefs.profile.set(draft.profile.text());
+        var prefs: profiles.Prefs = .{ .extra_json = draft.extra_json };
+        inline for (fields.text) |field| _ = @field(prefs, field.name).set(@field(draft, field.name).text());
+        inline for (fields.boolean) |field| @field(prefs, field.name) = @field(draft, field.name);
         return prefs;
     }
 
     pub fn choicesValid(draft: *const Draft) bool {
-        return switch (draft.agent_type) {
-            .claude => choiceValid(draft.permission_mode.text(), &.{ "plan", "auto", "acceptEdits", "bypassPermissions" }) and
-                choiceValid(draft.effort_level.text(), &.{ "low", "medium", "high", "xhigh", "max" }) and
-                choiceValid(draft.provider.text(), &.{ "bedrock", "vertex", "foundry" }),
-            .codex => choiceValid(draft.approval_mode.text(), &.{ "untrusted", "on-request", "never" }) and
-                choiceValid(draft.sandbox.text(), &.{ "read-only", "workspace-write", "danger-full-access" }),
-        };
+        inline for (fields.text) |field| {
+            if (@field(draft, field.name).truncated or !fields.valid(field, @field(draft, field.name).text())) return false;
+        }
+        return !draft.name.truncated;
     }
 };
 
-fn choiceValid(value: []const u8, allowed: []const []const u8) bool {
-    if (value.len == 0) return true;
-    for (allowed) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
-    return false;
-}
-
+pub const Navigation = union(enum) { profile: u64, agent: profiles.AgentType, new: profiles.AgentType, close, reload };
 pub const Write = enum { none, save, delete };
 pub const Save = struct {
     is_new: bool,
@@ -140,13 +102,18 @@ pub const WriteResult = struct { reload: bool, message: []const u8, select_id: p
 pub const State = struct {
     loaded: bool = false,
     load_valid: bool = true,
+    loading: bool = false,
     write: Write = .none,
     selected_id: u64 = 0,
     draft: Draft = .{},
     dirty: bool = false,
-    pending_switch: ?u64 = null,
+    pending_switch: ?Navigation = null,
     pending_delete: ?u64 = null,
     select_after_load: profiles.IdText = .{},
+
+    pub fn busy(self: *const State) bool {
+        return self.saving() or self.loading;
+    }
 
     pub fn saving(self: *const State) bool {
         return self.write != .none;
@@ -159,36 +126,70 @@ pub const State = struct {
         self.dirty = false;
     }
 
-    pub fn openAgent(self: *State, store: *profiles.Store, agent: profiles.AgentType) bool {
-        if (!self.loaded or self.saving()) return false;
-        const selected = store.find(self.selected_id);
-        if (selected == null or selected.?.agent_type != agent) {
-            if (store.default(agent)) |profile| self.load(store, profile.runtime_id);
+    fn requestNavigation(self: *State, store: *profiles.Store, target: Navigation) bool {
+        if (!self.loaded or self.busy()) return false;
+        const same = switch (target) {
+            .profile => |id| id == self.selected_id,
+            .agent => |agent| self.draft.agent_type == agent and (self.selected_id != 0 or self.draft.is_new),
+            else => false,
+        };
+        if (same) return true;
+        if (self.dirty) {
+            self.pending_switch = target;
+            return false;
         }
+        self.applyNavigation(store, target);
         return true;
     }
 
-    pub fn select(self: *State, store: *profiles.Store, id: u64) void {
-        if (id == self.selected_id or self.saving()) return;
-        if (self.dirty) {
-            self.pending_switch = id;
-            return;
+    fn applyNavigation(self: *State, store: *profiles.Store, target: Navigation) void {
+        switch (target) {
+            .profile => |id| self.load(store, id),
+            .agent => |agent| {
+                if (store.default(agent)) |profile| self.load(store, profile.runtime_id);
+            },
+            .new => |agent| {
+                _ = self.createDraft(store, agent);
+            },
+            .close => {
+                self.close(store);
+            },
+            .reload => {},
         }
-        self.load(store, id);
     }
 
-    pub fn confirmSwitch(self: *State, store: *profiles.Store) void {
-        const id = self.pending_switch orelse return;
+    pub fn openAgent(self: *State, store: *profiles.Store, agent: profiles.AgentType) bool {
+        return self.requestNavigation(store, .{ .agent = agent });
+    }
+
+    pub fn select(self: *State, store: *profiles.Store, id: u64) void {
+        _ = self.requestNavigation(store, .{ .profile = id });
+    }
+
+    pub fn requestReload(self: *State, store: *profiles.Store) bool {
+        if (!self.loaded) return !self.busy();
+        return self.requestNavigation(store, .reload);
+    }
+
+    pub fn requestClose(self: *State, store: *profiles.Store) bool {
+        if (!self.loaded) return !self.busy();
+        return self.requestNavigation(store, .close);
+    }
+
+    pub fn confirmSwitch(self: *State, store: *profiles.Store) ?Navigation {
+        if (self.busy()) return null;
+        const target = self.pending_switch orelse return null;
         self.pending_switch = null;
         self.dirty = false;
-        self.load(store, id);
+        self.applyNavigation(store, target);
+        return target;
     }
 
     pub fn cancelSwitch(self: *State) void {
         self.pending_switch = null;
     }
     pub fn requestDelete(self: *State, id: u64) void {
-        if (!self.saving()) self.pending_delete = id;
+        if (!self.busy()) self.pending_delete = id;
     }
     pub fn cancelDelete(self: *State) void {
         self.pending_delete = null;
@@ -202,22 +203,28 @@ pub const State = struct {
     }
 
     pub fn edit(self: *State, field: TextField, input: canvas.TextInputEvent) void {
+        if (self.busy()) return;
         self.draft.applyTextEdit(field, input);
         self.dirty = true;
     }
 
     pub fn toggleFullAuto(self: *State) void {
+        if (self.busy()) return;
         self.draft.full_auto = !self.draft.full_auto;
         self.dirty = true;
     }
 
     pub fn toggleDangerousBypass(self: *State) void {
+        if (self.busy()) return;
         self.draft.dangerously_bypass_approvals_and_sandbox = !self.draft.dangerously_bypass_approvals_and_sandbox;
         self.dirty = true;
     }
 
     pub fn create(self: *State, store: *profiles.Store, agent: profiles.AgentType) ?[]const u8 {
-        if (!self.loaded or self.saving()) return null;
+        return if (self.requestNavigation(store, .{ .new = agent })) "New profile draft" else null;
+    }
+
+    fn createDraft(self: *State, store: *profiles.Store, agent: profiles.AgentType) ?[]const u8 {
         var name_buffer: [profiles.max_profile_name_bytes]u8 = undefined;
         const name = uniqueName(store, agent, &name_buffer) orelse return "Could not allocate a profile name";
         var id_buffer: [profiles.max_profile_id_bytes]u8 = undefined;
@@ -229,16 +236,18 @@ pub const State = struct {
     }
 
     pub fn beginReload(self: *State, store: *profiles.Store, select_id: []const u8) void {
-        store.clear();
-        self.loaded = false;
+        store.beginLoad();
+        self.loading = true;
         self.load_valid = true;
         self.select_after_load.len = 0;
         _ = self.select_after_load.set(select_id);
     }
 
     pub fn finishLoad(self: *State, store: *profiles.Store, agent: profiles.AgentType) bool {
-        self.loaded = self.load_valid;
-        if (!self.loaded) return false;
+        self.loading = false;
+        store.finishLoad(self.load_valid);
+        if (!self.load_valid) return false;
+        self.loaded = true;
         const selected = if (self.select_after_load.len > 0) store.findByDatabaseId(self.select_after_load.slice()) else null;
         if (selected orelse store.default(agent)) |profile| self.load(store, profile.runtime_id);
         self.select_after_load.len = 0;
@@ -248,7 +257,7 @@ pub const State = struct {
     // Returned strings borrow the draft and caller-owned JSON scratch. Effects
     // copy them synchronously; no backend or UI state is needed in the editor.
     pub fn prepareSave(self: *State, store: *profiles.Store, json_buffer: []u8) Preparation {
-        if (!self.loaded or self.saving() or !self.dirty) return .skip;
+        if (!self.loaded or self.busy() or !self.dirty) return .skip;
         const name = std.mem.trim(u8, self.draft.name.text(), " ");
         if (name.len == 0) return .{ .invalid = "Profile name is required" };
         if (store.nameExists(self.draft.agent_type, name, self.draft.runtime_id)) return .{ .invalid = "A profile with this name already exists" };
@@ -261,17 +270,18 @@ pub const State = struct {
 
     pub fn prepareDelete(self: *State, store: *profiles.Store) ?[]const u8 {
         const profile = store.find(self.pending_delete orelse return null) orelse return null;
-        if (store.count(profile.agent_type) <= 1 or self.saving()) return null;
+        if (store.count(profile.agent_type) <= 1 or self.busy()) return null;
         self.pending_delete = null;
         self.write = .delete;
         self.select_after_load.len = 0;
         return profile.id.slice();
     }
 
-    pub fn finishWrite(self: *State, success: bool, busy: bool) WriteResult {
+    pub fn finishWrite(self: *State, success: bool, database_busy: bool) WriteResult {
         const operation = self.write;
+        if (operation == .none) return .{ .reload = false, .message = "" };
         self.write = .none;
-        if (!success) return .{ .reload = false, .message = if (busy) "Profiles database is busy; try again" else "Agent profile could not be saved" };
+        if (!success) return .{ .reload = false, .message = if (database_busy) "Profiles database is busy; try again" else "Agent profile could not be saved" };
         var result: WriteResult = .{ .reload = true, .message = if (operation == .delete) "Agent profile deleted" else "Agent profile saved" };
         if (operation == .save) _ = result.select_id.set(self.draft.database_id.text());
         self.dirty = false;
@@ -293,7 +303,8 @@ fn addTestProfile(store: *profiles.Store, runtime_id: u64, id: []const u8, name:
     var profile: profiles.Profile = .{ .runtime_id = runtime_id, .agent_type = .claude };
     _ = profile.id.set(id);
     _ = profile.name.set(name);
-    try store.items.append(store.allocator, profile);
+    const target = if (store.loading) &store.pending_items else &store.items;
+    try target.append(store.allocator, profile);
 }
 
 test "validation rejects invalid draft without entering the saving state" {

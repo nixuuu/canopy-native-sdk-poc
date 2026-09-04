@@ -76,19 +76,12 @@ pub const SidebarRow = struct {
     is_git: bool = false,
 };
 
-const ParsedWorktree = struct {
+pub const SnapshotEntry = struct {
     path: PathText = .{},
     name: NameText = .{},
     branch: BranchText = .{},
     is_main: bool = false,
 };
-
-fn parseWorktree(path: []const u8, branch: []const u8, is_main: bool) ?ParsedWorktree {
-    if (!std.fs.path.isAbsolute(path)) return null;
-    var parsed = ParsedWorktree{ .is_main = is_main };
-    if (!parsed.path.set(path) or !parsed.name.set(pathBasename(path)) or !parsed.branch.set(branch)) return null;
-    return parsed;
-}
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -219,77 +212,61 @@ pub const Store = struct {
         return true;
     }
 
-    pub fn applyWorktreePorcelain(store: *Store, project_id: u64, bytes: []const u8) bool {
-        const project = store.findProject(project_id) orelse return false;
-        var parsed: std.ArrayListUnmanaged(ParsedWorktree) = .empty;
-        defer parsed.deinit(store.allocator);
-
-        var current_path: []const u8 = "";
-        var current_branch: []const u8 = "(unknown)";
-        var detached = false;
-        var ordinal: usize = 0;
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |raw_line| {
-            const line = std.mem.trimEnd(u8, raw_line, "\r");
-            if (std.mem.startsWith(u8, line, "worktree ")) {
-                if (current_path.len > 0) {
-                    const entry = parseWorktree(current_path, if (detached) "(detached)" else current_branch, ordinal == 0) orelse return false;
-                    parsed.append(store.allocator, entry) catch return false;
-                    ordinal += 1;
-                }
-                current_path = line["worktree ".len..];
-                current_branch = "(unknown)";
-                detached = false;
-            } else if (std.mem.startsWith(u8, line, "branch refs/heads/")) {
-                current_branch = line["branch refs/heads/".len..];
-            } else if (std.mem.eql(u8, line, "detached")) {
-                detached = true;
-            } else if (line.len == 0 and current_path.len > 0) {
-                const entry = parseWorktree(current_path, if (detached) "(detached)" else current_branch, ordinal == 0) orelse return false;
-                parsed.append(store.allocator, entry) catch return false;
-                ordinal += 1;
-                current_path = "";
-                current_branch = "(unknown)";
-                detached = false;
-            }
+    pub fn applySnapshot(store: *Store, project_id: u64, entries: []const SnapshotEntry) !void {
+        const project = store.findProject(project_id) orelse return error.MissingProject;
+        if (entries.len == 0 or !entries[0].is_main) return error.InvalidSnapshot;
+        var incoming = std.StringHashMap(void).init(store.allocator);
+        defer incoming.deinit();
+        var existing = std.StringHashMap(usize).init(store.allocator);
+        defer existing.deinit();
+        for (project.worktrees.items, 0..) |*tree, index| try existing.put(tree.path.slice(), index);
+        var additions: usize = 0;
+        for (entries, 0..) |*entry, index| {
+            if (!std.fs.path.isAbsolute(entry.path.slice()) or entry.name.len == 0 or (index > 0 and entry.is_main)) return error.InvalidSnapshot;
+            if ((try incoming.getOrPut(entry.path.slice())).found_existing) return error.DuplicateWorktree;
+            if (!existing.contains(entry.path.slice())) additions += 1;
         }
-        if (current_path.len > 0) {
-            const entry = parseWorktree(current_path, if (detached) "(detached)" else current_branch, ordinal == 0) orelse return false;
-            parsed.append(store.allocator, entry) catch return false;
-        }
-
-        var new_count: usize = 0;
-        for (parsed.items) |entry| {
-            var exists = false;
-            for (project.worktrees.items) |worktree| if (worktree.path.eql(entry.path.slice())) {
-                exists = true;
-                break;
-            };
-            if (!exists) new_count += 1;
-        }
-        project.worktrees.ensureUnusedCapacity(store.allocator, new_count) catch return false;
-
-        for (project.worktrees.items) |*worktree| worktree.active = false;
-        for (parsed.items) |entry| {
-            for (project.worktrees.items) |*worktree| {
-                if (!worktree.path.eql(entry.path.slice())) continue;
-                worktree.active = true;
-                worktree.is_main = entry.is_main;
-                worktree.name = entry.name;
-                worktree.branch = entry.branch;
-                break;
+        // Reserve before changing membership; reallocation invalidates path keys.
+        try project.worktrees.ensureUnusedCapacity(store.allocator, additions);
+        existing.clearRetainingCapacity();
+        for (project.worktrees.items, 0..) |*tree, index| try existing.put(tree.path.slice(), index);
+        for (project.worktrees.items) |*tree| tree.active = false;
+        for (entries) |entry| {
+            if (existing.get(entry.path.slice())) |index| {
+                const tree = &project.worktrees.items[index];
+                tree.active = true;
+                tree.is_main = entry.is_main;
+                tree.name = entry.name;
+                tree.branch = entry.branch;
             } else {
-                project.worktrees.appendAssumeCapacity(.{
-                    .id = store.next_workspace_id,
-                    .path = entry.path,
-                    .name = entry.name,
-                    .branch = entry.branch,
-                    .is_main = entry.is_main,
-                });
-                store.next_workspace_id +%= 1;
+                project.worktrees.appendAssumeCapacity(.{ .id = store.next_workspace_id, .path = entry.path, .name = entry.name, .branch = entry.branch, .is_main = entry.is_main });
+                store.next_workspace_id += 1;
             }
         }
-        return true;
+    }
+
+    /// Retire inactive metadata only after all terminal owners have gone.
+    pub fn collectUnused(store: *Store, terminals: anytype) void {
+        var p = store.projects.items.len;
+        while (p > 0) {
+            p -= 1;
+            const project = &store.projects.items[p];
+            var owned = false;
+            var w = project.worktrees.items.len;
+            while (w > 0) {
+                w -= 1;
+                const tree = &project.worktrees.items[w];
+                if (terminals.hasWorkspace(tree.id)) {
+                    owned = true;
+                    continue;
+                }
+                if (!tree.active) _ = project.worktrees.orderedRemove(w);
+            }
+            if (!project.attached and !owned) {
+                var removed = store.projects.orderedRemove(p);
+                removed.deinit(store.allocator);
+            }
+        }
     }
 
     pub fn detach(store: *Store, project_id: u64) bool {
@@ -424,7 +401,7 @@ test "worktree porcelain creates main and linked worktrees" {
     defer store.destroy();
     const attached = store.attachPlaceholder("/tmp/repo").?;
     try std.testing.expect(store.markGit(attached.project_id, "/tmp/repo"));
-    try std.testing.expect(store.applyWorktreePorcelain(attached.project_id,
+    try std.testing.expect(@import("tests/worktree_fixture.zig").apply(store, attached.project_id,
         \\worktree /tmp/repo
         \\HEAD 1111111
         \\branch refs/heads/main
@@ -445,7 +422,7 @@ test "invalid worktree porcelain leaves the previous snapshot unchanged" {
     defer store.destroy();
     const attached = store.attachPlaceholder("/tmp/repo").?;
     try std.testing.expect(store.markGit(attached.project_id, "/tmp/repo"));
-    try std.testing.expect(store.applyWorktreePorcelain(attached.project_id,
+    try std.testing.expect(@import("tests/worktree_fixture.zig").apply(store, attached.project_id,
         \\worktree /tmp/repo
         \\HEAD 1111111
         \\branch refs/heads/main
@@ -454,7 +431,7 @@ test "invalid worktree porcelain leaves the previous snapshot unchanged" {
     const project = store.findProject(attached.project_id).?;
     const next_workspace_id = store.next_workspace_id;
 
-    try std.testing.expect(!store.applyWorktreePorcelain(attached.project_id,
+    try std.testing.expect(!@import("tests/worktree_fixture.zig").apply(store, attached.project_id,
         \\worktree relative/path
         \\branch refs/heads/broken
         \\

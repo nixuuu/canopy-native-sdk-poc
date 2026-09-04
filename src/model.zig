@@ -485,9 +485,16 @@ pub const Model = struct {
         return model.profile_edit.draft.dangerously_bypass_approvals_and_sandbox;
     }
 
+    pub fn profileControlsDisabled(model: *const Model) bool {
+        return !model.profile_edit.loaded or model.profile_edit.busy();
+    }
+    pub fn removeMissing(model: *const Model) bool {
+        return model.workspace_dialogs.removal.safety.missing;
+    }
+
     pub fn profileSaveDisabled(model: *const Model) bool {
         const name = std.mem.trim(u8, model.profile_edit.draft.name.text(), " ");
-        return model.profile_edit.saving() or !model.profile_edit.dirty or name.len == 0;
+        return model.profile_edit.busy() or !model.profile_edit.dirty or name.len == 0;
     }
 
     pub fn profileSaveLabel(model: *const Model) []const u8 {
@@ -503,7 +510,7 @@ pub const Model = struct {
         return model.profile_edit.pending_switch != null;
     }
     pub fn profileDeleteDialogOpen(model: *const Model) bool {
-        return model.profile_edit.pending_delete != null;
+        return model.profile_edit.pending_delete != null and model.profile_edit.pending_switch == null;
     }
 
     fn runningCount(model: *const Model, tool: TerminalTool) usize {
@@ -527,7 +534,7 @@ pub const Model = struct {
     }
 
     pub fn preferences_open(model: *const Model) bool {
-        return model.preferences_edit.open;
+        return model.preferences_edit.open and !model.profileSwitchDialogOpen() and !model.profileDeleteDialogOpen();
     }
 
     pub fn preferences_dirty(model: *const Model) bool {

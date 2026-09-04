@@ -18,6 +18,8 @@ pub const State = struct {
     loaded: bool = false,
     load_valid: bool = true,
     saving: bool = false,
+    submitted: ?preferences.Values = null,
+    pending_load: preferences.Values = .{},
     base_dir: canvas.TextBuffer(workspaces.max_path_bytes) = .{},
     search: canvas.TextBuffer(128) = .{},
 
@@ -89,16 +91,19 @@ pub const State = struct {
     }
 
     pub fn toggleReopen(self: *State) void {
+        if (self.saving) return;
         self.draft.reopen_last_workspace = !self.draft.reopen_last_workspace;
         self.dirty = true;
     }
 
     pub fn setAppearance(self: *State, appearance: preferences.AppearanceMode) void {
+        if (self.saving) return;
         self.draft.appearance_mode = appearance;
         self.dirty = true;
     }
 
     pub fn editBaseDir(self: *State, edit: canvas.TextInputEvent) void {
+        if (self.saving) return;
         self.base_dir.apply(edit);
         self.dirty = true;
     }
@@ -114,6 +119,7 @@ pub const State = struct {
         self.draft.worktrees_base_dir.len = 0;
         if (base_dir.len > 0 and !self.draft.worktrees_base_dir.set(base_dir)) return .{ .invalid = "Worktree base directory is too long" };
         self.saving = true;
+        self.submitted = self.draft;
         return .{ .ready = .{
             .reopen = if (self.draft.reopen_last_workspace) "true" else "false",
             .appearance = @tagName(self.draft.appearance_mode),
@@ -123,20 +129,22 @@ pub const State = struct {
 
     pub fn finishSave(self: *State, success: bool, busy: bool) Completion {
         if (!self.saving) return .{ .handled = false };
+        const submitted = self.submitted orelse return .{ .handled = false };
+        self.submitted = null;
         self.saving = false;
         if (!success) return .{ .message = if (busy) "Preferences database is busy; try again" else "Preferences could not be saved" };
-        self.saved = self.draft;
+        self.saved = submitted;
         self.dirty = false;
         return .{ .committed = true, .message = "Preferences saved" };
     }
 
     pub fn loadPage(self: *State, bytes: []const u8) void {
-        if (!preferences.decodePage(&self.saved, bytes)) self.load_valid = false;
+        if (!preferences.decodePage(&self.pending_load, bytes)) self.load_valid = false;
     }
 
     pub fn finishLoad(self: *State, success: bool) void {
         if (!success) self.load_valid = false;
-        if (!self.load_valid) self.saved = .{};
+        if (self.load_valid) self.saved = self.pending_load;
         self.draft = self.saved;
         self.loaded = true;
     }

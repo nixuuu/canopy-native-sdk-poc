@@ -13,7 +13,7 @@ test "new worktree flow preflights target and branch before checkout" {
     try std.testing.expect(stores.projects.setWorktreesBase("/tmp/canopy-worktrees"));
     const attached = stores.projects.attachPlaceholder("/tmp/canopy-repo").?;
     try std.testing.expect(stores.projects.markGit(attached.project_id, "/tmp/canopy-repo"));
-    try std.testing.expect(stores.projects.applyWorktreePorcelain(attached.project_id,
+    try std.testing.expect(@import("worktree_fixture.zig").apply(stores.projects, attached.project_id,
         \\worktree /tmp/canopy-repo
         \\HEAD 1111111
         \\branch refs/heads/main
@@ -73,7 +73,7 @@ test "Git lane keeps exactly one operation in flight and never queues user work"
     try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
     const running_key = model.git.active.key;
 
-    app.update(&model, .{ .git_done = .{ .key = running_key + 99, .outcome = .success, .output = "" } }, &fx);
+    app.update(&model, .{ .git_done = .{ .key = running_key + 99, .value = .ok } }, &fx);
     try std.testing.expect(model.gitBusy());
     try std.testing.expectEqual(running_key, model.git.active.key);
 
@@ -90,7 +90,7 @@ test "Git lane keeps exactly one operation in flight and never queues user work"
     try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
     try std.testing.expectEqual(.list_worktrees, model.git.active.kind);
     const refresh_key = model.git.active.key;
-    app.update(&model, .{ .git_done = .{ .key = running_key, .outcome = .success, .output = "" } }, &fx);
+    app.update(&model, .{ .git_done = .{ .key = running_key, .value = .ok } }, &fx);
     try std.testing.expectEqual(refresh_key, model.git.active.key);
     try std.testing.expect(model.gitBusy());
     try finishGit(&fx, &model, .success, &.{
@@ -108,7 +108,7 @@ test "repository discovery reuses an attached Git root instead of keeping a dupl
     defer stores.deinit();
     const existing = stores.projects.attachPlaceholder("/tmp/repository").?;
     try std.testing.expect(stores.projects.markGit(existing.project_id, "/tmp/repository"));
-    try std.testing.expect(stores.projects.applyWorktreePorcelain(existing.project_id,
+    try std.testing.expect(@import("worktree_fixture.zig").apply(stores.projects, existing.project_id,
         \\worktree /tmp/repository
         \\HEAD 1111111
         \\branch refs/heads/main
@@ -166,7 +166,7 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
     defer stores.deinit();
     const attached = stores.projects.attachPlaceholder("/tmp/removal-repo").?;
     try std.testing.expect(stores.projects.markGit(attached.project_id, "/tmp/removal-repo"));
-    try std.testing.expect(stores.projects.applyWorktreePorcelain(attached.project_id,
+    try std.testing.expect(@import("worktree_fixture.zig").apply(stores.projects, attached.project_id,
         \\worktree /tmp/removal-repo
         \\HEAD 1111111
         \\branch refs/heads/main
@@ -194,8 +194,6 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
     try std.testing.expectEqualStrings("truecolor", envValue(shell_request, "COLORTERM") orelse "");
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
     try finishGit(&fx, &model, .success, &.{" M README.md"});
-    try finishGit(&fx, &model, .negative, &.{});
-    try finishGit(&fx, &model, .success, &.{});
     try std.testing.expect(model.workspace_dialogs.removal.open);
     try std.testing.expect(model.removeHasWarnings());
 
@@ -220,8 +218,6 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
     app.update(&model, .{ .open_terminal = linked }, &fx);
     try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
     try finishGit(&fx, &model, .success, &.{" M README.md"});
-    try finishGit(&fx, &model, .negative, &.{});
-    try finishGit(&fx, &model, .success, &.{});
     const remove = model.git.active.request(stores.projects).?.remove_worktree;
     try std.testing.expect(remove.force);
     app.update(&model, .{ .open_terminal = linked }, &fx);
@@ -233,7 +229,7 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
         "branch refs/heads/main",
         "",
     });
-    try std.testing.expect(!stores.projects.findWorktree(linked).?.active);
+    try std.testing.expect(stores.projects.findWorktree(linked) == null);
     try std.testing.expect(!model.busy());
 }
 
@@ -242,7 +238,7 @@ test "worktree removal asks again when the fresh preflight changed" {
     defer stores.deinit();
     const attached = stores.projects.attachPlaceholder("/tmp/recheck-repo").?;
     try std.testing.expect(stores.projects.markGit(attached.project_id, "/tmp/recheck-repo"));
-    try std.testing.expect(stores.projects.applyWorktreePorcelain(attached.project_id,
+    try std.testing.expect(@import("worktree_fixture.zig").apply(stores.projects, attached.project_id,
         \\worktree /tmp/recheck-repo
         \\HEAD 1111111
         \\branch refs/heads/main
@@ -261,14 +257,10 @@ test "worktree removal asks again when the fresh preflight changed" {
 
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
     try finishGit(&fx, &model, .success, &.{});
-    try finishGit(&fx, &model, .negative, &.{});
-    try finishGit(&fx, &model, .success, &.{});
     try std.testing.expect(!model.removeHasWarnings());
 
     app.update(&model, .confirm_remove_worktree, &fx);
     try finishGit(&fx, &model, .success, &.{" M changed.txt"});
-    try finishGit(&fx, &model, .negative, &.{});
-    try finishGit(&fx, &model, .success, &.{});
     try std.testing.expect(model.workspace_dialogs.removal.open);
     try std.testing.expectEqualStrings("Worktree safety state changed; review again", model.status_text);
     try std.testing.expect(!model.teardown.busy());
@@ -276,14 +268,12 @@ test "worktree removal asks again when the fresh preflight changed" {
 
     app.update(&model, .confirm_remove_worktree, &fx);
     try finishGit(&fx, &model, .success, &.{" M changed.txt"});
-    try finishGit(&fx, &model, .negative, &.{});
-    try finishGit(&fx, &model, .success, &.{});
     const remove = model.git.active.request(stores.projects).?.remove_worktree;
     try std.testing.expect(remove.force);
     try finishGit(&fx, &model, .failure, &.{});
     try std.testing.expect(!model.busy());
     try std.testing.expect(stores.projects.findWorktree(linked).?.active);
-    try std.testing.expectEqualStrings("Git refused to remove the worktree", model.status_text);
+    try std.testing.expectEqualStrings("Git could not read or update the repository", model.status_text);
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
     try std.testing.expectEqual(.remove_status, model.git.active.kind);
 }

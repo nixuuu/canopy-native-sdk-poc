@@ -73,7 +73,7 @@ test "sidebar width survives a real SQLite close and reopen without changing oth
     try std.testing.expect(captured.valid);
     try std.testing.expectEqual(@as(u8, 18), captured.values.font_size);
     var restarted = app.initialModel(stores.tabs, stores.projects, stores.profiles);
-    restarted.preferences_edit.saved = captured.values;
+    restarted.preferences_edit.pending_load = captured.values;
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;

@@ -69,7 +69,7 @@ pub const Spec = struct {
                 if (!spec.putOptionalEnv("OPENAI_BASE_URL", prefs.base_url.slice())) return null;
             },
         }
-        spec.appendCustomEnv(arena, prefs.custom_env.slice());
+        if (!spec.appendCustomEnv(arena, prefs.custom_env.slice())) return null;
         return spec;
     }
 
@@ -108,12 +108,12 @@ pub const Spec = struct {
         return value.len == 0 or spec.putEnv(name, value);
     }
 
-    fn appendCustomEnv(spec: *Spec, arena: std.mem.Allocator, source: []const u8) void {
-        if (source.len == 0) return;
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{}) catch return;
+    fn appendCustomEnv(spec: *Spec, arena: std.mem.Allocator, source: []const u8) bool {
+        if (source.len == 0) return true;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{}) catch return false;
         const object = switch (parsed) {
             .object => |value| value,
-            else => return,
+            else => return false,
         };
         var iterator = object.iterator();
         while (iterator.next()) |entry| {
@@ -122,8 +122,9 @@ pub const Spec = struct {
                 .string => |text| text,
                 else => continue,
             };
-            _ = spec.putEnv(entry.key_ptr.*, value);
+            if (!spec.putEnv(entry.key_ptr.*, value)) return false;
         }
+        return true;
     }
 };
 

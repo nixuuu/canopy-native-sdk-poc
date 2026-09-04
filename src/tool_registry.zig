@@ -4,8 +4,8 @@ const profiles = @import("profiles.zig");
 const tabs = @import("terminal_tabs.zig");
 const workspaces = @import("workspaces.zig");
 
-pub const claude_check_key: u64 = 8_100;
-pub const codex_check_key: u64 = 8_101;
+pub const claude_check_key = @import("effect_keys.zig").key(.tools, 1);
+pub const codex_check_key = @import("effect_keys.zig").key(.tools, 2);
 
 pub const Agent = struct {
     expanded: bool = false,

@@ -2,12 +2,13 @@
 
 const std = @import("std");
 const db_page = @import("db_page.zig");
+const fields = @import("profile_fields.zig");
 const workspaces = @import("workspaces.zig");
 
 pub const max_profile_id_bytes: usize = 128;
 pub const max_profile_name_bytes: usize = 128;
-pub const max_pref_bytes: usize = 512;
-pub const max_long_pref_bytes: usize = 4096;
+pub const max_pref_bytes: usize = fields.short_capacity;
+pub const max_long_pref_bytes: usize = fields.long_capacity;
 
 pub const IdText = workspaces.Text(max_profile_id_bytes);
 pub const NameText = workspaces.Text(max_profile_name_bytes);
@@ -31,6 +32,7 @@ pub const AgentType = enum {
 };
 
 pub const Prefs = struct {
+    extra_json: LongPrefText = .{},
     model: PrefText = .{},
     custom_env: LongPrefText = .{},
     settings_json: LongPrefText = .{},
@@ -45,6 +47,13 @@ pub const Prefs = struct {
     dangerously_bypass_approvals_and_sandbox: bool = false,
     profile: PrefText = .{},
 };
+
+comptime {
+    if (@typeInfo(Prefs).@"struct".fields.len != fields.text.len + fields.boolean.len + 1)
+        @compileError("Every profile preference needs a profile_fields schema entry");
+}
+
+pub const max_encoded_bytes = @sizeOf(Prefs) * 6 + 1024;
 
 pub const Profile = struct {
     runtime_id: u64,
@@ -114,6 +123,8 @@ pub const load_sql =
 pub const Store = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayListUnmanaged(Profile) = .empty,
+    pending_items: std.ArrayListUnmanaged(Profile) = .empty,
+    loading: bool = false,
     next_runtime_id: u64 = 1,
     next_native_id: u64 = 1,
 
@@ -126,13 +137,20 @@ pub const Store = struct {
     pub fn destroy(store: *Store) void {
         const allocator = store.allocator;
         store.items.deinit(allocator);
+        store.pending_items.deinit(allocator);
         allocator.destroy(store);
     }
 
-    pub fn clear(store: *Store) void {
-        store.items.clearRetainingCapacity();
-        store.next_runtime_id = 1;
-        store.next_native_id = 1;
+    pub fn beginLoad(store: *Store) void {
+        store.pending_items.clearRetainingCapacity();
+        store.loading = true;
+    }
+
+    pub fn finishLoad(store: *Store, success: bool) void {
+        if (!store.loading) return;
+        if (success) std.mem.swap(std.ArrayListUnmanaged(Profile), &store.items, &store.pending_items);
+        store.pending_items.clearRetainingCapacity();
+        store.loading = false;
     }
 
     pub fn count(store: *const Store, agent_type: AgentType) usize {
@@ -227,67 +245,56 @@ pub const Store = struct {
             profile.is_default = is_default == 1;
             profile.sort_index = sort_index;
             profile.has_api_key = has_api_key == 1;
-            decodePrefs(&profile.prefs, prefs_json);
+            if (!decodePrefs(&profile.prefs, prefs_json)) return false;
+            if (store.findByDatabaseId(id)) |existing| profile.runtime_id = existing.runtime_id;
             decoded.append(store.allocator, profile) catch return false;
         }
         if (!page.done()) return false;
-        store.items.appendSlice(store.allocator, decoded.items) catch return false;
+        const target = if (store.loading) &store.pending_items else &store.items;
+        target.appendSlice(store.allocator, decoded.items) catch return false;
         store.next_runtime_id = next_runtime_id;
         return true;
     }
 };
 
-const PrefsWire = struct {
-    model: ?[]const u8 = null,
-    customEnv: ?[]const u8 = null,
-    settingsJson: ?[]const u8 = null,
-    permissionMode: ?[]const u8 = null,
-    effortLevel: ?[]const u8 = null,
-    appendSystemPrompt: ?[]const u8 = null,
-    baseUrl: ?[]const u8 = null,
-    provider: ?[]const u8 = null,
-    approvalMode: ?[]const u8 = null,
-    sandbox: ?[]const u8 = null,
-    fullAuto: ?[]const u8 = null,
-    dangerouslyBypassApprovalsAndSandbox: ?[]const u8 = null,
-    profile: ?[]const u8 = null,
-};
-
-fn decodePrefs(out: *Prefs, json: []const u8) void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const parsed = std.json.parseFromSliceLeaky(PrefsWire, arena.allocator(), json, .{ .ignore_unknown_fields = true }) catch return;
-    if (parsed.model) |value| _ = out.model.set(value);
-    if (parsed.customEnv) |value| _ = out.custom_env.set(value);
-    if (parsed.settingsJson) |value| _ = out.settings_json.set(value);
-    if (parsed.permissionMode) |value| _ = out.permission_mode.set(value);
-    if (parsed.effortLevel) |value| _ = out.effort_level.set(value);
-    if (parsed.appendSystemPrompt) |value| _ = out.append_system_prompt.set(value);
-    if (parsed.baseUrl) |value| _ = out.base_url.set(value);
-    if (parsed.provider) |value| _ = out.provider.set(value);
-    if (parsed.approvalMode) |value| _ = out.approval_mode.set(value);
-    if (parsed.sandbox) |value| _ = out.sandbox.set(value);
-    out.full_auto = if (parsed.fullAuto) |value| std.mem.eql(u8, value, "true") else false;
-    out.dangerously_bypass_approvals_and_sandbox = if (parsed.dangerouslyBypassApprovalsAndSandbox) |value| std.mem.eql(u8, value, "true") else false;
-    if (parsed.profile) |value| _ = out.profile.set(value);
+pub fn decodePrefs(out: *Prefs, json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    var object = parsed.value.object;
+    var decoded: Prefs = .{};
+    inline for (fields.text) |field| {
+        if (object.fetchSwapRemove(field.wire)) |entry| {
+            if (entry.value != .null) {
+                if (entry.value != .string or !@field(decoded, field.name).set(entry.value.string)) return false;
+            }
+        }
+    }
+    inline for (fields.boolean) |field| {
+        if (object.fetchSwapRemove(field.wire)) |entry| {
+            if (entry.value != .null) {
+                if (entry.value != .string) return false;
+                const value = entry.value.string;
+                if (!std.mem.eql(u8, value, "true") and !std.mem.eql(u8, value, "false") and value.len != 0) return false;
+                @field(decoded, field.name) = std.mem.eql(u8, value, "true");
+            }
+        }
+    }
+    var writer = std.Io.Writer.fixed(&decoded.extra_json.bytes);
+    std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer) catch return false;
+    decoded.extra_json.len = writer.buffered().len;
+    out.* = decoded;
+    return true;
 }
 
 pub fn encodePrefs(prefs: *const Prefs, out: []u8) ?[]const u8 {
-    const value = .{
-        .model = prefs.model.slice(),
-        .customEnv = prefs.custom_env.slice(),
-        .settingsJson = prefs.settings_json.slice(),
-        .permissionMode = prefs.permission_mode.slice(),
-        .effortLevel = prefs.effort_level.slice(),
-        .appendSystemPrompt = prefs.append_system_prompt.slice(),
-        .baseUrl = prefs.base_url.slice(),
-        .provider = prefs.provider.slice(),
-        .approvalMode = prefs.approval_mode.slice(),
-        .sandbox = prefs.sandbox.slice(),
-        .fullAuto = if (prefs.full_auto) "true" else "",
-        .dangerouslyBypassApprovalsAndSandbox = if (prefs.dangerously_bypass_approvals_and_sandbox) "true" else "",
-        .profile = prefs.profile.slice(),
-    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var value = std.json.parseFromSliceLeaky(std.json.Value, allocator, if (prefs.extra_json.len == 0) "{}" else prefs.extra_json.slice(), .{}) catch return null;
+    if (value != .object) return null;
+    inline for (fields.text) |field| value.object.put(allocator, field.wire, .{ .string = @field(prefs, field.name).slice() }) catch return null;
+    inline for (fields.boolean) |field| value.object.put(allocator, field.wire, .{ .string = if (@field(prefs, field.name)) "true" else "" }) catch return null;
     var writer = std.Io.Writer.fixed(out);
     std.json.Stringify.value(value, .{}, &writer) catch return null;
     return writer.buffered();
@@ -301,7 +308,7 @@ test "profile preferences preserve Electron's string JSON encoding" {
     var buffer: [max_long_pref_bytes * 3]u8 = undefined;
     const json = encodePrefs(&prefs, &buffer) orelse return error.TestUnexpectedResult;
     var decoded: Prefs = .{};
-    decodePrefs(&decoded, json);
+    try std.testing.expect(decodePrefs(&decoded, json));
     try std.testing.expectEqualStrings("gpt-5.6", decoded.model.slice());
     try std.testing.expectEqualStrings("on-request", decoded.approval_mode.slice());
     try std.testing.expect(decoded.full_auto);

@@ -10,9 +10,9 @@
         <text size="sm" foreground="text_muted">System preserves high-contrast and reduced-motion preferences.</text>
       </column>
       <row gap="4" role="radiogroup" label="Color mode">
-        <button size="sm" variant="ghost" selected="{preferencesAppearanceSystem}" on-press="use_system_appearance">System</button>
-        <button size="sm" variant="ghost" selected="{preferencesAppearanceLight}" on-press="use_light_appearance">Light</button>
-        <button size="sm" variant="ghost" selected="{preferencesAppearanceDark}" on-press="use_dark_appearance">Dark</button>
+        <button disabled="{preferences_edit.saving}" size="sm" variant="ghost" selected="{preferencesAppearanceSystem}" on-press="use_system_appearance">System</button>
+        <button disabled="{preferences_edit.saving}" size="sm" variant="ghost" selected="{preferencesAppearanceLight}" on-press="use_light_appearance">Light</button>
+        <button disabled="{preferences_edit.saving}" size="sm" variant="ghost" selected="{preferencesAppearanceDark}" on-press="use_dark_appearance">Dark</button>
       </row>
     </row>
   </column>

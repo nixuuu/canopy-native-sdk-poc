@@ -131,7 +131,7 @@ pub const Host = struct {
         const layout = runtime.canvasWidgetLayout(1, "main-canvas") catch return;
         var frame: ?geometry.RectF = null;
         if (!blocked) for (layout.nodes) |node| {
-            if (std.mem.eql(u8, node.widget.semantics.label, "Ghostty terminal viewport") and node.frame.width > 0 and node.frame.height > 0) {
+            if (node.widget.id == @import("canvas_host.zig").terminal_viewport_id and node.frame.width > 0 and node.frame.height > 0) {
                 frame = node.frame;
                 break;
             }

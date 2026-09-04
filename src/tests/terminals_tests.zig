@@ -29,7 +29,7 @@ test "shell and tool allocation failure leave no tab or pending process" {
             app.update(&model, if (tool) .{ .launch_agent = .codex } else .open_active_terminal, &fx);
             try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
             try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
-            try std.testing.expectEqual(@as(u64, 1), stores.tabs.free_pty_keys.items[0]);
+            try std.testing.expectEqual(@import("../effect_keys.zig").first(.pty), stores.tabs.free_pty_keys.items[0]);
             try std.testing.expectEqual(@as(u64, 0), model.terminal_state.active(model.active_workspace_id));
         }
     }
@@ -370,7 +370,7 @@ test "close tab shortcut cannot close terminals behind any application modal" {
         @field(model.workspace_dialogs, field).open = false;
     }
     inline for (.{ "pending_switch", "pending_delete" }) |field| {
-        @field(model.profile_edit, field) = 1;
+        @field(model.profile_edit, field) = if (comptime std.mem.eql(u8, field, "pending_switch")) .{ .profile = 1 } else 1;
         try std.testing.expect(!model.canCloseActiveTab());
         app.update(&model, .close_active_tab, &fx);
         try std.testing.expectEqual(app.TerminalPhase.starting, stores.tabs.items.items[0].phase);

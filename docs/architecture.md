@@ -1,55 +1,105 @@
 # Architecture
 
-Canopy uses a small composition root and keeps state transitions separate from
-Native SDK effects. Dependencies point toward domain state; domain modules do
-not import `main.zig` or the native host.
+The application keeps UI projection, state transitions and native execution
+separate. `main.zig` assembles the host; `app_controller.zig` exhaustively routes
+messages and composes startup. Neither is a feature implementation registry.
 
-## Layers
+## Feature boundaries
 
-- `main.zig` assembles markup, migrations, the native host and process startup.
-- `messages.zig` defines the typed UI/effect message contract.
-- `model.zig` owns application state and read-only markup projections.
-- `app_controller.zig` routes messages and performs Native SDK effects.
-- State modules (`terminal_controller.zig`, `preferences_editor.zig`,
-  `profile_editor.zig`, `project_persistence.zig`, `tool_registry.zig`,
-  `workspace_dialogs.zig`, `teardown_state.zig`) own transitions without host
-  process, file or database calls.
-- Transport adapters (`git_libgit2.zig`, `git_host.zig`, `ghostty_bridge.m`) translate typed domain
-  requests to platform operations.
-- Stores and parsers (`workspaces.zig`, `profiles.zig`, `preferences.zig`,
-  `ghostty_config.zig`) own bounded data and compatibility formats.
+| Module | Responsibility |
+| --- | --- |
+| `app_types.zig`, `messages.zig` | Shared application contracts, independent of host composition |
+| `workspace_actions.zig` | Attach/restore, worktree workflows, teardown coordination and project persistence |
+| `terminal_actions.zig` | Terminal commands and application statuses |
+| `settings_actions.zig` | Preference/profile queries, writes and navigation |
+| `agent_actions.zig` | Tool discovery, launch preparation and titles |
+| `sidebar_actions.zig` | Width persistence effects |
+| `model.zig`, `.native` files | Read-only projections and declarative layout |
 
-## Invariants
+State modules (`git_workflow`, `terminal_controller`, `teardown_state`, editors
+and persistence state) own transitions. Stores own records. Feature modules
+may coordinate each other through named operations but do not import
+`main.zig` or `app_controller.zig`. Native adapters never implement user-consent
+policy. Do not add another framework layer to wrap a single operation.
 
-1. Git has exactly one operation in flight. A second request is rejected, never
-   queued, and only the matching completion releases the lane.
-2. Every terminal tab has a monotonic tab identity. PTY keys may be recycled
-   only after the previous tab is retired.
-3. Closing a project or worktree waits for all owned terminal callbacks before
-   detach or Git removal starts.
-4. Preferences and project snapshots commit only matching active writes.
-5. Raw Ghostty configuration remains host-only because it may contain secrets.
-6. Markup is a projection of model state; it does not own process lifecycle.
+## Git and teardown
 
-## Change workflow
+`git_workflow.Request` and `Value` are typed contracts: booleans, paths, worktree
+entries, a safety snapshot, or a classified error. Production has no porcelain
+protocol; old-format fixture decoding is confined to `src/tests/`.
 
-Keep behavioral changes separate from structural refactors. Add state-machine
-tests beside pure modules and application scenarios under `src/tests/`. Run
-`npm run verify` locally before handing off a slice; it formats recursively,
-runs the model/markup contract and terminal suites, checks Native markup, and
-builds ReleaseFast. CI is intentionally outside the current PoC cleanup scope.
+`git_host` owns one worker and copies request data before launching it. The
+worker owns all libgit2 handles. Its SDK channel wakes the loop; only a matching
+notification marks the lane ready. `git_service.Service(Executor)` consumes
+completed results synchronously and starts the next admitted request. Its
+executor can be replaced in tests. Every executor supplies `busy`, `start`,
+`completed`, `release`, and `deinit`; borrowed worktree entries remain live
+until `release` after the consumer returns.
 
-`git_libgit2.zig` implements the typed local requests through the pinned C API.
-The native host starts `git_host.zig` only after lane admission, with copied
-request data. One worker owns all libgit2 handles and result memory. A dedicated
-SDK channel wakes the UI without polling; the host joins the completed worker,
-dispatches the borrowed result synchronously, frees it and starts the next step.
-The host also joins at shutdown. No worker touches the model or stores.
-SDK session replay does not currently reproduce host-delivered Git results.
+Host event order is explicit:
 
-The build compiles hash-pinned libgit2 using CMake, with a static archive and
-local repository support. No SDK modifications are needed. Hooks and external
-filters are not run; network transports are disabled. Removal verifies linked
-worktree identity, common repository, validity, lock state and (unless approved
-force) dirty/submodule state immediately before pruning. The existing UI also
-rechecks its safety snapshot after terminal shutdown.
+1. Process SDK messages and geometry.
+2. Drain the ready Git result.
+3. Reconcile terminal/native callbacks.
+4. Submit any newly admitted Git operation, including one admitted by a
+   terminal-exit callback in step 3.
+5. Finish sidebar interaction and persistence.
+
+A second Git request is rejected, never queued. Shutdown joins the owned worker
+before destroying its channel or stores. SDK journal replay of host-owned Git
+results remains unsupported.
+
+Removal waits for owned terminals, inspects the actual worktree HEAD, branch,
+working/index state, submodules and unpublished history, and compares this to
+the approved snapshot. The library adapter repeats inspection before pruning.
+HEAD or safety changes return `changed` and require another review. Read errors
+are errors, not invented dirty flags or commit counts. Force cannot bypass
+worktree locks, identity checks or the approval snapshot. Detached commits are
+compared against local and remote refs; attached branches against remote refs.
+The dirty-state fingerprint includes paths, index object IDs and filesystem
+size/mtime; it is a change detector, not a transaction lock against external Git
+processes. External processes must not mutate a checkout during removal.
+
+## Terminal ownership
+
+`terminal_controller` is the only owner of tab lifecycle transitions, including
+bulk close. `terminal_transport` selects Native SDK PTY effects or owned Ghostty
+launch data. A monotonic tab identity protects native callbacks from recycled
+PTY keys. `ghostty_host` maps callbacks and mounts views; `ghostty_bridge.m`
+owns the embedded engine while `ghostty_view.m` owns AppKit input/IME/geometry.
+Their private declarations live in `ghostty_native.h`; the public C ABI remains
+in `ghostty_bridge.h`. The viewport uses an authored global key, never an
+accessibility label, for native mounting.
+
+Inactive worktrees and detached projects are collected only when no terminal
+owns them. Snapshot reconciliation validates and reserves before mutation and
+uses path indexes. Entity IDs are never reused. SDK effect keys use disjoint
+families in `effect_keys.zig` and remain exactly representable in JSON.
+
+## Settings and compatibility
+
+Preference saves retain the submitted snapshot. Editors freeze mutations while
+a write/reload is pending, and only a matching active completion commits state.
+All navigation replacing a dirty profile draft goes through one consent gate,
+including agent changes, new profile, close and reload.
+
+Profile queries stage pages and atomically replace the visible store on success.
+Failure retains the previous snapshot and offers reload. Profile codecs reject
+malformed/oversized known fields and preserve unknown JSON fields. `profile_fields`
+is the shared JSON/editor/validation schema; explicit CLI mapping stays in
+`tool_launch`. Add tests for new fields and maintain the external JSON dialect.
+
+## Verification and dependencies
+
+Run `npm run verify`: Zig formatting, patch-inventory validation, application,
+terminal, native policy tests, strict markup validation and ReleaseFast build.
+Native renderer/viewport changes additionally require a real macOS window check;
+canvas-only captures omit adopted NSViews. `-Dsmoke=true` uses a separate app
+identity/database and worktree base for that check. `npm run format:native`
+formats the owned Objective-C integration using `.clang-format` (clang-format
+must be installed). The pinned SDK patch inventory is in `docs/sdk-patches.md`.
+
+Keep fixes separate from future feature changes. Never write Electron Canopy's
+database. Raw Ghostty configuration remains host-only. libgit2 is statically
+linked from hash-pinned sources; network transports, hooks and external Git
+filters are not enabled by this local integration.

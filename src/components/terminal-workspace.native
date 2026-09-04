@@ -43,7 +43,7 @@
               </if>
               <if test="{tab.phase == 'failed'}"><text size="sm" foreground="destructive">Failed</text></if>
             </row>
-            <if test="{use_ghostty}"><column grow="1" label="Ghostty terminal viewport" /></if>
+            <if test="{use_ghostty}"><column grow="1" global-key="canopy-terminal-viewport" label="Ghostty terminal viewport" /></if>
             <else><terminal pty="{tab.pty}" autofocus="true" grow="1" focus-ring="background" label="{tab.title}" /></else>
           </column>
         </if>

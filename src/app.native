@@ -42,6 +42,7 @@
   <if test="{create_dialog_open}"><use template="create-worktree-dialog" /></if>
   <if test="{remove_dialog_open}"><use template="remove-worktree-dialog" /></if>
   <if test="{detach_dialog_open}"><use template="detach-project-dialog" /></if>
+  <!-- Present one dialog at a time; the editor draft stays in the model. -->
   <if test="{preferences_open}"><use template="preferences-dialog" /></if>
   <if test="{profileSwitchDialogOpen}"><use template="profile-switch-dialog" /></if>
   <if test="{profileDeleteDialogOpen}"><use template="profile-delete-dialog" /></if>

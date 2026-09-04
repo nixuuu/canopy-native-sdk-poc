@@ -25,7 +25,7 @@
       <dialog width="400" height="180" background="surface" label="Discard Profile Changes" on-dismiss="cancel_profile_switch">
         <column padding="16" gap="10">
           <text size="heading">Discard unsaved changes?</text>
-          <text foreground="text_muted" wrap="true">You have unsaved changes in the current profile. Switch anyway?</text>
+          <text foreground="text_muted" wrap="true">You have unsaved changes in the current profile. Discard them and continue?</text>
           <spacer grow="1" />
           <use template="dialog-actions">
             <button variant="ghost" on-press="cancel_profile_switch">Cancel</button>
@@ -65,6 +65,7 @@
           <if test="{removeHasWarnings}">
             <alert variant="destructive" text="This worktree needs explicit force consent.">
               <column gap="4">
+                <if test="{removeMissing}"><text size="sm">The directory is missing. Only its Git registration will be removed.</text></if>
                 <if test="{removeDirty}"><text size="sm">It contains uncommitted changes.</text></if>
                 <if test="{removeHasSubmodules}"><text size="sm">It contains submodule configuration that Git may refuse to remove safely.</text></if>
                 <if test="{removeUnmergedCount > 0}"><text size="sm">{removeUnmergedCount} commit(s) are not present on any remote.</text></if>

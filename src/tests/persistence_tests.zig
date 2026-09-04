@@ -71,7 +71,7 @@ test "detach waits for every owned terminal and leaves unrelated sessions runnin
     try fx.feedPtyExit(pty_one, -1, 0, .cancelled, 0);
     while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
     try std.testing.expect(!model.busy());
-    try std.testing.expect(!stores.projects.findProject(first.project_id).?.attached);
+    try std.testing.expect(stores.projects.findProject(first.project_id) == null);
     try std.testing.expect(stores.projects.findProject(other.project_id).?.attached);
     try std.testing.expectEqual(@as(usize, 1), stores.tabs.items.items.len);
     try std.testing.expectEqual(pty_other, stores.tabs.items.items[0].pty);

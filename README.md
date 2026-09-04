@@ -102,7 +102,7 @@ The implementation mirrors Canopy Desktop's important ownership boundary:
 project -> worktree -> terminal tabs -> native PTY
 ```
 
-`src/main.zig` owns the root model, typed effects, and orchestration. Pure
+`src/main.zig` assembles the host, and feature action modules orchestrate typed effects. Pure
 boundaries keep data handling out of that reducer: `db_page.zig` decodes bounded
 SQLite pages, `tool_launch.zig` builds validated Claude/Codex argv and
 environment overlays, and `terminal_tabs.zig` owns terminal metadata, PTY-key
@@ -122,7 +122,7 @@ switching worktrees restores that worktree's last active tab.
 
 `profile_editor.zig` owns the profile draft, validation, pending confirmations
 and write lifecycle. It prepares borrowed save data and resolves selection after
-reload by database identity. `main.zig` keeps the SQLite effects and UI section
+reload by database identity. `settings_actions.zig` keeps the SQLite effects and UI section
 routing; the Electron-compatible schema and profile JSON dialect are unchanged.
 
 `ghostty_bridge.h` is the shared ABI contract, imported by Zig through
@@ -131,7 +131,7 @@ routing; the Electron-compatible schema and profile JSON dialect are unchanged.
 
 `terminal_controller.zig` owns monotonic tab identity, recyclable PTY keys,
 per-worktree selection and close/output/exit state transitions.
-`main.zig` keeps only the Native SDK PTY effects and user-facing statuses;
+`terminal_actions.zig` and `terminal_transport.zig` apply PTY effects and user-facing statuses;
 `ghostty_host.zig` consumes the same controller state for surface adoption.
 
 `CanopyHost.event` keeps an explicit order: prepare sidebar geometry, deliver the
@@ -141,29 +141,23 @@ persistence. `sidebar_controller.zig` owns that sidebar coordination;
 Event-order tests cover resize coalescing, startup, pointer release, hover and
 shutdown staging without needing a GUI or a live PTY.
 
-Git operations use `git_workflow.zig` for semantic requests, creation-step
-transitions, removal safety snapshots and the single-flight lane.
-`git_libgit2.zig` calls libgit2 1.9.7 directly through Zig's C interop.
-`git_host.zig` copies requests into owned memory and runs one worker at a time;
-a Native SDK channel wakes the host to deliver the result on the UI thread.
-Shutdown joins the worker before releasing its memory. `app_controller.zig`
-handles results and `teardown_state.zig` fences terminal shutdown and fresh
-safety review. No local Git operation launches a subprocess.
+Git uses typed requests and results through statically linked libgit2 1.9.7.
+`git_service.zig` coordinates admission, matching completion notifications and
+worker-owned result lifetimes. Tests exercise the same service with controlled
+and real executors, without starting a macOS event loop. Removal inspects the
+actual worktree HEAD and revalidates the approved safety snapshot before pruning.
 
-libgit2 is built from hash-verified sources and linked statically. Only local
-repository operations are enabled; SSH and HTTPS transports are disabled.
-The build requires CMake but no system libgit2 installation. Worktree listing
-uses the existing internal porcelain decoder. Main, foreign and locked
-worktrees are protected from removal; force consent can remove dirty worktrees
-but cannot bypass a lock. Discovery from a linked worktree resolves the primary
-repository so attaching it does not create a duplicate project.
+`app_controller.zig` routes messages to feature modules for workspace, terminal,
+settings, agent and sidebar operations. Editors protect dirty drafts and freeze
+edits during writes. Profile reloads atomically replace staged data; malformed
+known fields are rejected and unknown JSON properties survive editing.
 
-Git hooks and external Git filters are not executed by this integration.
-Repositories requiring those checkout side effects need separate support.
-Bare primary repositories and paths containing line breaks are not supported
-by the project store. Failed or oversized reads leave the existing worktree
-snapshot intact. Git worker results are host-delivered; SDK session replay of
-Git workflows is not currently supported.
+The build requires CMake but no system libgit2 installation. SSH/HTTPS, Git hooks
+and external filters (including LFS) are not enabled. Bare primary repositories
+and line-break paths are unsupported. SDK replay of host-owned Git results is
+not yet implemented. See [architecture](docs/architecture.md) for ownership,
+event ordering, verification and extension rules, and the
+[SDK patch map](docs/sdk-patches.md) before upgrading dependencies.
 
 Claude and Codex share the `agent-launcher` template in
 `components/tools-sidebar.native`, including profile expansion and launch
@@ -179,24 +173,24 @@ stay beside their implementations. Run `npm run verify` locally for recursive
 format checks, markup checks, all test suites and the ReleaseFast build.
 
 `project_persistence.zig` owns restore scanning and coalesced project-snapshot
-writes. File effects remain in `main.zig`; only the matching active write key
+writes. File effects remain in `workspace_actions.zig`; only the matching active write key
 can complete a write, so delayed callbacks cannot release a newer operation.
 
 `workspace_dialogs.zig` groups the create-worktree draft, removal safety review
 and detach selection. It also retains checkout refresh state until the matching
-Git listing completes; Git and PTY effects remain in `main.zig`.
+Git listing completes; Git and PTY effects are coordinated by the workspace and terminal action modules.
 
 `preferences_editor.zig` owns the preferences dialog draft, navigation,
-validation and save/load lifecycle. SQLite effects remain in `main.zig`, while
+validation and save/load lifecycle. SQLite effects remain in `settings_actions.zig`, while
 the editor decides whether a completion is current and whether it commits the
 Electron-compatible preference values.
 
 `model.zig` owns application state and all projections required by Native
-markup. It has no host effects. `main.zig` is limited to messages, effect
-routing, application boot and native-host coordination.
+markup. It has no host effects. The app controller routes messages and composes
+startup; the native host reconciles services.
 
 `messages.zig` is the typed UI/host message contract. `app_controller.zig`
-owns the reducer and side-effect orchestration. `main.zig` only assembles the
+delegates to feature action modules. `main.zig` only assembles the
 compiled view, migrations, native host and process entrypoint.
 The dependency direction and lifecycle invariants are summarized in
 [`docs/architecture.md`](docs/architecture.md).

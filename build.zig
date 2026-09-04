@@ -8,6 +8,12 @@ pub fn build(b: *std.Build) void {
         .manifest = "app.json",
         .terminal_sessions = true,
     });
+    const config = b.addOptions();
+    const smoke = b.option(bool, "smoke", "Use an isolated application identity for native-window smoke tests") orelse false;
+    config.addOption([]const u8, "bundle_id", if (smoke) "tech.itsol.canopy.native-poc.smoke" else "tech.itsol.canopy.native-poc");
+    config.addOption(bool, "smoke", smoke);
+    app.exe.root_module.addOptions("app_config", config);
+    app.tests.root_module.addOptions("app_config", config);
     app.exe.root_module.addIncludePath(b.path("src"));
     app.tests.root_module.addIncludePath(b.path("src"));
     const git_source = b.dependency("libgit2", .{});
@@ -40,6 +46,7 @@ pub fn build(b: *std.Build) void {
         else
             &.{ "-fobjc-arc", "-fno-sanitize=builtin" };
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/ghostty_bridge.m"), .flags = flags });
+        app.exe.root_module.addCSourceFile(.{ .file = b.path("src/ghostty_view.m"), .flags = flags });
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/app_menu.m"), .flags = flags });
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/app_chrome.m"), .flags = flags });
         const clock_module = b.createModule(.{ .target = app.exe.root_module.resolved_target, .optimize = .Debug, .link_libc = true });

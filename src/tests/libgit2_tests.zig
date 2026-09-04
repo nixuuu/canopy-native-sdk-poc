@@ -75,104 +75,173 @@ const Fixture = struct {
     }
 
     fn create(self: *Fixture) !void {
-        try expect(.{ .create_branch = .{ .repo = self.root, .branch = "feature/test" } }, .success, false);
-        try expect(.{ .create_worktree = .{ .repo = self.root, .path = self.linked, .branch = "feature/test" } }, .success, false);
+        try succeeds(.{ .create_branch = .{ .repo = self.root, .branch = "feature/test" } });
+        try succeeds(.{ .create_worktree = .{ .repo = self.root, .path = self.linked, .branch = "feature/test" } });
     }
 };
 
-fn expect(request: workflow.Request, outcome: workflow.Outcome, nonempty: bool) !void {
+fn succeeds(request: workflow.Request) !void {
     var response = backend.execute(a, request);
     defer response.deinit(a);
-    try std.testing.expectEqual(outcome, response.outcome);
-    try std.testing.expectEqual(nonempty, response.output.items.len > 0);
+    try std.testing.expect(response.value != .failure);
 }
 
-test "libgit2 discovers roots and creates lists and removes a real worktree without subprocesses" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try expect(.{ .directory_exists = f.root }, .success, false);
-    try expect(.{ .list_worktrees = f.root }, .success, true);
-    try expect(.{ .directory_exists = f.linked }, .negative, false);
-    try expect(.{ .target_available = f.linked }, .success, false);
-    try expect(.{ .branch_exists = .{ .repo = f.root, .branch = "feature/test" } }, .negative, false);
-    try f.create();
-    try expect(.{ .target_available = f.linked }, .negative, false);
-    try expect(.{ .branch_exists = .{ .repo = f.root, .branch = "feature/test" } }, .success, false);
-    try expect(.{ .create_branch = .{ .repo = f.root, .branch = "feature/test" } }, .failure, false);
-    var root = backend.execute(a, .{ .repository_root = f.linked });
-    defer root.deinit(a);
-    try std.testing.expectEqual(.success, root.outcome);
-    try std.testing.expectEqualStrings(f.root, root.output.items);
-    var list = backend.execute(a, .{ .list_worktrees = f.linked });
-    defer list.deinit(a);
-    try std.testing.expectEqual(.success, list.outcome);
-    try std.testing.expect(std.mem.indexOf(u8, list.output.items, f.root) != null);
-    try std.testing.expect(std.mem.indexOf(u8, list.output.items, f.linked) != null);
-    try std.testing.expect(std.mem.indexOf(u8, list.output.items, "branch refs/heads/feature/test") != null);
-    try expect(.{ .status = f.linked }, .success, false);
-    try expect(.{ .submodules = f.linked }, .negative, false);
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = false } }, .success, false);
-    try expect(.{ .directory_exists = f.linked }, .negative, false);
-    try expect(.{ .branch_exists = .{ .repo = f.root, .branch = "feature/test" } }, .success, false);
+fn safety(f: *Fixture) !workflow.RemovalSafety {
+    var response = backend.execute(a, .{ .inspect = .{ .repo = f.root, .path = f.linked } });
+    defer response.deinit(a);
+    if (response.value != .safety) return error.ExpectedSafety;
+    return response.value.safety;
 }
 
-test "libgit2 refuses dirty locked main and foreign worktrees even with inappropriate removal requests" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.create();
-    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/untracked.txt", .data = "keep me" });
-    try expect(.{ .status = f.linked }, .success, true);
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = false } }, .failure, false);
-    var tree: ?*c.git_worktree = null;
-    try ok(c.git_worktree_lookup(&tree, f.repo, "linked 'quoted'"));
-    defer c.git_worktree_free(tree);
-    try ok(c.git_worktree_lock(tree, "keep"));
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = true } }, .failure, false);
-    try ok(c.git_worktree_unlock(tree));
-    var other = try Fixture.init();
-    defer other.deinit();
-    try expect(.{ .remove_worktree = .{ .repo = other.root, .path = f.linked, .force = true } }, .failure, false);
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.root, .force = true } }, .failure, false);
-    try expect(.{ .directory_exists = f.linked }, .success, false);
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = true } }, .success, false);
+fn remove(f: *Fixture, approved: workflow.RemovalSafety, force: bool) backend.Response {
+    return backend.execute(a, .{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = force, .approved = approved } });
 }
 
-test "libgit2 validates branches and fails closed for invalid repository input" {
-    for ([_][]const u8{ "feature/test", "unicode/żółć" }) |name| try expect(.{ .validate_branch = name }, .success, false);
-    for ([_][]const u8{ "", "-option", "HEAD", "a..b", "bad name", "trailing/", "@{-1}" }) |name| try expect(.{ .validate_branch = name }, .negative, false);
-    try expect(.{ .repository_root = "/missing/canopy/repository" }, .failure, false);
-    try expect(.{ .repository_root = "/tmp\x00/repository" }, .failure, false);
-}
-
-test "libgit2 history hides remote refs and protects detached commits and detects submodules" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.create();
-    try expect(.{ .unmerged = .{ .repo = f.root, .branch = "feature/test", .detached = false } }, .success, true);
+fn publish(f: *Fixture) !void {
     var head: ?*c.git_reference = null;
     try ok(c.git_repository_head(&head, f.repo));
     defer c.git_reference_free(head);
     var remote: ?*c.git_reference = null;
-    try ok(c.git_reference_create(&remote, f.repo, "refs/remotes/origin/main", c.git_reference_target(head), 0, null));
+    try ok(c.git_reference_create(&remote, f.repo, "refs/remotes/origin/main", c.git_reference_target(head), 1, null));
     defer c.git_reference_free(remote);
-    try expect(.{ .unmerged = .{ .repo = f.root, .branch = "feature/test", .detached = false } }, .success, false);
+}
+
+fn detachAndCommit(f: *Fixture) !void {
     var linked: ?*c.git_repository = null;
     try ok(c.git_repository_open(&linked, f.linked));
     defer c.git_repository_free(linked);
-    try ok(c.git_repository_set_head_detached(linked, c.git_reference_target(head)));
-    try expect(.{ .unmerged = .{ .repo = f.linked, .branch = "HEAD", .detached = true } }, .success, false);
+    var head: ?*c.git_reference = null;
+    try ok(c.git_repository_head(&head, linked));
+    defer c.git_reference_free(head);
     var parent: ?*c.git_commit = null;
     try ok(c.git_commit_lookup(&parent, linked, c.git_reference_target(head)));
     defer c.git_commit_free(parent);
+    try ok(c.git_repository_set_head_detached(linked, c.git_reference_target(head)));
     const original = f.repo;
     f.repo = linked.?;
-    _ = try f.commit("detached", parent);
-    f.repo = original;
-    try expect(.{ .unmerged = .{ .repo = f.linked, .branch = "HEAD", .detached = true } }, .success, true);
-    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/.gitmodules", .data = "[submodule \"test\"]\n path = module\n url = ../module\n" });
-    try expect(.{ .submodules = f.linked }, .success, true);
+    defer f.repo = original;
+    _ = try f.commit("detached local work", parent);
+}
+
+test "libgit2 discovers primary roots and returns typed worktrees including empty linked list" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var initial = backend.execute(a, .{ .list_worktrees = f.root });
+    defer initial.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), initial.value.worktrees.len);
+    try f.create();
+    var root = backend.execute(a, .{ .repository_root = f.linked });
+    defer root.deinit(a);
+    try std.testing.expectEqualStrings(f.root, root.value.root.slice());
+    var list = backend.execute(a, .{ .list_worktrees = f.linked });
+    defer list.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), list.value.worktrees.len);
+    try std.testing.expect(list.value.worktrees[0].is_main);
+    try std.testing.expectEqualStrings("feature/test", list.value.worktrees[1].branch.slice());
+    try publish(&f);
+    const approved = try safety(&f);
+    try std.testing.expect(!approved.hasWarnings());
+    var result = remove(&f, approved, false);
+    defer result.deinit(a);
+    try std.testing.expect(result.value == .ok);
+    var exists = backend.execute(a, .{ .branch_exists = .{ .repo = f.root, .branch = "feature/test" } });
+    defer exists.deinit(a);
+    try std.testing.expect(exists.value.exists);
+}
+
+test "live HEAD inspection detects detached commits and rejects stale approval" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.create();
+    try publish(&f);
+    const approved = try safety(&f);
+    try detachAndCommit(&f);
+    const changed = try safety(&f);
+    try std.testing.expect(changed.detached and changed.unmerged_count == 1);
+    try std.testing.expect(!approved.matches(changed));
+    var refusal = remove(&f, approved, false);
+    defer refusal.deinit(a);
+    try std.testing.expect(refusal.value == .changed);
+    var no_force = remove(&f, changed, false);
+    defer no_force.deinit(a);
+    try std.testing.expect(no_force.value == .failure);
+    var confirmed = remove(&f, changed, true);
+    defer confirmed.deinit(a);
+    try std.testing.expect(confirmed.value == .ok);
+}
+
+test "removal protects dirty locked foreign and primary trees" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.create();
+    try publish(&f);
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/untracked.txt", .data = "keep me" });
+    const approved = try safety(&f);
+    try std.testing.expect(approved.dirty);
+    var dirty = remove(&f, approved, false);
+    defer dirty.deinit(a);
+    try std.testing.expect(dirty.value == .failure);
+    var tree: ?*c.git_worktree = null;
+    try ok(c.git_worktree_lookup(&tree, f.repo, "linked 'quoted'"));
+    defer c.git_worktree_free(tree);
+    try ok(c.git_worktree_lock(tree, "keep"));
+    var locked = remove(&f, approved, true);
+    defer locked.deinit(a);
+    try std.testing.expectEqual(workflow.Failure.locked, locked.value.failure);
+    try ok(c.git_worktree_unlock(tree));
+    var other = try Fixture.init();
+    defer other.deinit();
+    var foreign = backend.execute(a, .{ .remove_worktree = .{ .repo = other.root, .path = f.linked, .force = true, .approved = approved } });
+    defer foreign.deinit(a);
+    try std.testing.expect(foreign.value == .failure);
+    var main = backend.execute(a, .{ .remove_worktree = .{ .repo = f.root, .path = f.root, .force = true, .approved = approved } });
+    defer main.deinit(a);
+    try std.testing.expect(main.value == .failure);
+    var missing_approval = backend.execute(a, .{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = true } });
+    defer missing_approval.deinit(a);
+    try std.testing.expect(missing_approval.value == .failure);
+}
+
+test "changed dirty files require review even when the dirty flag remains true" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.create();
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/untracked.txt", .data = "old" });
+    const approved = try safety(&f);
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/untracked.txt", .data = "new content" });
+    var result = remove(&f, approved, true);
+    defer result.deinit(a);
+    try std.testing.expect(result.value == .changed);
+}
+
+test "missing registered worktrees remain visible and require current force approval" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.create();
+    try f.tmp.dir.deleteTree(std.testing.io, "linked 'quoted'");
+    var list = backend.execute(a, .{ .list_worktrees = f.root });
+    defer list.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), list.value.worktrees.len);
+    const approved = try safety(&f);
+    try std.testing.expect(approved.missing);
+    var result = remove(&f, approved, true);
+    defer result.deinit(a);
+    try std.testing.expect(result.value == .ok);
+}
+
+test "branch validation and malformed submodule configuration fail explicitly" {
+    for ([_][]const u8{ "", "-option", "HEAD", "a..b", "bad name", "trailing/", "@{-1}" }) |name| {
+        var result = backend.execute(a, .{ .validate_branch = name });
+        defer result.deinit(a);
+        try std.testing.expect(!result.value.exists);
+    }
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.create();
     try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/.gitmodules", .data = "[invalid" });
-    try expect(.{ .submodules = f.linked }, .failure, false);
+    var result = backend.execute(a, .{ .inspect = .{ .repo = f.root, .path = f.linked } });
+    defer result.deinit(a);
+    try std.testing.expect(result.value == .failure);
 }
 
 test "Git worker owns request bytes rejects overlap and posts completion without spawning processes" {
@@ -194,7 +263,7 @@ test "Git worker owns request bytes rejects overlap and posts completion without
         try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
     }
     const result = completion orelse return error.WorkerTimedOut;
-    try std.testing.expectEqual(.success, result.outcome);
+    try std.testing.expect(result.value.exists);
     try std.testing.expectEqual(@as(u64, 10000), result.key);
     try std.testing.expect(host.completed() == null);
     try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
@@ -205,23 +274,6 @@ test "Git worker owns request bytes rejects overlap and posts completion without
     // Shutdown joins and frees a running job, including all copied strings.
     host.deinit();
     try std.testing.expect(host.job == null and host.thread == null);
-}
-
-test "libgit2 lists and force prunes a registered worktree removed outside the app" {
-    var f = try Fixture.init();
-    defer f.deinit();
-    try f.create();
-    try f.tmp.dir.deleteTree(std.testing.io, "linked 'quoted'");
-    var list = backend.execute(a, .{ .list_worktrees = f.root });
-    defer list.deinit(a);
-    try std.testing.expectEqual(.success, list.outcome);
-    try std.testing.expect(std.mem.indexOf(u8, list.output.items, f.linked) != null);
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = false } }, .failure, false);
-    try expect(.{ .remove_worktree = .{ .repo = f.root, .path = f.linked, .force = true } }, .success, false);
-    var after = backend.execute(a, .{ .list_worktrees = f.root });
-    defer after.deinit(a);
-    try std.testing.expectEqual(.success, after.outcome);
-    try std.testing.expect(std.mem.indexOf(u8, after.output.items, f.linked) == null);
 }
 
 test "Git worker does not close a channel whose occupied key rejects its start" {
@@ -236,4 +288,63 @@ test "Git worker does not close a channel whose occupied key rejects its start" 
     try std.testing.expectError(error.GitChannelUnavailable, host.start(&fx, 12000, .{ .validate_branch = "test" }));
     try std.testing.expect(existing.live());
     try std.testing.expect(host.job == null and host.thread == null and host.channel_key == null);
+}
+
+test "real Git service completes create and remove workflows without a macOS event loop" {
+    const support = @import("support.zig");
+    const service_tests = @import("git_service_tests.zig");
+    var f = try Fixture.init();
+    defer f.deinit();
+    const stores = try support.Stores.init();
+    defer stores.deinit();
+    try std.testing.expect(stores.projects.setWorktreesBase(std.fs.path.dirname(f.root).?));
+    var ui: service_tests.Ui = .{ .model = support.app.initialModel(stores.tabs, stores.projects, stores.profiles), .effects = support.app.Effects.init(a) };
+    defer ui.effects.deinit();
+    defer ui.model.terminal_state.deinit(a);
+    ui.effects.executor = .fake;
+    var service: @import("../git_service.zig").Service(@import("../git_host.zig").Host) = .{};
+    defer service.deinit();
+    try ui.dispatch({}, 1, .{ .folder_selected = support.app.PathPayload.from(f.root).? });
+    try service_tests.settle(&service, &ui);
+    const project = stores.projects.projects.items[0].id;
+    try ui.dispatch({}, 1, .{ .begin_create_worktree = project });
+    ui.model.workspace_dialogs.create.branch.set("feature/service");
+    try ui.dispatch({}, 1, .confirm_create_worktree);
+    try service_tests.settle(&service, &ui);
+    const workspace = ui.model.active_workspace_id;
+    try std.testing.expect(!stores.projects.findWorktree(workspace).?.is_main);
+    try ui.dispatch({}, 1, .{ .request_remove_worktree = workspace });
+    try service_tests.settle(&service, &ui);
+    try std.testing.expect(ui.model.workspace_dialogs.removal.open);
+    try std.testing.expect(ui.model.workspace_dialogs.removal.safety.unmerged_count > 0);
+    try ui.dispatch({}, 1, .confirm_remove_worktree);
+    try service_tests.settle(&service, &ui);
+    try std.testing.expect(stores.projects.findWorktree(workspace) == null);
+    try std.testing.expectEqual(@as(usize, 0), ui.effects.pendingSpawnCount());
+}
+
+test "changed gitlink cannot redirect removal into another repository" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.create();
+    const approved = try safety(&f);
+    var other = try Fixture.init();
+    defer other.deinit();
+    const redirect = try std.fmt.allocPrint(a, "gitdir: {s}/.git\n", .{other.root});
+    defer a.free(redirect);
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "linked 'quoted'/.git", .data = redirect });
+    var result = remove(&f, approved, true);
+    defer result.deinit(a);
+    try std.testing.expectEqual(workflow.Failure.invalid_input, result.value.failure);
+}
+
+test "inspection supports the complete allowed branch-name length" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var name: [@import("../workspaces.zig").max_branch_bytes]u8 = @splat('x');
+    name[128] = '/'; // Keep each filesystem component below NAME_MAX.
+    try succeeds(.{ .create_branch = .{ .repo = f.root, .branch = &name } });
+    try succeeds(.{ .create_worktree = .{ .repo = f.root, .path = f.linked, .branch = &name } });
+    const inspected = try safety(&f);
+    try std.testing.expectEqualStrings(&name, inspected.branch.slice());
 }

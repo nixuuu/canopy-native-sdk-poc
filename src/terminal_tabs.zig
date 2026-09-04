@@ -54,9 +54,7 @@ pub const Store = struct {
 
     pub fn allocatePtyKey(store: *Store, next: *u64) u64 {
         if (store.free_pty_keys.pop()) |key| return key;
-        const key = next.*;
-        next.* +%= 1;
-        return key;
+        return @import("effect_keys.zig").advance(next);
     }
 
     pub fn releasePtyKey(store: *Store, key: u64) void {

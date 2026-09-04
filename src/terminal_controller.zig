@@ -11,7 +11,7 @@ pub const Exit = union(enum) { missing, removed: Removed, completed: tabs.Phase 
 pub const State = struct {
     active_by_workspace: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     next_tab_id: u64 = 1,
-    next_pty_key: u64 = 1,
+    next_pty_key: u64 = @import("effect_keys.zig").first(.pty),
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.active_by_workspace.deinit(allocator);
@@ -73,12 +73,22 @@ pub const State = struct {
         }
         const found = index orelse return .missing;
         const tab = &store.items.items[found];
+        if (tab.phase == .closing) return .missing;
         if (tab.phase == .exited or tab.phase == .failed) return .{ .removed = self.removeAt(store, found) };
         tab.phase = .closing;
         if (self.active(tab.workspace_id) == tab_id) {
             self.select(store, tab.workspace_id, store.replacementForWorkspace(tab.workspace_id));
         }
         return .{ .waiting = tab.pty };
+    }
+
+    pub fn closeWorkspace(self: *State, store: *tabs.Store, workspace_id: u64, sink: anytype) void {
+        var index = store.items.items.len;
+        while (index > 0) {
+            index -= 1;
+            const tab = store.items.items[index];
+            if (tab.workspace_id == workspace_id) sink.closed(self.close(store, tab.id));
+        }
     }
 
     pub fn output(_: *State, store: *tabs.Store, pty_key: u64) Output {

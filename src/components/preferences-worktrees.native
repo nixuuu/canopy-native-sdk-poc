@@ -7,7 +7,7 @@
     <column padding="12" gap="8">
       <text size="lg">Base directory</text>
       <text size="sm" foreground="text_muted">Leave empty to use the default directory shown below.</text>
-      <text-field size="lg" height="33" text="{preferencesBaseDirText}" placeholder="{preferencesDefaultBaseDir}" on-input="edit_preferences_base_dir" label="Worktrees base directory" />
+      <text-field disabled="{preferences_edit.saving}" size="lg" height="33" text="{preferencesBaseDirText}" placeholder="{preferencesDefaultBaseDir}" on-input="edit_preferences_base_dir" label="Worktrees base directory" />
       <if test="{preferencesBaseDirInvalid}"><text size="sm" foreground="destructive">Enter an absolute directory path.</text></if>
       <else><text size="sm" foreground="text_muted"><span mono="true">{preferencesDefaultBaseDir}</span></text></else>
     </column>

@@ -34,7 +34,24 @@ pub fn finishGit(fx: *app.Effects, model: *app.Model, outcome: @import("../git_w
     try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
     const output = try std.mem.join(std.testing.allocator, "\n", output_lines);
     defer std.testing.allocator.free(output);
-    app.update(model, .{ .git_done = .{ .key = model.git.active.key, .outcome = outcome, .output = output } }, fx);
+    const git = @import("../git_workflow.zig");
+    var entries: std.ArrayListUnmanaged(workspaces.SnapshotEntry) = .empty;
+    defer entries.deinit(std.testing.allocator);
+    const value: git.Value = if (outcome == .failure) .{ .failure = .io } else switch (model.git.active.kind) {
+        .detect_repo => blk: {
+            var path: workspaces.PathText = .{};
+            try std.testing.expect(path.set(output));
+            break :blk .{ .root = path };
+        },
+        .list_worktrees => blk: {
+            entries = try @import("worktree_fixture.zig").decode(std.testing.allocator, output);
+            break :blk .{ .worktrees = entries.items };
+        },
+        .remove_status => .{ .safety = .{ .dirty = output.len > 0 } },
+        .restore_check, .validate_branch, .check_target, .check_branch => .{ .exists = outcome == .success },
+        else => .ok,
+    };
+    app.update(model, .{ .git_done = .{ .key = model.git.active.key, .value = value } }, fx);
 }
 
 pub fn addProfile(stores: Stores, runtime_id: u64, agent_type: profiles.AgentType, name: []const u8) !*profiles.Profile {

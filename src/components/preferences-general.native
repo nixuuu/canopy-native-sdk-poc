@@ -9,7 +9,7 @@
         <text size="lg">Reopen attached projects</text>
         <text size="sm" foreground="text_muted">Restore the previous project list when Canopy starts.</text>
       </column>
-      <switch selected="{preferencesReopenLast}" on-toggle="toggle_preferences_reopen" label="Reopen attached projects on startup" />
+      <switch disabled="{preferences_edit.saving}" selected="{preferencesReopenLast}" on-toggle="toggle_preferences_reopen" label="Reopen attached projects on startup" />
     </row>
   </column>
 </template>

@@ -42,3 +42,6 @@ test "native configuration can only be claimed once after UI installation" {
     try testing.expect(!gate.claim(true)); // synchronous reentrant callback
     try testing.expect(!gate.claim(false));
 }
+
+/// Authored global-key in terminal-workspace.native, independent of its label.
+pub const terminal_viewport_id = @import("native_sdk").canvas.globalWidgetId(.column, .{ .str = "canopy-terminal-viewport" });

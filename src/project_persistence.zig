@@ -9,7 +9,7 @@ pub const WriteFinish = enum { ignored, idle, restart };
 pub const State = struct {
     path: workspaces.PathText = .{},
     restore: Restore = .ready,
-    next_write_key: u64 = 9_100,
+    next_write_key: u64 = @import("effect_keys.zig").first(.projects),
     active_write_key: ?u64 = null,
     write_dirty: bool = false,
 
@@ -61,9 +61,7 @@ pub const State = struct {
             self.write_dirty = true;
             return .deferred;
         }
-        const key = self.next_write_key;
-        self.next_write_key +%= 1;
-        if (self.next_write_key < 9_100) self.next_write_key = 9_100;
+        const key = @import("effect_keys.zig").advance(&self.next_write_key);
         self.active_write_key = key;
         return .{ .start = key };
     }
@@ -99,12 +97,12 @@ test "writes coalesce without queuing multiple host effects" {
     var state: State = .{};
     try std.testing.expectEqual(Write.unavailable, state.requestWrite());
     try std.testing.expect(state.configure("/tmp/projects.store"));
-    try std.testing.expectEqual(@as(u64, 9_100), state.requestWrite().start);
+    try std.testing.expectEqual(@import("effect_keys.zig").first(.projects), state.requestWrite().start);
     try std.testing.expectEqual(Write.deferred, state.requestWrite());
     try std.testing.expect(state.active_write_key != null and state.write_dirty);
     try std.testing.expectEqual(WriteFinish.ignored, state.writeFinished(999));
-    try std.testing.expectEqual(WriteFinish.restart, state.writeFinished(9_100));
-    try std.testing.expectEqual(@as(u64, 9_101), state.requestWrite().start);
-    try std.testing.expectEqual(WriteFinish.idle, state.writeFinished(9_101));
+    try std.testing.expectEqual(WriteFinish.restart, state.writeFinished(@import("effect_keys.zig").first(.projects)));
+    try std.testing.expectEqual(@import("effect_keys.zig").first(.projects) + 1, state.requestWrite().start);
+    try std.testing.expectEqual(WriteFinish.idle, state.writeFinished(@import("effect_keys.zig").first(.projects) + 1));
     try std.testing.expect(state.active_write_key == null and !state.write_dirty);
 }

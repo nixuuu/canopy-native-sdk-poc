@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const runner = @import("runner");
+const app_config = @import("app_config");
 const native_sdk = @import("native_sdk");
 const preferences_mod = @import("preferences.zig");
 const ghostty_config_mod = @import("ghostty_config.zig");
@@ -150,7 +151,7 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 }
 
 const CanopyHost = struct {
-    git: @import("git_host.zig").Host = .{},
+    git: @import("git_service.zig").Service(@import("git_host.zig").Host) = .{},
     chrome_install: canvas_host.InstallGate = .{},
     sidebar_controller: @import("sidebar_controller.zig").Controller = .{},
     menu: @import("app_menu.zig").Host = .{},
@@ -222,33 +223,15 @@ const CanopyHost = struct {
         while (host.menu.takeClose()) try host.ui_app.dispatch(runtime, 1, .close_active_tab);
         try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
-        try host.synchronizeGit(runtime);
+        try host.git.drain(runtime, host.ui_app);
         if (builtin.os.tag == .macos and !host.sidebar_controller.hasPendingGeometry()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
+        try host.git.submit(runtime, host.ui_app);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
         // AppKit can synchronously emit resizes when its toolbar style changes.
         // Do this only after UiApp has finished installation, with the guard
         // already set so a reentrant callback cannot initialize UI twice.
         if (builtin.os.tag == .macos and host.chrome_install.claim(host.ui_app.installed)) {
             canopy_use_compact_titlebar();
-        }
-    }
-
-    fn synchronizeGit(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
-        if (host.git.completed()) |result| {
-            // Keep response memory alive through the synchronous update.
-            defer host.git.release();
-            try host.ui_app.dispatch(runtime, 1, .{ .git_done = result });
-        }
-        const model = &host.ui_app.model;
-        while (host.git.job == null and model.git.busy()) {
-            const operation = &model.git.active;
-            const request = operation.request(model.project_store) orelse {
-                try host.ui_app.dispatch(runtime, 1, .{ .git_done = .{ .key = operation.key, .outcome = .failure, .output = "" } });
-                continue;
-            };
-            host.git.start(&host.ui_app.effects, operation.key, request) catch {
-                try host.ui_app.dispatch(runtime, 1, .{ .git_done = .{ .key = operation.key, .outcome = .failure, .output = "" } });
-            };
         }
     }
 
@@ -340,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
     const platform = native_sdk.app_dirs.currentPlatform();
     var worktree_base_buffer: [workspaces.max_path_bytes]u8 = undefined;
     const home = env.home orelse return error.MissingHome;
-    const default_worktrees_base = try std.fmt.bufPrint(&worktree_base_buffer, "{s}/canopy/worktrees", .{home});
+    const default_worktrees_base = try std.fmt.bufPrint(&worktree_base_buffer, if (app_config.smoke) "{s}/canopy/smoke-worktrees" else "{s}/canopy/worktrees", .{home});
     if (!project_store.setWorktreesBase(default_worktrees_base)) return error.InvalidWorktreesBase;
     std.Io.Dir.cwd().createDirPath(init.io, default_worktrees_base) catch {};
     var data_dir_buffer: [workspaces.max_path_bytes]u8 = undefined;
@@ -348,7 +331,7 @@ pub fn main(init: std.process.Init) !void {
     var preferences_db_path_buffer: [workspaces.max_path_bytes]u8 = undefined;
     var store_path: []const u8 = "";
     var preferences_db_path: []const u8 = "";
-    if (native_sdk.app_dirs.resolveOne(.{ .name = "tech.itsol.canopy.native-poc" }, platform, env, .data, &data_dir_buffer)) |data_dir| {
+    if (native_sdk.app_dirs.resolveOne(.{ .name = app_config.bundle_id }, platform, env, .data, &data_dir_buffer)) |data_dir| {
         std.Io.Dir.cwd().createDirPath(init.io, data_dir) catch {};
         store_path = native_sdk.app_dirs.join(platform, &store_path_buffer, &.{ data_dir, "projects.store" }) catch "";
         preferences_db_path = native_sdk.app_dirs.join(platform, &preferences_db_path_buffer, &.{ data_dir, "app.db" }) catch "";
@@ -370,7 +353,7 @@ pub fn main(init: std.process.Init) !void {
     try runner.runWithOptions(host.app(), .{
         .app_name = "canopy-native-sdk-poc",
         .window_title = "Canopy",
-        .bundle_id = "tech.itsol.canopy.native-poc",
+        .bundle_id = app_config.bundle_id,
         .icon_path = "assets/icon.png",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .js_window_api = false,

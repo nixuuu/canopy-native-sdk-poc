@@ -62,6 +62,7 @@ pub const Msg = union(enum) {
     preferences_load_done: native_sdk.EffectDbResult,
     preferences_db_done: native_sdk.EffectDbResult,
     worktrees_base_failed,
+    reload_profiles,
     profiles_load_done: native_sdk.EffectDbResult,
     profile_db_done: native_sdk.EffectDbResult,
     tool_check_done: native_sdk.EffectExit,
