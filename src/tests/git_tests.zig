@@ -4,7 +4,7 @@ const app = support.app;
 const profiles = support.profiles;
 const workspaces = support.workspaces;
 const Stores = support.Stores;
-const finishSpawn = support.finishSpawn;
+const finishGit = support.finishGit;
 const envValue = support.envValue;
 
 test "new worktree flow preflights target and branch before checkout" {
@@ -28,26 +28,24 @@ test "new worktree flow preflights target and branch before checkout" {
     app.update(&model, .{ .begin_create_worktree = attached.project_id }, &fx);
     model.workspace_dialogs.create.branch.set("feature/safe-flow");
     app.update(&model, .confirm_create_worktree, &fx);
-    try std.testing.expectEqualStrings("check-ref-format", fx.pendingSpawnAt(0).?.argv[1]);
+    try std.testing.expectEqual(.validate_branch, model.git.active.kind);
 
-    try finishSpawn(&fx, &model, 0, &.{});
-    try std.testing.expectEqualStrings("/bin/test", fx.pendingSpawnAt(0).?.argv[0]);
-    try finishSpawn(&fx, &model, 0, &.{});
-    try std.testing.expectEqualStrings("show-ref", fx.pendingSpawnAt(0).?.argv[3]);
-    try finishSpawn(&fx, &model, 1, &.{});
-    try std.testing.expectEqualStrings("branch", fx.pendingSpawnAt(0).?.argv[3]);
-    try finishSpawn(&fx, &model, 0, &.{});
-    const add = fx.pendingSpawnAt(0).?;
-    try std.testing.expectEqualStrings("worktree", add.argv[3]);
-    try std.testing.expectEqualStrings("add", add.argv[4]);
-    try std.testing.expectEqualStrings("feature/safe-flow", add.argv[6]);
+    try finishGit(&fx, &model, .success, &.{});
+    try std.testing.expectEqual(.check_target, model.git.active.kind);
+    try finishGit(&fx, &model, .success, &.{});
+    try std.testing.expectEqual(.check_branch, model.git.active.kind);
+    try finishGit(&fx, &model, .negative, &.{});
+    try std.testing.expectEqual(.create_branch, model.git.active.kind);
+    try finishGit(&fx, &model, .success, &.{});
+    const add = model.git.active.request(stores.projects).?.create_worktree;
+    try std.testing.expectEqualStrings("feature/safe-flow", add.branch);
     var target_copy: workspaces.PathText = .{};
-    try std.testing.expect(target_copy.set(add.argv[5]));
-    try finishSpawn(&fx, &model, 0, &.{});
-    try std.testing.expectEqualStrings("list", fx.pendingSpawnAt(0).?.argv[4]);
+    try std.testing.expect(target_copy.set(add.path));
+    try finishGit(&fx, &model, .success, &.{});
+    try std.testing.expectEqual(.list_worktrees, model.git.active.kind);
     var worktree_line_buffer: [workspaces.max_path_bytes + 16]u8 = undefined;
     const worktree_line = try std.fmt.bufPrint(&worktree_line_buffer, "worktree {s}", .{target_copy.slice()});
-    try finishSpawn(&fx, &model, 0, &.{
+    try finishGit(&fx, &model, .success, &.{
         "worktree /tmp/canopy-repo",
         "HEAD 1111111",
         "branch refs/heads/main",
@@ -60,7 +58,7 @@ test "new worktree flow preflights target and branch before checkout" {
     try std.testing.expectEqualStrings(target_copy.slice(), model.activeWorkspacePath());
 }
 
-test "Git lane keeps exactly one command in flight and never queues user work" {
+test "Git lane keeps exactly one operation in flight and never queues user work" {
     const stores = try Stores.init();
     defer stores.deinit();
     var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
@@ -72,37 +70,37 @@ test "Git lane keeps exactly one command in flight and never queues user work" {
     const first = app.PathPayload.from("/tmp/slow-repository").?;
     app.update(&model, .{ .folder_selected = first }, &fx);
     try std.testing.expect(model.gitBusy());
-    try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
-    const running_key = fx.pendingSpawnAt(0).?.key;
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    const running_key = model.git.active.key;
 
-    app.update(&model, .{ .git_done = .{ .key = running_key + 99, .code = 0 } }, &fx);
+    app.update(&model, .{ .git_done = .{ .key = running_key + 99, .outcome = .success, .output = "" } }, &fx);
     try std.testing.expect(model.gitBusy());
-    try std.testing.expectEqual(running_key, fx.pendingSpawnAt(0).?.key);
+    try std.testing.expectEqual(running_key, model.git.active.key);
 
     const second = app.PathPayload.from("/tmp/must-not-be-queued").?;
     app.update(&model, .{ .folder_selected = second }, &fx);
     app.update(&model, .open_folder, &fx);
     try std.testing.expectEqual(@as(usize, 1), stores.projects.attachedCount());
-    try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
-    try std.testing.expectEqual(running_key, fx.pendingSpawnAt(0).?.key);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expectEqual(running_key, model.git.active.key);
     try std.testing.expectEqual(@as(u64, 0), model.picker_serial);
 
-    try finishSpawn(&fx, &model, 0, &.{"/tmp/slow-repository"});
+    try finishGit(&fx, &model, .success, &.{"/tmp/slow-repository"});
     try std.testing.expect(model.gitBusy());
-    try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
-    try std.testing.expectEqualStrings("list", fx.pendingSpawnAt(0).?.argv[4]);
-    const refresh_key = fx.pendingSpawnAt(0).?.key;
-    app.update(&model, .{ .git_done = .{ .key = running_key, .code = 0 } }, &fx);
-    try std.testing.expectEqual(refresh_key, fx.pendingSpawnAt(0).?.key);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expectEqual(.list_worktrees, model.git.active.kind);
+    const refresh_key = model.git.active.key;
+    app.update(&model, .{ .git_done = .{ .key = running_key, .outcome = .success, .output = "" } }, &fx);
+    try std.testing.expectEqual(refresh_key, model.git.active.key);
     try std.testing.expect(model.gitBusy());
-    try finishSpawn(&fx, &model, 0, &.{
+    try finishGit(&fx, &model, .success, &.{
         "worktree /tmp/slow-repository",
         "HEAD 1111111",
         "branch refs/heads/main",
         "",
     });
     try std.testing.expect(!model.gitBusy());
-    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expect(!model.git.busy());
 }
 
 test "repository discovery reuses an attached Git root instead of keeping a duplicate" {
@@ -125,14 +123,14 @@ test "repository discovery reuses an attached Git root instead of keeping a dupl
 
     app.update(&model, .{ .folder_selected = app.PathPayload.from("/tmp/repository/child").? }, &fx);
     try std.testing.expectEqual(@as(usize, 2), stores.projects.attachedCount());
-    try std.testing.expectEqualStrings("rev-parse", fx.pendingSpawnAt(0).?.argv[3]);
-    try finishSpawn(&fx, &model, 0, &.{"/tmp/repository"});
+    try std.testing.expectEqual(.detect_repo, model.git.active.kind);
+    try finishGit(&fx, &model, .success, &.{"/tmp/repository"});
     try std.testing.expectEqual(@as(usize, 1), stores.projects.attachedCount());
     try std.testing.expectEqual(existing.workspace_id, model.active_workspace_id);
-    try std.testing.expectEqualStrings("list", fx.pendingSpawnAt(0).?.argv[4]);
-    try finishSpawn(&fx, &model, 0, &.{ "worktree /tmp/repository", "HEAD 1111111", "branch refs/heads/main", "" });
+    try std.testing.expectEqual(.list_worktrees, model.git.active.kind);
+    try finishGit(&fx, &model, .success, &.{ "worktree /tmp/repository", "HEAD 1111111", "branch refs/heads/main", "" });
     try std.testing.expect(!model.gitBusy());
-    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expect(!model.git.busy());
 }
 
 test "failed worktree checkout refreshes state without deleting the created branch" {
@@ -149,16 +147,16 @@ test "failed worktree checkout refreshes state without deleting the created bran
     app.update(&model, .{ .begin_create_worktree = attached.project_id }, &fx);
     model.workspace_dialogs.create.branch.set("feature/retained");
     app.update(&model, .confirm_create_worktree, &fx);
-    try finishSpawn(&fx, &model, 0, &.{}); // valid name
-    try finishSpawn(&fx, &model, 0, &.{}); // absent target
-    try finishSpawn(&fx, &model, 1, &.{}); // absent branch
-    try finishSpawn(&fx, &model, 0, &.{}); // branch created
-    try std.testing.expectEqualStrings("add", fx.pendingSpawnAt(0).?.argv[4]);
-    try finishSpawn(&fx, &model, 128, &.{});
-    try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
-    try std.testing.expectEqualStrings("list", fx.pendingSpawnAt(0).?.argv[4]);
-    try finishSpawn(&fx, &model, 0, &.{ "worktree /tmp/checkout-failure", "HEAD 1111111", "branch refs/heads/main", "" });
+    try finishGit(&fx, &model, .success, &.{}); // valid name
+    try finishGit(&fx, &model, .success, &.{}); // absent target
+    try finishGit(&fx, &model, .negative, &.{}); // absent branch
+    try finishGit(&fx, &model, .success, &.{}); // branch created
+    try std.testing.expectEqual(.create_worktree, model.git.active.kind);
+    try finishGit(&fx, &model, .failure, &.{});
     try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expectEqual(.list_worktrees, model.git.active.kind);
+    try finishGit(&fx, &model, .success, &.{ "worktree /tmp/checkout-failure", "HEAD 1111111", "branch refs/heads/main", "" });
+    try std.testing.expect(!model.git.busy());
     try std.testing.expect(!model.gitBusy());
     try std.testing.expectEqualStrings("Worktree creation failed; branch retained and Git state refreshed", model.status_text);
 }
@@ -195,9 +193,9 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
     try std.testing.expectEqualStrings("/bin/zsh", envValue(shell_request, "SHELL") orelse "");
     try std.testing.expectEqualStrings("truecolor", envValue(shell_request, "COLORTERM") orelse "");
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
-    try finishSpawn(&fx, &model, 0, &.{" M README.md"});
-    try finishSpawn(&fx, &model, 1, &.{});
-    try finishSpawn(&fx, &model, 0, &.{});
+    try finishGit(&fx, &model, .success, &.{" M README.md"});
+    try finishGit(&fx, &model, .negative, &.{});
+    try finishGit(&fx, &model, .success, &.{});
     try std.testing.expect(model.workspace_dialogs.removal.open);
     try std.testing.expect(model.removeHasWarnings());
 
@@ -214,23 +212,22 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
     app.update(&model, .{ .open_terminal = linked }, &fx);
     try std.testing.expectEqual(linked, model.teardown.closing_worktree.workspace_id);
     try std.testing.expectEqual(@as(usize, 1), stores.tabs.items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expect(!model.git.busy());
     try fx.feedPtyExit(pty_key, -1, 0, .cancelled, 0);
     while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
     try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
-    try std.testing.expectEqualStrings("status", fx.pendingSpawnAt(0).?.argv[3]);
+    try std.testing.expectEqual(.remove_status, model.git.active.kind);
     app.update(&model, .{ .open_terminal = linked }, &fx);
     try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
-    try finishSpawn(&fx, &model, 0, &.{" M README.md"});
-    try finishSpawn(&fx, &model, 1, &.{});
-    try finishSpawn(&fx, &model, 0, &.{});
-    const remove = fx.pendingSpawnAt(0).?;
-    try std.testing.expectEqualStrings("remove", remove.argv[4]);
-    try std.testing.expectEqualStrings("--force", remove.argv[5]);
+    try finishGit(&fx, &model, .success, &.{" M README.md"});
+    try finishGit(&fx, &model, .negative, &.{});
+    try finishGit(&fx, &model, .success, &.{});
+    const remove = model.git.active.request(stores.projects).?.remove_worktree;
+    try std.testing.expect(remove.force);
     app.update(&model, .{ .open_terminal = linked }, &fx);
     try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
-    try finishSpawn(&fx, &model, 0, &.{});
-    try finishSpawn(&fx, &model, 0, &.{
+    try finishGit(&fx, &model, .success, &.{});
+    try finishGit(&fx, &model, .success, &.{
         "worktree /tmp/removal-repo",
         "HEAD 1111111",
         "branch refs/heads/main",
@@ -263,31 +260,30 @@ test "worktree removal asks again when the fresh preflight changed" {
     fx.executor = .fake;
 
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
-    try finishSpawn(&fx, &model, 0, &.{});
-    try finishSpawn(&fx, &model, 1, &.{});
-    try finishSpawn(&fx, &model, 0, &.{});
+    try finishGit(&fx, &model, .success, &.{});
+    try finishGit(&fx, &model, .negative, &.{});
+    try finishGit(&fx, &model, .success, &.{});
     try std.testing.expect(!model.removeHasWarnings());
 
     app.update(&model, .confirm_remove_worktree, &fx);
-    try finishSpawn(&fx, &model, 0, &.{" M changed.txt"});
-    try finishSpawn(&fx, &model, 1, &.{});
-    try finishSpawn(&fx, &model, 0, &.{});
+    try finishGit(&fx, &model, .success, &.{" M changed.txt"});
+    try finishGit(&fx, &model, .negative, &.{});
+    try finishGit(&fx, &model, .success, &.{});
     try std.testing.expect(model.workspace_dialogs.removal.open);
     try std.testing.expectEqualStrings("Worktree safety state changed; review again", model.status_text);
     try std.testing.expect(!model.teardown.busy());
-    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expect(!model.git.busy());
 
     app.update(&model, .confirm_remove_worktree, &fx);
-    try finishSpawn(&fx, &model, 0, &.{" M changed.txt"});
-    try finishSpawn(&fx, &model, 1, &.{});
-    try finishSpawn(&fx, &model, 0, &.{});
-    const remove = fx.pendingSpawnAt(0).?;
-    try std.testing.expectEqualStrings("remove", remove.argv[4]);
-    try std.testing.expectEqualStrings("--force", remove.argv[5]);
-    try finishSpawn(&fx, &model, 128, &.{});
+    try finishGit(&fx, &model, .success, &.{" M changed.txt"});
+    try finishGit(&fx, &model, .negative, &.{});
+    try finishGit(&fx, &model, .success, &.{});
+    const remove = model.git.active.request(stores.projects).?.remove_worktree;
+    try std.testing.expect(remove.force);
+    try finishGit(&fx, &model, .failure, &.{});
     try std.testing.expect(!model.busy());
     try std.testing.expect(stores.projects.findWorktree(linked).?.active);
     try std.testing.expectEqualStrings("Git refused to remove the worktree", model.status_text);
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
-    try std.testing.expectEqualStrings("status", fx.pendingSpawnAt(0).?.argv[3]);
+    try std.testing.expectEqual(.remove_status, model.git.active.kind);
 }

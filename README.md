@@ -8,7 +8,7 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
 
 - empty-state onboarding with the native macOS folder picker;
 - attaching and detaching folders or Git repositories, persisted in the app data directory;
-- live discovery with `git worktree list --porcelain` and a project/worktree sidebar;
+- live discovery through libgit2 and a project/worktree sidebar;
 - creating a new branch and worktree under `~/canopy/worktrees`;
 - preflighted removal of non-main worktrees, with dirty, unpublished-commit,
   and submodule warnings before explicit force consent;
@@ -37,7 +37,7 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
 
 ## Run
 
-Requirements: macOS 13+, Xcode with Metal tools, Node.js 24+, and Zig 0.16.0.
+Requirements: macOS 13+, Xcode with Metal tools, Node.js 24+, CMake 3.16+, and Zig 0.16.0.
 
 ```sh
 npm install
@@ -45,7 +45,7 @@ npm run check
 npm run dev
 ```
 
-The first build applies the versioned Canopy Native SDK patch and compiles the SDK and Ghostty sources,
+The first build applies the versioned Canopy Native SDK patch and compiles the SDK, Ghostty and libgit2 sources,
 so it is much slower than subsequent incremental builds.
 
 Other useful commands:
@@ -57,7 +57,7 @@ npm run verify
 ```
 
 `package.json` pins the npm CLI and Node/npm toolchain. Native SDK itself and
-the lazy Ghostty terminal dependency remain reproducibly pinned in
+the Ghostty and libgit2 dependencies remain reproducibly pinned in
 `build.zig.zon`, where Zig resolves build dependencies.
 
 ## Architecture
@@ -142,16 +142,28 @@ Event-order tests cover resize coalescing, startup, pointer release, hover and
 shutdown staging without needing a GUI or a live PTY.
 
 Git operations use `git_workflow.zig` for semantic requests, creation-step
-transitions, explicit result groups, removal safety snapshots and the
-single-flight lane. `main.zig` routes completed operations to focused discovery,
-listing, creation and removal handlers. `git_cli.zig`
-is the current transport: it builds argv and maps process outcomes into workflow
-results. `teardown_state.zig` owns the approved target and the transition from
-terminal shutdown to fresh safety review. `main.zig` dispatches the resulting
-effects and keeps UI selection and approval dialogs; worktree porcelain
-decoding remains in `workspaces.zig`. This is a
-refactoring boundary, not a switch to libgit2. Calls still run one at a time,
-without a backlog or execution timeout; stale results cannot release the lane.
+transitions, removal safety snapshots and the single-flight lane.
+`git_libgit2.zig` calls libgit2 1.9.7 directly through Zig's C interop.
+`git_host.zig` copies requests into owned memory and runs one worker at a time;
+a Native SDK channel wakes the host to deliver the result on the UI thread.
+Shutdown joins the worker before releasing its memory. `app_controller.zig`
+handles results and `teardown_state.zig` fences terminal shutdown and fresh
+safety review. No local Git operation launches a subprocess.
+
+libgit2 is built from hash-verified sources and linked statically. Only local
+repository operations are enabled; SSH and HTTPS transports are disabled.
+The build requires CMake but no system libgit2 installation. Worktree listing
+uses the existing internal porcelain decoder. Main, foreign and locked
+worktrees are protected from removal; force consent can remove dirty worktrees
+but cannot bypass a lock. Discovery from a linked worktree resolves the primary
+repository so attaching it does not create a duplicate project.
+
+Git hooks and external Git filters are not executed by this integration.
+Repositories requiring those checkout side effects need separate support.
+Bare primary repositories and paths containing line breaks are not supported
+by the project store. Failed or oversized reads leave the existing worktree
+snapshot intact. Git worker results are host-delivered; SDK session replay of
+Git workflows is not currently supported.
 
 Claude and Codex share the `agent-launcher` template in
 `components/tools-sidebar.native`, including profile expansion and launch

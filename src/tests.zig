@@ -6,5 +6,6 @@ test {
     _ = @import("tests/terminals_tests.zig");
     _ = @import("tests/workspaces_tests.zig");
     _ = @import("tests/git_tests.zig");
+    _ = @import("tests/libgit2_tests.zig");
     _ = @import("tests/persistence_tests.zig");
 }

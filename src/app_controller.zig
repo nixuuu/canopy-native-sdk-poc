@@ -13,7 +13,6 @@ const tool_launch = @import("tool_launch.zig");
 const tool_registry = @import("tool_registry.zig");
 const workspaces = @import("workspaces.zig");
 const git_workflow = @import("git_workflow.zig");
-const git_cli = @import("git_cli.zig");
 
 pub const Model = model_mod.Model;
 pub const Msg = messages.Msg;
@@ -24,33 +23,26 @@ const TerminalTab = terminal_tabs.Tab;
 const sidebar_divider_width = model_mod.sidebar_divider_width;
 const terminal_bootstrap = "cd -- \"$1\" && exec \"$2\" -l";
 
-/// One zero-backlog lane for every Git workflow. A running command owns the
-/// lane until its exact EffectExit arrives; callers are rejected, never queued.
-/// Native SDK spawn has no execution timeout, so slow repositories are allowed
-/// to finish naturally without a polling loop creating more host work.
-fn spawnGit(model: *Model, fx: *Effects, operation: GitOperation) void {
+/// Admission only. The native host copies and executes the request off-thread.
+/// Only a matching completion releases the zero-backlog lane.
+fn startGit(model: *Model, _: *Effects, operation: GitOperation) void {
     if (model.git.busy()) {
         model.status_text = "Another Git operation is still running";
         return;
     }
-    const request = operation.request(model.project_store) orelse return;
-    const key = model.git.begin(operation) orelse return;
-    git_cli.execute(fx, key, request) catch {
-        _ = model.git.finish(key);
-        model.status_text = "Branch name is too long";
-        return;
-    };
+    _ = operation.request(model.project_store) orelse return;
+    _ = model.git.begin(operation) orelse return;
     model.status_text = operation.progress();
 }
 
 fn detectRepository(model: *Model, fx: *Effects, project_id: u64) void {
-    spawnGit(model, fx, .{ .kind = .detect_repo, .project_id = project_id });
+    startGit(model, fx, .{ .kind = .detect_repo, .project_id = project_id });
 }
 
 fn refreshWorktrees(model: *Model, fx: *Effects, project_id: u64) void {
     const project = model.project_store.findProject(project_id) orelse return;
     if (!project.is_git) return;
-    spawnGit(model, fx, .{ .kind = .list_worktrees, .project_id = project_id });
+    startGit(model, fx, .{ .kind = .list_worktrees, .project_id = project_id });
 }
 
 fn validateNewBranch(model: *Model, fx: *Effects, project_id: u64, branch: []const u8, target_path: []const u8) void {
@@ -59,7 +51,7 @@ fn validateNewBranch(model: *Model, fx: *Effects, project_id: u64, branch: []con
         model.status_text = "Branch name or worktree path is too long";
         return;
     }
-    spawnGit(model, fx, operation);
+    startGit(model, fx, operation);
 }
 
 const store_read_key: u64 = 9_001;
@@ -86,7 +78,7 @@ fn persistProjects(model: *Model, fx: *Effects) void {
 fn detectNextRestoredProject(model: *Model, fx: *Effects) void {
     if (!model.project_io.scanning() or model.git.busy()) return;
     if (model.project_io.nextAttachedProject(model.project_store)) |project_id| {
-        spawnGit(model, fx, .{ .kind = .restore_check, .project_id = project_id });
+        startGit(model, fx, .{ .kind = .restore_check, .project_id = project_id });
         return;
     }
     model.status_text = if (model.project_store.hasProjects()) "Projects restored" else "Ready";
@@ -95,11 +87,11 @@ fn detectNextRestoredProject(model: *Model, fx: *Effects) void {
 fn preflightRemoveStatus(model: *Model, fx: *Effects, workspace_id: u64) void {
     const worktree = model.project_store.findWorktree(workspace_id) orelse return;
     if (worktree.is_main or !worktree.active) return;
-    spawnGit(model, fx, .{ .kind = .remove_status, .workspace_id = workspace_id });
+    startGit(model, fx, .{ .kind = .remove_status, .workspace_id = workspace_id });
 }
 
 fn preflightRemoveSubmodules(model: *Model, fx: *Effects, workspace_id: u64) void {
-    spawnGit(model, fx, .{ .kind = .remove_submodules, .workspace_id = workspace_id });
+    startGit(model, fx, .{ .kind = .remove_submodules, .workspace_id = workspace_id });
 }
 
 fn finishRemovePreflight(model: *Model, fx: *Effects) void {
@@ -121,7 +113,7 @@ fn preflightRemoveUnmerged(model: *Model, fx: *Effects, workspace_id: u64) void 
         finishRemovePreflight(model, fx);
         return;
     }
-    spawnGit(model, fx, .{ .kind = .remove_unmerged, .project_id = project.id, .workspace_id = workspace_id });
+    startGit(model, fx, .{ .kind = .remove_unmerged, .project_id = project.id, .workspace_id = workspace_id });
 }
 
 fn executeWorktreeRemoval(model: *Model, fx: *Effects, workspace_id: u64, force: bool) void {
@@ -129,7 +121,7 @@ fn executeWorktreeRemoval(model: *Model, fx: *Effects, workspace_id: u64, force:
     const project = model.project_store.projectForWorkspace(workspace_id) orelse return;
     var operation = GitOperation{ .kind = .remove_worktree, .project_id = project.id, .workspace_id = workspace_id, .force = force };
     _ = operation.target_path.set(worktree.path.slice());
-    spawnGit(model, fx, operation);
+    startGit(model, fx, operation);
 }
 
 // Borrowed launch data: startTerminal copies metadata and the selected backend
@@ -656,7 +648,7 @@ fn handleGitCreation(model: *Model, fx: *Effects, operation: GitOperation, resul
     switch (operation.kind) {
         .validate_branch, .check_target, .check_branch, .create_branch => {
             switch (operation.advanceCreation(result.outcome)) {
-                .next => |next| spawnGit(model, fx, next),
+                .next => |next| startGit(model, fx, next),
                 .failed => |message| model.status_text = message,
             }
         },
@@ -855,7 +847,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .edit_profile_codex_profile => |edit| editProfileDraft(model, .profile, edit),
         .toggle_profile_full_auto => model.profile_edit.toggleFullAuto(),
         .toggle_profile_dangerous_bypass => model.profile_edit.toggleDangerousBypass(),
-        .git_done => |exit| handleGitResult(model, fx, git_cli.result(exit)),
+        .git_done => |result| handleGitResult(model, fx, result),
+        .git_wakeup => {},
         .store_done => |result| handleStoreResult(model, fx, result),
         .terminal_event => |event| handleTerminalEvent(model, fx, event),
         .sidebar_resized => |fraction| {

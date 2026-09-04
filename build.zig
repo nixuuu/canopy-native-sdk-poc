@@ -10,6 +10,25 @@ pub fn build(b: *std.Build) void {
     });
     app.exe.root_module.addIncludePath(b.path("src"));
     app.tests.root_module.addIncludePath(b.path("src"));
+    const git_source = b.dependency("libgit2", .{});
+    const prepare_git = b.addSystemCommand(&.{ "node", "scripts/build-libgit2.mjs", git_source.path("").getPath(b) });
+    const git_output = prepare_git.addOutputDirectoryArg("libgit2");
+    prepare_git.addFileInput(b.path("scripts/build-libgit2.mjs"));
+    const git_license = b.addInstallFile(git_source.path("COPYING"), "share/licenses/libgit2/COPYING");
+    app.install.step.dependOn(&git_license.step);
+    for ([_]*std.Build.Step.Compile{ app.exe, app.tests }) |artifact| {
+        artifact.step.dependOn(&prepare_git.step);
+        artifact.root_module.addIncludePath(git_source.path("include"));
+        artifact.root_module.addObjectFile(git_output.path(b, "lib/libgit2.a"));
+        artifact.root_module.linkSystemLibrary("z", .{});
+        artifact.root_module.linkSystemLibrary("iconv", .{});
+        if (b.sysroot) |sysroot| {
+            artifact.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+            artifact.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sysroot}) });
+        }
+        artifact.root_module.linkFramework("Security", .{});
+        artifact.root_module.linkFramework("CoreFoundation", .{});
+    }
     if (app.exe.root_module.resolved_target.?.result.os.tag == .macos) {
         const ghostty = b.lazyDependency("ghostty", .{}) orelse return;
         const output = b.pathFromRoot("zig-out/ghostty");

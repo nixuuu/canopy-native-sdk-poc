@@ -29,11 +29,12 @@ pub const Stores = struct {
     }
 };
 
-pub fn finishSpawn(fx: *app.Effects, model: *app.Model, code: i32, output_lines: []const []const u8) !void {
-    const request = fx.pendingSpawnAt(0) orelse return error.MissingSpawn;
-    for (output_lines) |line| try fx.feedLine(request.key, line);
-    try fx.feedExit(request.key, code);
-    while (fx.takeMsg()) |msg| app.update(model, msg, fx);
+pub fn finishGit(fx: *app.Effects, model: *app.Model, outcome: @import("../git_workflow.zig").Outcome, output_lines: []const []const u8) !void {
+    try std.testing.expect(model.git.busy());
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    const output = try std.mem.join(std.testing.allocator, "\n", output_lines);
+    defer std.testing.allocator.free(output);
+    app.update(model, .{ .git_done = .{ .key = model.git.active.key, .outcome = outcome, .output = output } }, fx);
 }
 
 pub fn addProfile(stores: Stores, runtime_id: u64, agent_type: profiles.AgentType, name: []const u8) !*profiles.Profile {

@@ -150,6 +150,7 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 }
 
 const CanopyHost = struct {
+    git: @import("git_host.zig").Host = .{},
     chrome_install: canvas_host.InstallGate = .{},
     sidebar_controller: @import("sidebar_controller.zig").Controller = .{},
     menu: @import("app_menu.zig").Host = .{},
@@ -187,6 +188,7 @@ const CanopyHost = struct {
     }
 
     fn destroy(host: *CanopyHost, allocator: std.mem.Allocator) void {
+        host.git.deinit();
         host.menu.deinit();
         host.terminals.deinit();
         host.ui_app.model.terminal_state.deinit(host.ui_app.model.tab_store.allocator);
@@ -220,6 +222,7 @@ const CanopyHost = struct {
         while (host.menu.takeClose()) try host.ui_app.dispatch(runtime, 1, .close_active_tab);
         try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
+        try host.synchronizeGit(runtime);
         if (builtin.os.tag == .macos and !host.sidebar_controller.hasPendingGeometry()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
         // AppKit can synchronously emit resizes when its toolbar style changes.
@@ -227,6 +230,25 @@ const CanopyHost = struct {
         // already set so a reentrant callback cannot initialize UI twice.
         if (builtin.os.tag == .macos and host.chrome_install.claim(host.ui_app.installed)) {
             canopy_use_compact_titlebar();
+        }
+    }
+
+    fn synchronizeGit(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
+        if (host.git.completed()) |result| {
+            // Keep response memory alive through the synchronous update.
+            defer host.git.release();
+            try host.ui_app.dispatch(runtime, 1, .{ .git_done = result });
+        }
+        const model = &host.ui_app.model;
+        while (host.git.job == null and model.git.busy()) {
+            const operation = &model.git.active;
+            const request = operation.request(model.project_store) orelse {
+                try host.ui_app.dispatch(runtime, 1, .{ .git_done = .{ .key = operation.key, .outcome = .failure, .output = "" } });
+                continue;
+            };
+            host.git.start(&host.ui_app.effects, operation.key, request) catch {
+                try host.ui_app.dispatch(runtime, 1, .{ .git_done = .{ .key = operation.key, .outcome = .failure, .output = "" } });
+            };
         }
     }
 
@@ -243,6 +265,7 @@ const CanopyHost = struct {
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
+        host.git.deinit();
         host.sidebar_controller.flushPending(host.ui_app, update);
         host.menu.deinit();
         if (builtin.os.tag == .macos) host.terminals.detach(runtime);

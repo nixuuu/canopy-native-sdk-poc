@@ -4,6 +4,10 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .libgit2 = .{
+            .url = "https://github.com/libgit2/libgit2/archive/refs/tags/v1.9.7.tar.gz",
+            .hash = "N-V-__8AAPE7NgGzXiYp17A2YYEYpVRbRzgNqovmU-BWmr8z",
+        },
         .native_sdk = .{
             // npm pins the exact SDK/CLI build and patch-package applies
             // Canopy's dynamic PTY reactor patch reproducibly at install.
