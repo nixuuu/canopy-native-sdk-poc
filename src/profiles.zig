@@ -1,6 +1,7 @@
 //! Electron Canopy-compatible agent profile storage and CLI mapping.
 
 const std = @import("std");
+const db_page = @import("db_page.zig");
 const workspaces = @import("workspaces.zig");
 
 pub const max_profile_id_bytes: usize = 128;
@@ -206,34 +207,33 @@ pub const Store = struct {
     }
 
     pub fn appendEncodedPage(store: *Store, bytes: []const u8) bool {
-        var at: usize = 0;
-        const column_count = readInt(u32, bytes, &at) orelse return false;
-        const row_count = readInt(u32, bytes, &at) orelse return false;
-        if (column_count != 7) return false;
         const expected = [_][]const u8{ "id", "agent_type", "name", "is_default", "sort_index", "prefs_json", "has_api_key" };
-        for (expected) |name| {
-            const actual = readBytes(bytes, &at) orelse return false;
-            if (!std.mem.eql(u8, actual, name)) return false;
-        }
-        for (0..row_count) |_| {
-            const id = readText(bytes, &at) orelse return false;
-            const agent_name = readText(bytes, &at) orelse return false;
-            const name = readText(bytes, &at) orelse return false;
-            const is_default = readInteger(bytes, &at) orelse return false;
-            const sort_index = readInteger(bytes, &at) orelse return false;
-            const prefs_json = readText(bytes, &at) orelse return false;
-            const has_api_key = readInteger(bytes, &at) orelse return false;
+        var page = db_page.Reader.init(bytes, &expected) orelse return false;
+        var decoded: std.ArrayListUnmanaged(Profile) = .empty;
+        defer decoded.deinit(store.allocator);
+        var next_runtime_id = store.next_runtime_id;
+        for (0..page.row_count) |_| {
+            const id = page.text() orelse return false;
+            const agent_name = page.text() orelse return false;
+            const name = page.text() orelse return false;
+            const is_default = page.integer() orelse return false;
+            const sort_index = page.integer() orelse return false;
+            const prefs_json = page.text() orelse return false;
+            const has_api_key = page.integer() orelse return false;
             const agent_type = std.meta.stringToEnum(AgentType, agent_name) orelse continue;
-            var profile = Profile{ .runtime_id = store.next_runtime_id, .agent_type = agent_type };
-            store.next_runtime_id +%= 1;
+            var profile = Profile{ .runtime_id = next_runtime_id, .agent_type = agent_type };
+            next_runtime_id +%= 1;
             if (!profile.id.set(id) or !profile.name.set(name)) return false;
             profile.is_default = is_default == 1;
             profile.sort_index = sort_index;
             profile.has_api_key = has_api_key == 1;
             decodePrefs(&profile.prefs, prefs_json);
-            store.items.append(store.allocator, profile) catch return false;
+            decoded.append(store.allocator, profile) catch return false;
         }
-        return at == bytes.len;
+        if (!page.done()) return false;
+        store.items.appendSlice(store.allocator, decoded.items) catch return false;
+        store.next_runtime_id = next_runtime_id;
+        return true;
     }
 };
 
@@ -293,34 +293,6 @@ pub fn encodePrefs(prefs: *const Prefs, out: []u8) ?[]const u8 {
     return writer.buffered();
 }
 
-fn readText(bytes: []const u8, at: *usize) ?[]const u8 {
-    if (at.* >= bytes.len or bytes[at.*] != 3) return null;
-    at.* += 1;
-    return readBytes(bytes, at);
-}
-
-fn readInteger(bytes: []const u8, at: *usize) ?i64 {
-    if (at.* >= bytes.len or bytes[at.*] != 1) return null;
-    at.* += 1;
-    return readInt(i64, bytes, at);
-}
-
-fn readBytes(bytes: []const u8, at: *usize) ?[]const u8 {
-    const len = readInt(u32, bytes, at) orelse return null;
-    if (len > bytes.len - at.*) return null;
-    const start = at.*;
-    at.* += len;
-    return bytes[start..at.*];
-}
-
-fn readInt(comptime T: type, bytes: []const u8, at: *usize) ?T {
-    const width = @sizeOf(T);
-    if (at.* > bytes.len or width > bytes.len - at.*) return null;
-    const value = std.mem.readInt(T, bytes[at.*..][0..width], .little);
-    at.* += width;
-    return value;
-}
-
 test "profile preferences preserve Electron's string JSON encoding" {
     var prefs: Prefs = .{};
     try std.testing.expect(prefs.model.set("gpt-5.6"));
@@ -350,4 +322,28 @@ test "profile row names reference stable store entries" {
     try std.testing.expectEqualStrings("Default", projected[0].name);
     try std.testing.expectEqualStrings("Work", projected[1].name);
     try std.testing.expect(projected[1].selected);
+}
+
+test "malformed profile page appends nothing" {
+    const malformed =
+        "\x07\x00\x00\x00\x01\x00\x00\x00" ++
+        "\x02\x00\x00\x00id" ++
+        "\x0a\x00\x00\x00agent_type" ++
+        "\x04\x00\x00\x00name" ++
+        "\x0a\x00\x00\x00is_default" ++
+        "\x0a\x00\x00\x00sort_index" ++
+        "\x0a\x00\x00\x00prefs_json" ++
+        "\x0b\x00\x00\x00has_api_key" ++
+        "\x03\x01\x00\x00\x00p" ++
+        "\x03\x05\x00\x00\x00codex" ++
+        "\x03\x07\x00\x00\x00Default" ++
+        "\x01\x01\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x01\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x03\x02\x00\x00\x00{}" ++
+        "\x01\x00\x00\x00\x00\x00\x00\x00\x00\xff";
+    const store = try Store.create(std.testing.allocator);
+    defer store.destroy();
+    try std.testing.expect(!store.appendEncodedPage(malformed));
+    try std.testing.expectEqual(@as(usize, 0), store.items.items.len);
+    try std.testing.expectEqual(@as(u64, 1), store.next_runtime_id);
 }

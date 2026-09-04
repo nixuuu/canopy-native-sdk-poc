@@ -1,6 +1,7 @@
 //! Compatibility layer for Electron Canopy's `preferences(key,value)` table.
 
 const std = @import("std");
+const db_page = @import("db_page.zig");
 const native_sdk = @import("native_sdk");
 const workspaces = @import("workspaces.zig");
 
@@ -60,41 +61,16 @@ pub const load_sql =
 ;
 
 pub fn decodePage(values: *Values, bytes: []const u8) bool {
-    var at: usize = 0;
-    const column_count = readInt(u32, bytes, &at) orelse return false;
-    const row_count = readInt(u32, bytes, &at) orelse return false;
-    if (column_count != 2) return false;
-    const first_column = readBytes(bytes, &at) orelse return false;
-    const second_column = readBytes(bytes, &at) orelse return false;
-    if (!std.mem.eql(u8, first_column, "key") or !std.mem.eql(u8, second_column, "value")) return false;
-    for (0..row_count) |_| {
-        const key = readTextValue(bytes, &at) orelse return false;
-        const value = readTextValue(bytes, &at) orelse return false;
-        values.apply(key, value);
+    var page = db_page.Reader.init(bytes, &.{ "key", "value" }) orelse return false;
+    var decoded = values.*;
+    for (0..page.row_count) |_| {
+        const key = page.text() orelse return false;
+        const value = page.text() orelse return false;
+        decoded.apply(key, value);
     }
-    return at == bytes.len;
-}
-
-fn readTextValue(bytes: []const u8, at: *usize) ?[]const u8 {
-    if (at.* >= bytes.len or bytes[at.*] != 3) return null;
-    at.* += 1;
-    return readBytes(bytes, at);
-}
-
-fn readBytes(bytes: []const u8, at: *usize) ?[]const u8 {
-    const len = readInt(u32, bytes, at) orelse return null;
-    if (len > bytes.len - at.*) return null;
-    const start = at.*;
-    at.* += len;
-    return bytes[start..at.*];
-}
-
-fn readInt(comptime T: type, bytes: []const u8, at: *usize) ?T {
-    const width = @sizeOf(T);
-    if (at.* > bytes.len or width > bytes.len - at.*) return null;
-    const value = std.mem.readInt(T, bytes[at.*..][0..width], .little);
-    at.* += width;
-    return value;
+    if (!page.done()) return false;
+    values.* = decoded;
+    return true;
 }
 
 test "Electron-compatible preferences decode and clamp values" {
@@ -109,4 +85,15 @@ test "Electron-compatible preferences decode and clamp values" {
     try std.testing.expectEqualStrings("/tmp/canopy-worktrees", values.worktrees_base_dir.slice());
     values.apply(key_font_size, "99");
     try std.testing.expectEqual(@as(u8, 18), values.font_size);
+}
+
+test "malformed preference page leaves the previous values unchanged" {
+    const malformed =
+        "\x02\x00\x00\x00\x01\x00\x00\x00" ++
+        "\x03\x00\x00\x00key\x05\x00\x00\x00value" ++
+        "\x03\x13\x00\x00\x00reopenLastWorkspace" ++
+        "\x03\x05\x00\x00\x00false\xff";
+    var values: Values = .{};
+    try std.testing.expect(!decodePage(&values, malformed));
+    try std.testing.expect(values.reopen_last_workspace);
 }

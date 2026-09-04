@@ -482,6 +482,45 @@ test "Codex dangerous bypass takes precedence over approval sandbox and full aut
     try std.testing.expectEqualStrings("Codex (Work)", stores.tabs.items.items[0].title.slice());
 }
 
+test "closing and reopening Codex retires the old PTY before recycling its key" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    const attached = stores.projects.attachPlaceholder("/tmp/canopy-codex-lifecycle").?;
+    model.active_workspace_id = attached.workspace_id;
+    _ = try addProfile(stores, 9, .codex, "Default");
+    model.profiles_loaded = true;
+    model.tool_checks_remaining = 0;
+    model.codex_available = true;
+    try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    app.update(&model, .launch_codex, &fx);
+    const first = fx.pendingPtyAt(0) orelse return error.MissingPty;
+    const first_key = first.key;
+    const first_tab_id = stores.tabs.items.items[0].id;
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
+
+    app.update(&model, .{ .close_tab = first_tab_id }, &fx);
+    try std.testing.expect(fx.ptyKillRequested(first_key));
+    try std.testing.expectEqual(app.TerminalPhase.closing, stores.tabs.items.items[0].phase);
+    // Metadata and key remain owned until the exactly-one exit arrives.
+    try std.testing.expectEqual(@as(usize, 1), stores.tabs.items.items.len);
+    try fx.feedPtyExit(first_key, -1, 0, .cancelled, 0);
+    while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+    try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
+
+    app.update(&model, .launch_codex, &fx);
+    const second = fx.pendingPtyAt(0) orelse return error.MissingPty;
+    try std.testing.expectEqual(first_key, second.key);
+    try std.testing.expect(stores.tabs.items.items[0].id != first_tab_id);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
+}
+
 test "profile editor saves compatible prefs JSON before reloading rows" {
     const stores = try Stores.init();
     defer stores.deinit();

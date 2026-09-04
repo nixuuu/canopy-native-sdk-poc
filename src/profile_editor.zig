@@ -5,6 +5,21 @@ const profiles = @import("profiles.zig");
 
 const canvas = native_sdk.canvas;
 
+pub const TextField = enum {
+    name,
+    model,
+    permission_mode,
+    effort_level,
+    provider,
+    approval_mode,
+    sandbox,
+    base_url,
+    append_system_prompt,
+    custom_env,
+    settings_json,
+    profile,
+};
+
 pub const Draft = struct {
     runtime_id: u64 = 0,
     agent_type: profiles.AgentType = .claude,
@@ -26,6 +41,23 @@ pub const Draft = struct {
     full_auto: bool = false,
     dangerously_bypass_approvals_and_sandbox: bool = false,
     profile: canvas.TextBuffer(profiles.max_pref_bytes) = .{},
+
+    pub fn applyTextEdit(draft: *Draft, field: TextField, edit: canvas.TextInputEvent) void {
+        switch (field) {
+            .name => draft.name.apply(edit),
+            .model => draft.model.apply(edit),
+            .permission_mode => draft.permission_mode.apply(edit),
+            .effort_level => draft.effort_level.apply(edit),
+            .provider => draft.provider.apply(edit),
+            .approval_mode => draft.approval_mode.apply(edit),
+            .sandbox => draft.sandbox.apply(edit),
+            .base_url => draft.base_url.apply(edit),
+            .append_system_prompt => draft.append_system_prompt.apply(edit),
+            .custom_env => draft.custom_env.apply(edit),
+            .settings_json => draft.settings_json.apply(edit),
+            .profile => draft.profile.apply(edit),
+        }
+    }
 
     pub fn load(draft: *Draft, source: *const profiles.Profile) void {
         draft.* = .{

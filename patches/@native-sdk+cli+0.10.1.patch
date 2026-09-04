@@ -1,3 +1,276 @@
+diff --git a/node_modules/@native-sdk/cli/src/canopy_terminal_tests.zig b/node_modules/@native-sdk/cli/src/canopy_terminal_tests.zig
+new file mode 100644
+index 0000000..16cc72d
+--- /dev/null
++++ b/node_modules/@native-sdk/cli/src/canopy_terminal_tests.zig
+@@ -0,0 +1,4 @@
++//! Consumer test root: unlike the SDK-wide suite, this uses real Ghostty VT.
++test {
++    _ = @import("runtime/terminal_session_tests.zig");
++}
+diff --git a/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m b/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
+index 3225c78..f11db33 100644
+--- a/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
++++ b/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
+@@ -6995,6 +6995,21 @@ - (void)setScrollDrivers:(const native_sdk_appkit_scroll_driver_t *)drivers coun
+         driver.occluderMask = desired.occluder_mask;
+         NSRect target = NSMakeRect(desired.x, self.bounds.size.height - desired.y - desired.height, desired.width, desired.height);
+         if (!NSEqualRects(driver.frame, target)) driver.frame = target;
++        // Native overlay scrollers are AppKit subviews above the Metal canvas.
++        // A full-view modal therefore cannot visually cover or hit-block one
++        // by paint order alone. Hide a driver whenever one of the occluders in
++        // its mask fully covers its frame; nested modal scroll regions carry
++        // no mask and remain visible and interactive.
++        BOOL fullyOccluded = NO;
++        for (NSUInteger occluderIndex = 0; occluderIndex < occluderRects.count && occluderIndex < 32; occluderIndex += 1) {
++            const uint32_t bit = (uint32_t)1 << occluderIndex;
++            if ((driver.occluderMask & bit) == 0) continue;
++            if (NSContainsRect([occluderRects[occluderIndex] rectValue], target)) {
++                fullyOccluded = YES;
++                break;
++            }
++        }
++        driver.hidden = fullyOccluded;
+         NSSize contentSize = NSMakeSize(MAX(desired.content_width, 1), MAX(desired.content_height, 1));
+         if (driver.documentView && !NSEqualSizes(driver.documentView.frame.size, contentSize)) {
+             [driver.documentView setFrameSize:contentSize];
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig
+index f36fa7d..1956e36 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig
+@@ -28,14 +28,13 @@ const canvas = @import("root.zig");
+ const geometry = @import("geometry");
+ const box = @import("terminal_box.zig");
+
+-/// Grid ceilings, derived from the per-view canvas budgets: the glyph
+-/// budget bounds how many cells can hold ink at once, and the command
+-/// budget bounds per-row style runs. A viewport is clamped to these
+-/// before it reaches an emulator, so a huge window degrades to a
+-/// bounded grid instead of a budget error.
++/// Representable grid dimensions. Painter resources are charged by runs and
++/// distinct glyphs, not by viewport cell count.
+ pub const max_cols: usize = 320;
+ pub const max_rows: usize = 96;
+-pub const max_cells: usize = 7168;
++// Grid geometry is independent from painter budgets: repeated glyphs and
++// merged runs do not cost one atlas entry/command per terminal cell.
++pub const max_cells: usize = max_cols * max_rows;
+
+ /// Painter budgets when the grid rides the WIDGET tree, where it shares
+ /// the per-view stores with every other widget. The command reserve is
+@@ -226,13 +225,10 @@ pub fn cellMetrics(tokens: canvas.DesignTokens) TerminalCellMetrics {
+ }
+
+ /// Clamp a proposed grid to the canvas budgets: the glyph budget bounds
+-/// total cells, so a very wide viewport trades rows for columns to stay
+-/// under the cell ceiling instead of overflowing the frame.
++/// each axis independently, so widening a viewport never shortens its height.
+ pub fn clampGrid(proposed_cols: usize, proposed_rows: usize) TerminalCellPos {
+-    var c = std.math.clamp(proposed_cols, 2, max_cols);
+-    var r = std.math.clamp(proposed_rows, 2, max_rows);
+-    if (c * r > max_cells) r = @max(2, max_cells / c);
+-    if (c * r > max_cells) c = @max(2, max_cells / r);
++    const c = std.math.clamp(proposed_cols, 2, max_cols);
++    const r = std.math.clamp(proposed_rows, 2, max_rows);
+     return .{ .x = @intCast(c), .y = @intCast(r) };
+ }
+
+@@ -414,6 +410,16 @@ fn rowPathElements(row: TerminalRow) usize {
+     return total;
+ }
+
++fn squareCorner(cp: u21) u21 {
++    return switch (cp) {
++        0x256D => 0x250C,
++        0x256E => 0x2510,
++        0x256F => 0x2518,
++        0x2570 => 0x2514,
++        else => cp,
++    };
++}
++
+ /// Text bytes ALREADY in the display list — every `draw_text`, whether
+ /// its bytes are builder-owned (a chart's labels, this grid's own runs)
+ /// or referenced from view-owned memory (an earlier text widget). The
+@@ -444,41 +450,47 @@ fn displayListPathElements(list: canvas.DisplayList) usize {
+     return total;
+ }
+
+-/// An UPPER BOUND on the display-list commands one row emits, assuming
+-/// no runs merge (the pathological worst case): a background run per
+-/// cell that carries one, plus the cell's ink — eight commands for a
+-/// pure-double box joint, two (text run + underline) for a styled
+-/// character, none for an empty cell — plus one selection wash. Real
+-/// rows merge runs and cost far less; this bound is what the per-row
+-/// preflight checks so a row is only started when it can finish whole,
+-/// and it is content-accurate (a cheap ASCII row costs ~2/column, not a
+-/// flat worst-case-per-column reserve that would starve wide grids).
++/// Command upper bound using the same background/text/box run boundaries as
++/// paint. Charging per cell instead of per run discards otherwise cheap dense
++/// TUI rows even when the display list has plenty of remaining capacity.
+ fn rowCommandCost(row: TerminalRow) usize {
+-    var total: usize = 1; // the selection wash
++    var total: usize = if (row.selection != null) 1 else 0;
++    var background: ?canvas.Color = null;
++    for (row.cells) |cell| {
++        if (cell.bg) |bg| {
++            if (background == null or !colorEql(background.?, bg)) total += 1;
++        }
++        background = cell.bg;
++    }
++    var text_active = false;
++    var text_fg: canvas.Color = undefined;
++    var text_underline = false;
++    var text_bytes: usize = 0;
++    var previous_cluster = false;
+     var i: usize = 0;
+     while (i < row.cells.len) : (i += 1) {
+         const cell = row.cells[i];
+-        if (cell.wide == .spacer) continue;
+-        if (cell.bg != null) total += 1;
+-        if (cell.cp == 0) continue;
++        if (cell.wide == .spacer or cell.cp == 0) {
++            text_active = false;
++            continue;
++        }
+         if (box.isBoxDrawing(cell.cp)) {
++            text_active = false;
+             if (box.mergesHorizontally(cell.cp)) {
+                 // A horizontally-merged run (a long `─` border) paints
+                 // ONE geometry command plus a possible underline, no
+                 // matter how wide — mirror the paint loop's merge (same
+                 // code point, foreground, and underline) so the estimate
+                 // does not charge nine per column for what collapses to
+-                // two commands. Backgrounds still count per cell (their
+-                // own run pass is separate).
++                // two commands. Background runs were counted separately.
+                 var span: usize = 1;
+                 while (i + span < row.cells.len) : (span += 1) {
+                     const next = row.cells[i + span];
+                     if (next.cp != cell.cp or !colorEql(next.fg, cell.fg) or next.underline != cell.underline) break;
+-                    if (next.bg != null) total += 1;
+                 }
+                 // A merged run's worst-case ink: a double piece (═)
+                 // paints TWO parallel bars, plus a possible underline.
+-                total += 3;
++                total += box.maxCommands(cell.cp) + @as(usize, @intFromBool(cell.underline));
+                 i += span - 1;
+             } else {
+                 // The glyph's own worst case (kept lockstep with the
+@@ -486,10 +498,23 @@ fn rowCommandCost(row: TerminalRow) usize {
+                 // underline — a row of one-bar pieces costs what it
+                 // paints, never a flat joint-worst-case that starves
+                 // wide grids.
+-                total += box.maxCommands(cell.cp) + 1;
++                total += box.maxCommands(cell.cp) + @as(usize, @intFromBool(cell.underline));
+             }
+         } else {
+-            total += 2; // the text run plus its underline
++            const primary_len = std.unicode.utf8CodepointSequenceLength(cell.cp) catch 1;
++            const cluster = cell.cluster.len > primary_len;
++            if (!text_active or !colorEql(text_fg, cell.fg) or
++                text_underline != cell.underline or cluster or previous_cluster or
++                text_bytes + cell.cluster.len > text_scratch_bytes)
++            {
++                total += 1 + @as(usize, @intFromBool(cell.underline));
++                text_bytes = 0;
++            }
++            text_active = true;
++            text_fg = cell.fg;
++            text_underline = cell.underline;
++            text_bytes += cell.cluster.len;
++            previous_cluster = cluster;
+         }
+     }
+     return total;
+@@ -612,12 +637,12 @@ pub fn paint(grid: TerminalGrid, builder: *canvas.Builder, options: TerminalPain
+         // grid adds, not what its siblings spent.
+         const row_text = rowTextBytes(row);
+         if (row_text > 0 and text_total + row_text > text_ceiling) break;
+-        // Path-element stop, ATOMIC per row, against the view-global
+-        // running total (static sibling paths included): a row of rounded
+-        // corners is skipped BEFORE it would cross the per-view
+-        // path-element budget; a row adding none paints regardless.
++        // Path budget includes static sibling icons. If rounded corners do
++        // not fit, square them while keeping the entire row's content.
+         const row_paths = rowPathElements(row);
+-        if (row_paths > 0 and path_total + row_paths > path_ceiling) break;
++        // Decoration must not suppress the entire TUI. Square joins need no
++        // path storage and fit the same command bound as arc + straight.
++        const square_corners = row_paths > 0 and path_total + row_paths > path_ceiling;
+         // Glyph-budget stop, same row-atomic shape: stop BEFORE the row
+         // whose new DISTINCT code points would cross the atlas proxy —
+         // the frame degrades to fewer rows instead of failing whole on
+@@ -843,7 +868,8 @@ pub fn paint(grid: TerminalGrid, builder: *canvas.Builder, options: TerminalPain
+                 // four-wide stride would collide the ids of adjacent
+                 // double cells and fail the retained diff with
+                 // DuplicateObjectId.
+-                box.paint(builder, ids.at(row_id + 0x6000 + @as(u64, @intCast(x)) * commands_per_cell), rect, box_cp, fg, box_thickness) catch {
++                const painted_cp = if (square_corners) squareCorner(box_cp) else box_cp;
++                box.paint(builder, ids.at(row_id + 0x6000 + @as(u64, @intCast(x)) * commands_per_cell), rect, painted_cp, fg, box_thickness) catch {
+                     row_torn = true;
+                     break;
+                 };
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid_tests.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid_tests.zig
+index ef7c027..bb271a6 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid_tests.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid_tests.zig
+@@ -750,7 +750,10 @@ test "the widget diff reports paint damage for a changed bound grid" {
+     try testing.expect(saw_paint_dirty);
+ }
+
+-test "clampGrid trades rows for columns under the cell ceiling" {
++test "clampGrid preserves viewport rows independently of its width" {
++    const viewport = grid_model.clampGrid(178, 51);
++    try testing.expectEqual(@as(u16, 178), viewport.x);
++    try testing.expectEqual(@as(u16, 51), viewport.y);
+     const clamped = grid_model.clampGrid(400, 100);
+     try testing.expectEqual(@as(u16, grid_model.max_cols), clamped.x);
+     try testing.expect(@as(usize, clamped.x) * @as(usize, clamped.y) <= grid_model.max_cells);
+@@ -1020,6 +1023,43 @@ test "rounded-corner path elements survive the builder's lifetime" {
+     try testing.expect(saw_path);
+ }
+
++test "path exhaustion squares TUI corners instead of hiding terminal content" {
++    const cells = [_]grid_model.TerminalCell{
++        .{ .cp = 0x256D, .fg = white },
++        .{ .cp = 'T', .cluster = "T", .fg = white },
++        .{ .cp = 0x256E, .fg = white },
++    };
++    const rows = [_]grid_model.TerminalRow{.{ .cells = &cells }};
++    var commands: [64]canvas.CanvasCommand = undefined;
++    var builder = try paintInto(baseGrid(&rows), &commands, .{
++        .frame = geometry.RectF.init(0, 0, 100, 40),
++        .path_reserve = std.math.maxInt(usize),
++        .tokens = .{},
++    });
++    var saw_text = false;
++    for (builder.displayList().commands) |command| {
++        if (command == .draw_text and std.mem.eql(u8, command.draw_text.text, "T")) saw_text = true;
++        try testing.expect(command != .stroke_path);
++    }
++    try testing.expect(saw_text);
++}
++
++test "dense uniform TUI rows charge merged runs rather than every cell" {
++    const cells = [_]grid_model.TerminalCell{.{ .cp = 'A', .cluster = "A", .fg = white, .bg = black }} ** 178;
++    const rows = [_]grid_model.TerminalRow{.{ .cells = &cells }} ** 40;
++    var commands: [256]canvas.CanvasCommand = undefined;
++    var builder = try paintInto(baseGrid(&rows), &commands, .{
++        .frame = geometry.RectF.init(0, 0, 1600, 1200),
++        .tokens = .{},
++        .command_budget = commands.len,
++    });
++    var painted: usize = 0;
++    for (builder.displayList().commands) |command| if (command == .draw_text) {
++        painted += 1;
++    };
++    try testing.expectEqual(@as(usize, 40), painted);
++}
++
+ test "adjacent double-cross cells never collide command ids" {
+     // ╬ emits up to eight commands; the per-column id stride must be at
+     // least eight so neighbors never share an object id.
 diff --git a/node_modules/@native-sdk/cli/src/root.zig b/node_modules/@native-sdk/cli/src/root.zig
 index 2da935a..84fb786 100644
 --- a/node_modules/@native-sdk/cli/src/root.zig
@@ -24,10 +297,10 @@ index e780399..45a7ce4 100644
 -    const requestCanvasFrameForView = CanvasFrameMethods.requestCanvasFrameForView;
 +    pub const requestCanvasFrameForView = CanvasFrameMethods.requestCanvasFrameForView;
      const invalidateForCanvasChanges = CanvasFrameMethods.invalidateForCanvasChanges;
- 
+
      const CanvasImageMethods = runtime_canvas_images.RuntimeCanvasImages(Runtime);
 diff --git a/node_modules/@native-sdk/cli/src/runtime/effects.zig b/node_modules/@native-sdk/cli/src/runtime/effects.zig
-index ce420b0..e9176d8 100644
+index ce420b0..26ab2ba 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/effects.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/effects.zig
 @@ -1102,12 +1102,16 @@ pub const max_effect_channel_pending: usize = 32;
@@ -77,10 +350,25 @@ index ce420b0..e9176d8 100644
  /// Bytes of `ptyWrite` input a FAKE pty retains for test assertions
  /// (`ptyWrittenBytes`) — the scriptable pty's inspection window, not a
  /// delivery bound: writes beyond it drop oldest-first, exactly what a
-@@ -2255,41 +2280,136 @@ fn fallbackEnviron() std.process.Environ {
+@@ -1204,6 +1229,14 @@ pub const EffectPtyEvent = struct {
+ pub const PtyTap = struct {
+     context: *anyopaque,
+     notify: *const fn (context: *anyopaque, event: *const EffectPtyEvent) void,
++    /// An accepted spawn owns a fresh terminal lifetime even when its key
++    /// recycles an ended transport. Notify the emulator before the child can
++    /// emit output so a newly mounted terminal never paints stale scrollback.
++    spawn: ?*const fn (context: *anyopaque, key: u64) void = null,
++    /// Release framework-owned terminal presentation state after the app has
++    /// removed the corresponding tab. This does not kill a transport; callers
++    /// retire the PTY first and forget its emulator after the exit delivery.
++    forget: ?*const fn (context: *anyopaque, key: u64) void = null,
+ };
+
+ /// What one channel event Msg reports. `.data` is one delivered post;
+@@ -2255,41 +2288,136 @@ fn fallbackEnviron() std.process.Environ {
      }
  }
- 
+
 -/// Flatten the bound environ into the pty transport's env list — the
 -/// spawn effect's inherit-the-host policy, made explicit because execve
 -/// takes a flat envp. TERM is injected by the transport whether or not
@@ -242,7 +530,7 @@ index ce420b0..e9176d8 100644
      }
      return buffer[0..count];
  }
-@@ -2453,8 +2573,6 @@ fn ptyStageOutput(shared: *PtyShared, generation: u64, bytes: []const u8) void {
+@@ -2453,8 +2581,6 @@ fn ptyStageOutput(shared: *PtyShared, generation: u64, bytes: []const u8) void {
                      _ = owner.pending.fetchAdd(1, .seq_cst);
                      stamped = true;
                  }
@@ -251,10 +539,10 @@ index ce420b0..e9176d8 100644
              }
          }
      }
-@@ -2544,6 +2662,256 @@ fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation
+@@ -2544,6 +2670,256 @@ fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation
      }
  }
- 
+
 +/// One stable registration in the Darwin kqueue reactor. Registrations are
 +/// retained until reactor teardown so a queued kernel event can never point at
 +/// freed memory; `active` and `generation` make stale events inert.
@@ -508,7 +796,7 @@ index ce420b0..e9176d8 100644
  /// `std.Io.Threaded` (the real executor's io) does not exist on
  /// freestanding targets — the docs' live-preview wasm host compiles
  /// this runtime to wasm32-freestanding. There the executor io compiles
-@@ -3453,6 +3821,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3453,6 +3829,12 @@ pub fn Effects(comptime Msg: type) type {
              /// environ (`bindEnviron`), nothing else — a pty is a spawn
              /// with a different transport, one env story.
              term: []const u8 = pty_transport.default_term,
@@ -521,15 +809,15 @@ index ce420b0..e9176d8 100644
              /// Every pty event — each coalesced output batch and the
              /// exactly-one `.exit` terminal — arrives through this
              /// constructor. Required: a terminal nobody watches is not
-@@ -3469,6 +3843,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3469,6 +3851,7 @@ pub fn Effects(comptime Msg: type) type {
              cols: u16,
              rows: u16,
              term: []const u8,
 +            env: []const PtyEnvEntry = &.{},
          };
- 
+
          /// How one pty table slot advances: `.running` from the
-@@ -3496,6 +3871,8 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3496,6 +3879,8 @@ pub fn Effects(comptime Msg: type) type {
              transport: if (pty_transport.supported) ?pty_transport.Pty else void =
                  if (pty_transport.supported) null else {},
              io_thread: ?WorkerThread = null,
@@ -538,7 +826,7 @@ index ce420b0..e9176d8 100644
              /// The io thread's nudge pipe: [read, write]. Written by
              /// the loop (outbound bytes staged, drain freed staging
              /// room, shutdown); poll()'d by the io thread.
-@@ -3518,6 +3895,16 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3518,6 +3903,16 @@ pub fn Effects(comptime Msg: type) type {
              argv_count: usize = 0,
              term_storage: [max_effect_pty_term_bytes]u8 = undefined,
              term_len: usize = 0,
@@ -555,7 +843,7 @@ index ce420b0..e9176d8 100644
              /// Session replay only: the pending-order reservation this
              /// parked spawn holds (see `ParkOrderState` — the channel
              /// park dance, pty-shaped: a fed start-failure terminal
-@@ -3534,6 +3921,37 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3534,6 +3929,37 @@ pub fn Effects(comptime Msg: type) type {
              fn requestTerm(slot: *const PtySlot) []const u8 {
                  return slot.term_storage[0..slot.term_len];
              }
@@ -591,9 +879,9 @@ index ce420b0..e9176d8 100644
 +                slot.env_bytes_len = 0;
 +            }
          };
- 
+
          /// How one channel table slot advances: `.open` accepts posts
-@@ -5026,7 +5444,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5026,7 +5452,12 @@ pub fn Effects(comptime Msg: type) type {
          /// occupancies beside the channel table. Loop-thread only —
          /// the thread-shared half of each slot lives behind its
          /// `PtySlot.shared` header.
@@ -607,7 +895,7 @@ index ce420b0..e9176d8 100644
          /// Monotonic stamp shared by every pty's staged output backlog
          /// and exit marker — the channels' `channel_seq`, pty-shaped:
          /// cross-pty delivery order and the drain boundary's causality
-@@ -5273,7 +5696,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5273,7 +5704,7 @@ pub fn Effects(comptime Msg: type) type {
              // teaching warning: everything it can still reach (the
              // shared header, its staging ring, the transport fds) is
              // process-lived or deliberately leaked with it.
@@ -616,7 +904,7 @@ index ce420b0..e9176d8 100644
                  // Wind down a running REAL pty: kill and wait (bounded)
                  // for the io thread to stage its exit, then retire or
                  // abandon it. A fake or unsupported occupancy just
-@@ -5298,7 +5721,11 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5298,7 +5729,11 @@ pub fn Effects(comptime Msg: type) type {
                          } else if (pty_slot.transport) |transport| {
                              transport.kill(false);
                          }
@@ -629,7 +917,7 @@ index ce420b0..e9176d8 100644
                          var io_done = pty_slot.shared == null;
                          if (pty_slot.shared) |shared| {
                              const start_ns = runtime_clock.monotonicNanoseconds();
-@@ -5375,7 +5802,18 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5375,7 +5810,18 @@ pub fn Effects(comptime Msg: type) type {
                      pty_slot.state = .idle;
                      pty_slot.on_event = null;
                  }
@@ -649,7 +937,7 @@ index ce420b0..e9176d8 100644
              self.pty_pending_count.store(0, .release);
              // Settle any surrendered reap whose child has since died —
              // teardown is the last cheap moment before the process
-@@ -6029,7 +6467,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -6029,7 +6475,7 @@ pub fn Effects(comptime Msg: type) type {
                  // `bindServices`, which the standard startup order
                  // never does; contained here regardless.)
                  if (comptime pty_transport.supported) {
@@ -658,7 +946,7 @@ index ce420b0..e9176d8 100644
                          if (!(pty_slot.state == .running and !pty_slot.fake)) continue;
                          const shared = pty_slot.shared orelse continue;
                          shared.mutex.lock();
-@@ -6039,7 +6477,11 @@ pub fn Effects(comptime Msg: type) type {
+@@ -6039,7 +6485,11 @@ pub fn Effects(comptime Msg: type) type {
                              if (pty_slot.transport) |transport| transport.kill(false);
                          }
                          shared.mutex.unlock();
@@ -671,7 +959,7 @@ index ce420b0..e9176d8 100644
                          const start_ns = runtime_clock.monotonicNanoseconds();
                          var io_done = false;
                          while (true) {
-@@ -6133,7 +6575,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -6133,7 +6583,7 @@ pub fn Effects(comptime Msg: type) type {
              }
              // Ptys arm the same producer-wake seam: a running REAL
              // occupancy's io thread wakes through its shared header.
@@ -680,7 +968,7 @@ index ce420b0..e9176d8 100644
                  if (slot.state == .running and !slot.fake and slot.shared != null) return true;
              }
              return false;
-@@ -8004,12 +8446,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8004,12 +8454,12 @@ pub fn Effects(comptime Msg: type) type {
          /// second producer beside a live io thread.
          pub fn feedPtyOutput(self: *Self, key: u64, bytes: []const u8) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, PtyChunkTooLarge, ReplayDamagedRecord }!void {
              const slot_index = blk: {
@@ -695,7 +983,7 @@ index ce420b0..e9176d8 100644
              if (!slot.fake) return error.PtyLiveFeed;
              if (slot.park_state == .terminated) {
                  if (comptime builtin.os.tag != .freestanding) {
-@@ -8072,12 +8514,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8072,12 +8522,12 @@ pub fn Effects(comptime Msg: type) type {
          /// ride the completion queue and retire the slot at delivery.
          pub fn feedPtyExit(self: *Self, key: u64, code: i32, signal: i32, reason: EffectExitReason, dropped_writes: u32) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, ReplayDamagedRecord }!void {
              const slot_index = blk: {
@@ -710,7 +998,7 @@ index ce420b0..e9176d8 100644
              if (!slot.fake) return error.PtyLiveFeed;
              // Normalize the tuple to the EffectPtyEvent contract the live
              // io loop guarantees, so a fake (test or replay) can never
-@@ -8204,7 +8646,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8204,7 +8654,7 @@ pub fn Effects(comptime Msg: type) type {
          /// Number of recorded (still-active) fake pty spawns.
          pub fn pendingPtyCount(self: *Self) usize {
              var count: usize = 0;
@@ -719,7 +1007,7 @@ index ce420b0..e9176d8 100644
                  if (slot.fake and slot.state == .running) count += 1;
              }
              return count;
-@@ -8215,7 +8657,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8215,7 +8665,7 @@ pub fn Effects(comptime Msg: type) type {
          /// valid until the occupancy retires.
          pub fn pendingPtyAt(self: *Self, index: usize) ?PtyRequest {
              var seen: usize = 0;
@@ -728,7 +1016,7 @@ index ce420b0..e9176d8 100644
                  if (!(slot.fake and slot.state == .running)) continue;
                  if (seen == index) {
                      return .{
-@@ -8224,6 +8666,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8224,6 +8674,7 @@ pub fn Effects(comptime Msg: type) type {
                          .cols = slot.cols,
                          .rows = slot.rows,
                          .term = slot.requestTerm(),
@@ -736,7 +1024,7 @@ index ce420b0..e9176d8 100644
                      };
                  }
                  seen += 1;
-@@ -8291,16 +8734,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8291,16 +8742,12 @@ pub fn Effects(comptime Msg: type) type {
              // truncate it at the C boundary, so a spawn that "succeeded"
              // would hand the child a different TERM than requested.
              if (std.mem.indexOfScalar(u8, options.term, 0) != null) return self.rejectPty(options.key, options.on_event, true);
@@ -758,24 +1046,28 @@ index ce420b0..e9176d8 100644
              // A build without a pty transport (a libc-free Linux
              // build; a target outside the support matrix) refuses up
              // front. Unlike
-@@ -8317,7 +8756,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8317,7 +8764,7 @@ pub fn Effects(comptime Msg: type) type {
                  if (self.executor != .fake) return self.rejectPty(options.key, options.on_event, false);
              }
- 
+
 -            const slot = &self.pty_slots[slot_index];
 +            const slot = &self.pty_slots.items[slot_index];
              const generation = self.nextChannelGeneration();
              slot.* = .{
                  .state = .running,
-@@ -8338,6 +8777,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8338,6 +8785,11 @@ pub fn Effects(comptime Msg: type) type {
              }
              @memcpy(slot.term_storage[0..options.term.len], options.term);
              slot.term_len = options.term.len;
 +            slot.copyEnv(options.env);
- 
++
++            if (self.pty_tap) |tap| if (tap.spawn) |notify_spawn| {
++                notify_spawn(tap.context, options.key);
++            };
+
              if (slot.fake) {
                  // Session replay: PARK — the fake-slot discipline. The
-@@ -8496,7 +8936,13 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8496,7 +8948,13 @@ pub fn Effects(comptime Msg: type) type {
                  break :accepted true;
              };
              shared.mutex.unlock();
@@ -789,8 +1081,8 @@ index ce420b0..e9176d8 100644
 +            }
              return accepted;
          }
- 
-@@ -8574,7 +9020,11 @@ pub fn Effects(comptime Msg: type) type {
+
+@@ -8574,7 +9032,20 @@ pub fn Effects(comptime Msg: type) type {
                  if (slot.transport) |transport| transport.kill(false);
              }
              shared.mutex.unlock();
@@ -800,10 +1092,19 @@ index ce420b0..e9176d8 100644
 +            } else {
 +                pty_transport.nudge(slot.wake_pipe[1]);
 +            }
++        }
++
++        /// Forget framework-owned emulator state for a retired PTY key. The
++        /// external process lifecycle remains owned by `ptyKill` + its exit
++        /// event; this synchronous hook only releases scrollback/render buffers.
++        pub fn ptyForget(self: *Self, key: u64) void {
++            if (self.pty_tap) |tap| if (tap.forget) |forget| {
++                forget(tap.context, key);
++            };
          }
- 
+
          /// Ask the desktop host to show a system notification. This is
-@@ -11444,7 +11894,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -11444,7 +11915,7 @@ pub fn Effects(comptime Msg: type) type {
                  shared.wake.pending.store(false, .seq_cst);
                  shared.wake.mutex.unlock();
              }
@@ -812,7 +1113,7 @@ index ce420b0..e9176d8 100644
                  const shared = slot.shared orelse continue;
                  shared.wake.mutex.lock();
                  shared.wake.pending.store(false, .seq_cst);
-@@ -11779,7 +12229,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -11779,7 +12250,7 @@ pub fn Effects(comptime Msg: type) type {
                              // still lands in the delivered count.
                              var event = entry.event;
                              if (entry.retire_slot) |slot_index| {
@@ -821,7 +1122,7 @@ index ce420b0..e9176d8 100644
                                  if (parked.state != .idle and parked.generation == entry.retire_generation) {
                                      event.dropped_writes +|= parked.dropped_writes;
                                      self.retirePtySlot(parked);
-@@ -12377,7 +12827,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12377,7 +12848,7 @@ pub fn Effects(comptime Msg: type) type {
                              self.drain_heap_line = heap;
                              entry.heap_line = null;
                          }
@@ -830,7 +1131,7 @@ index ce420b0..e9176d8 100644
                          if (pty_slot.state == .idle or entry.channel_generation != pty_slot.generation) continue;
                          const on_event = pty_slot.on_event;
                          // The delivered drop count reads AT DELIVERY, the
-@@ -12556,7 +13006,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12556,7 +13027,7 @@ pub fn Effects(comptime Msg: type) type {
              var best_index: ?usize = null;
              var best_seq: u64 = std.math.maxInt(u64);
              var best_exit = false;
@@ -839,7 +1140,7 @@ index ce420b0..e9176d8 100644
                  if (slot.state == .idle) continue;
                  const shared = slot.shared orelse continue;
                  shared.mutex.lock();
-@@ -12603,7 +13053,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12603,7 +13074,7 @@ pub fn Effects(comptime Msg: type) type {
                  }
              }
              const index = best_index orelse return null;
@@ -848,7 +1149,7 @@ index ce420b0..e9176d8 100644
              const shared = slot.shared.?;
              const on_event = slot.on_event;
              var event: EffectPtyEvent = .{ .key = slot.key };
-@@ -12641,7 +13091,6 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12641,7 +13112,6 @@ pub fn Effects(comptime Msg: type) type {
                  staging.head = (staging.head + take) % max_effect_pty_staging_bytes;
                  staging.len -= take;
                  const emptied = staging.len == 0;
@@ -856,7 +1157,7 @@ index ce420b0..e9176d8 100644
                  if (emptied) {
                      shared.data_seq_valid = false;
                  } else if (shared.owner) |owner| {
-@@ -12654,7 +13103,6 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12654,7 +13124,6 @@ pub fn Effects(comptime Msg: type) type {
                      // stamp would let one pass deliver without bound and
                      // starve every other platform event.
                      shared.data_seq = owner.seq.fetchAdd(1, .seq_cst);
@@ -864,7 +1165,7 @@ index ce420b0..e9176d8 100644
                  }
                  if (shared.reader_parked) {
                      shared.reader_parked = false;
-@@ -12662,9 +13110,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12662,9 +13131,12 @@ pub fn Effects(comptime Msg: type) type {
                  }
                  shared.mutex.unlock();
                  if (emptied) _ = self.pty_pending_count.fetchSub(1, .seq_cst);
@@ -879,9 +1180,9 @@ index ce420b0..e9176d8 100644
                  }
                  event.bytes = self.pty_drain_scratch[0..take];
                  self.journalNote(.{
-@@ -13857,22 +14308,23 @@ pub fn Effects(comptime Msg: type) type {
+@@ -13857,22 +14329,23 @@ pub fn Effects(comptime Msg: type) type {
          }
- 
+
          fn findPtySlot(self: *Self, key: u64) ?*PtySlot {
 -            for (&self.pty_slots) |*slot| {
 +            for (self.pty_slots.items) |*slot| {
@@ -889,7 +1190,7 @@ index ce420b0..e9176d8 100644
              }
              return null;
          }
- 
+
 -        fn findIdlePtySlot(self: *Self) ?usize {
 -            for (&self.pty_slots, 0..) |*slot, index| {
 +        fn claimIdlePtySlot(self: *Self) ?usize {
@@ -900,7 +1201,7 @@ index ce420b0..e9176d8 100644
 +            self.pty_slots.append(self.allocator, .{}) catch return null;
 +            return self.pty_slots.items.len - 1;
          }
- 
+
          fn idlePtySlotCount(self: *Self) usize {
              var count: usize = 0;
 -            for (&self.pty_slots) |*slot| {
@@ -908,7 +1209,7 @@ index ce420b0..e9176d8 100644
                  if (slot.state == .idle) count += 1;
              }
              return count;
-@@ -13937,6 +14389,10 @@ pub fn Effects(comptime Msg: type) type {
+@@ -13937,6 +14410,10 @@ pub fn Effects(comptime Msg: type) type {
          /// wait on child I/O). The `PtyShared` header stays allocated
          /// forever, the channel headers' bounded-leak invariant.
          fn retirePtySlot(self: *Self, slot: *PtySlot) void {
@@ -919,7 +1220,7 @@ index ce420b0..e9176d8 100644
              if (slot.shared) |shared| {
                  shared.mutex.lock();
                  shared.open = false;
-@@ -14012,6 +14468,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -14012,6 +14489,7 @@ pub fn Effects(comptime Msg: type) type {
              slot.kill_requested = false;
              slot.write_capture_len = 0;
              slot.dropped_writes = 0;
@@ -927,7 +1228,7 @@ index ce420b0..e9176d8 100644
              slot.park_seq = 0;
              slot.park_state = .none;
          }
-@@ -14036,6 +14493,10 @@ pub fn Effects(comptime Msg: type) type {
+@@ -14036,6 +14514,10 @@ pub fn Effects(comptime Msg: type) type {
          /// NFS/autofs PATH entry stalls the loop like any synchronous
          /// filesystem touch of that mount would.
          fn startRealPty(self: *Self, slot: *PtySlot, options: PtySpawnOptions) void {
@@ -938,7 +1239,7 @@ index ce420b0..e9176d8 100644
              if (comptime !pty_transport.supported) {
                  // ptySpawn already refused unsupported builds.
                  unreachable;
-@@ -14057,17 +14518,25 @@ pub fn Effects(comptime Msg: type) type {
+@@ -14057,17 +14539,25 @@ pub fn Effects(comptime Msg: type) type {
                  return self.failPtyStart(slot, options);
              };
              outbound.* = .{};
@@ -970,7 +1271,7 @@ index ce420b0..e9176d8 100644
                  self.channel_storage_allocator.destroy(outbound);
                  self.channel_storage_allocator.destroy(staging);
                  pty_transport.closeFd(pipe[0]);
-@@ -14152,6 +14621,45 @@ pub fn Effects(comptime Msg: type) type {
+@@ -14152,6 +14642,45 @@ pub fn Effects(comptime Msg: type) type {
                  }
                  if (self.hasPending()) self.wakeHost();
              }
@@ -1016,7 +1317,7 @@ index ce420b0..e9176d8 100644
              const thread = std.Thread.spawn(.{}, ptyIoLoop, .{ shared, transport, pipe[0], generation }) catch {
                  shared.mutex.lock();
                  shared.open = false;
-@@ -14181,6 +14689,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -14181,6 +14710,7 @@ pub fn Effects(comptime Msg: type) type {
          /// Release a claimed pty slot and stage the executor-truth
          /// start-failure terminal.
          fn failPtyStart(self: *Self, slot: *PtySlot, options: PtySpawnOptions) void {
@@ -1025,13 +1326,40 @@ index ce420b0..e9176d8 100644
              slot.on_event = null;
              self.stagePendingPty(.{
 diff --git a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
-index a92c59f..f8571a6 100644
+index a92c59f..5d011e4 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
-@@ -70,13 +70,21 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
+@@ -46,6 +46,26 @@ const DirectMsg = union(enum) {
+
+ const DirectFx = effects_mod.Effects(DirectMsg);
+
++const PtyTapRecorder = struct {
++    spawned: usize = 0,
++    forgotten: usize = 0,
++    last_key: u64 = 0,
++
++    fn notify(_: *anyopaque, _: *const effects_mod.EffectPtyEvent) void {}
++
++    fn spawn(context: *anyopaque, key: u64) void {
++        const recorder: *PtyTapRecorder = @ptrCast(@alignCast(context));
++        recorder.spawned += 1;
++        recorder.last_key = key;
++    }
++
++    fn forget(context: *anyopaque, key: u64) void {
++        const recorder: *PtyTapRecorder = @ptrCast(@alignCast(context));
++        recorder.forgotten += 1;
++        recorder.last_key = key;
++    }
++};
++
+ fn expectOutput(fx: *DirectFx, key: u64, bytes: []const u8) !void {
+     const msg = fx.takeMsg() orelse return error.TestExpectedMsg;
+     try testing.expectEqual(key, msg.pty.key);
+@@ -70,13 +90,21 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
      defer fx.deinit();
      fx.executor = .fake;
- 
+
 +    var overlay_name: [15]u8 = "PTY_TEST_MARKER".*;
 +    var overlay_value: [7]u8 = "overlay".*;
 +
@@ -1050,7 +1378,7 @@ index a92c59f..f8571a6 100644
      try testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
      const request = fx.pendingPtyAt(0) orelse return error.TestExpectedRequest;
      try testing.expectEqual(@as(u64, 9), request.key);
-@@ -86,6 +94,11 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
+@@ -86,6 +114,11 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
      try testing.expectEqual(@as(u16, 120), request.cols);
      try testing.expectEqual(@as(u16, 40), request.rows);
      try testing.expectEqualStrings(pty_transport.default_term, request.term);
@@ -1059,13 +1387,45 @@ index a92c59f..f8571a6 100644
 +    try testing.expectEqual(@as(usize, 1), request.env.len);
 +    try testing.expectEqualStrings("PTY_TEST_MARKER", request.env[0].name);
 +    try testing.expectEqualStrings("overlay", request.env[0].value);
- 
+
      try fx.feedPtyOutput(9, "$ ");
      try fx.feedPtyOutput(9, "hello\r\n");
-@@ -131,20 +144,39 @@ test "pty admission: every refused spawn delivers exactly one rejected exit" {
+@@ -102,6 +135,31 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
+     try testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
+ }
+
++test "pty presentation lifecycle observes accepted spawn and explicit forget" {
++    var fx = DirectFx.init(testing.allocator);
++    defer fx.deinit();
++    fx.executor = .fake;
++    var recorder: PtyTapRecorder = .{};
++    fx.pty_tap = .{
++        .context = @ptrCast(&recorder),
++        .notify = PtyTapRecorder.notify,
++        .spawn = PtyTapRecorder.spawn,
++        .forget = PtyTapRecorder.forget,
++    };
++
++    fx.ptySpawn(.{ .key = 61, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
++    try testing.expectEqual(@as(usize, 1), recorder.spawned);
++    try testing.expectEqual(@as(u64, 61), recorder.last_key);
++
++    // A rejected duplicate never claims a fresh terminal lifetime.
++    fx.ptySpawn(.{ .key = 61, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
++    try testing.expectEqual(@as(usize, 1), recorder.spawned);
++
++    fx.ptyForget(61);
++    try testing.expectEqual(@as(usize, 1), recorder.forgotten);
++    try testing.expectEqual(@as(u64, 61), recorder.last_key);
++}
++
+ test "pty admission: every refused spawn delivers exactly one rejected exit" {
+     var fx = DirectFx.init(testing.allocator);
+     defer fx.deinit();
+@@ -131,20 +189,39 @@ test "pty admission: every refused spawn delivers exactly one rejected exit" {
      fx.ptySpawn(.{ .key = 5, .argv = &.{"sh"}, .term = long_term, .on_event = DirectFx.ptyMsg(.pty) });
      _ = try expectExit(&fx, 5, .rejected);
- 
+
 +    // Environment names are map keys, not shell fragments: reject empty
 +    // names, '=' and NUL in names/values, and TERM (owned by `.term`).
 +    fx.ptySpawn(.{ .key = 100, .argv = &.{"sh"}, .env = &.{.{ .name = "", .value = "x" }}, .on_event = DirectFx.ptyMsg(.pty) });
@@ -1091,7 +1451,7 @@ index a92c59f..f8571a6 100644
      fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
      fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
      _ = try expectExit(&fx, 6, .rejected);
- 
+
 -    // Table exhaustion: the table already holds key 6; filling the
 -    // remaining slots leaves the next spawn refused.
 +    // Dynamic growth: the table already holds key 6 and accepts a burst
@@ -1106,12 +1466,28 @@ index a92c59f..f8571a6 100644
 -    try testing.expectEqual(@as(usize, effects_mod.max_effect_ptys), fx.pendingPtyCount());
 +    try testing.expectEqual(@as(usize, 65), fx.pendingPtyCount());
  }
- 
+
  test "fake pty write capture, resize mirror, and kill mirror" {
-@@ -676,6 +708,40 @@ test "live pty end to end: output, coalescing, and the exit code" {
+@@ -542,13 +619,13 @@ test "a fed output batch over the chunk bound is refused, never truncated" {
+     try testing.expectError(error.PtyChunkTooLarge, fx.feedPtyOutput(72, &over));
+ }
+
+-test "a fed output batch past the inline entry bound rides a heap payload intact" {
++test "a fed output batch at the chunk bound arrives intact" {
+     var fx = DirectFx.init(testing.allocator);
+     defer fx.deinit();
+     fx.executor = .fake;
+
+     fx.ptySpawn(.{ .key = 21, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
+-    var big: [effects_mod.max_effect_line_bytes + 128]u8 = undefined;
++    var big: [effects_mod.max_effect_pty_chunk_bytes]u8 = undefined;
+     for (&big, 0..) |*byte, index| byte.* = @intCast('a' + (index % 26));
+     try fx.feedPtyOutput(21, &big);
+     const msg = fx.takeMsg() orelse return error.TestExpectedMsg;
+@@ -676,6 +753,40 @@ test "live pty end to end: output, coalescing, and the exit code" {
      try testing.expectEqual(effects_mod.EffectExitReason.exited, result.exit.reason);
  }
- 
+
 +test "live pty env overlay replaces host values and is not argv" {
 +    if (comptime !live_posix) return;
 +    const host_marker = try testing.allocator.dupeZ(u8, "CANOPY_PTY_OVERLAY=host");
@@ -1172,7 +1548,7 @@ index 4ed1f37..b4165cc 100644
 @@ -1087,6 +1096,124 @@ pub const Ready = struct {
      nudged: bool = false,
  };
- 
+
 +/// Darwin readiness reactor used by the effects layer to serve every live PTY
 +/// from one blocking thread. kqueue registration and wake calls are safe from
 +/// the loop thread while another thread is inside `kevent`.
@@ -1310,13 +1686,18 @@ index d6a79e9..3a37b6d 100644
  pub const HostCallBinding = runtime_effects.HostCallBinding;
  pub const HostCallCompletion = runtime_effects.HostCallCompletion;
 diff --git a/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig b/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
-index 808265e..def1743 100644
+index 808265e..0df466e 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
-@@ -41,8 +41,16 @@ const term_vt = @import("terminal_vt");
- 
+@@ -37,12 +37,21 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const canvas = @import("canvas");
+ const effects = @import("effects.zig");
++const runtime_clock = @import("clock.zig");
+ const term_vt = @import("terminal_vt");
+
  pub const enabled = term_vt.enabled;
- 
+
 -/// One session per pty slot: the effects engine's own table bound.
 -pub const max_sessions: usize = effects.max_effect_ptys;
 +const DeviceAttributesCallback = if (enabled)
@@ -1329,10 +1710,25 @@ index 808265e..def1743 100644
 +/// Emulators are allocated on demand; rendering capacity is independent from
 +/// the number of live PTY transports.
 +pub const max_sessions: ?usize = null;
- 
+
  /// The journaled pty verbs the store drives, type-erased so this module
  /// never names the Msg-generic engine: the app loop wraps its engine.
-@@ -167,7 +175,8 @@ const EnabledStore = struct {
+@@ -101,6 +110,14 @@ const DisabledStore = struct {
+         _ = self;
+         _ = event;
+     }
++    pub fn notePtySpawn(self: *DisabledStore, pty: u64) void {
++        _ = self;
++        _ = pty;
++    }
++    pub fn forget(self: *DisabledStore, pty: u64) void {
++        _ = self;
++        _ = pty;
++    }
+     pub fn hasSession(self: *const DisabledStore, pty: u64) bool {
+         _ = self;
+         _ = pty;
+@@ -167,7 +184,8 @@ const EnabledStore = struct {
      /// for a stable address; built on first session create so apps with
      /// no `<terminal>` pay nothing.
      threaded: ?*std.Io.Threaded = null,
@@ -1342,9 +1738,9 @@ index 808265e..def1743 100644
      gateway: ?PtyGateway = null,
      /// The tokens the CURRENT build resolves snapshots with, stamped by
      /// `beginBuild` (the palette's theme mapping needs them). Valid for
-@@ -184,10 +193,14 @@ const EnabledStore = struct {
+@@ -184,10 +202,14 @@ const EnabledStore = struct {
      }
- 
+
      pub fn deinit(self: *EnabledStore) void {
 -        for (&self.entries) |*entry| {
 +        for (self.entries.items) |*entry| {
@@ -1358,18 +1754,19 @@ index 808265e..def1743 100644
          if (self.threaded) |threaded| {
              threaded.deinit();
              self.allocator.destroy(threaded);
-@@ -201,6 +214,7 @@ const EnabledStore = struct {
- 
+@@ -201,6 +223,7 @@ const EnabledStore = struct {
+
      pub fn beginBuild(self: *EnabledStore, tokens: canvas.DesignTokens) void {
          self.tokens = tokens;
 +        self.visible_keys.clearRetainingCapacity();
      }
- 
+
      /// The builder seam (`Ui.terminal_lookup`): finalize resolves each
-@@ -214,6 +228,14 @@ const EnabledStore = struct {
+@@ -214,7 +237,15 @@ const EnabledStore = struct {
      fn resolveOpaque(context: *anyopaque, pty: u64) ?*const canvas.TerminalGrid {
          const self: *EnabledStore = @ptrCast(@alignCast(context));
          const session = self.ensureSession(pty) orelse return null;
+-        if (session.snapshot_dirty) {
 +        var visible = false;
 +        for (self.visible_keys.items) |key| {
 +            if (key == pty) {
@@ -1378,11 +1775,12 @@ index 808265e..def1743 100644
 +            }
 +        }
 +        if (!visible) self.visible_keys.append(self.allocator, pty) catch {};
-         if (session.snapshot_dirty) {
++        if (session.snapshot_dirty and session.canPublishSnapshot()) {
              session.rebuildSnapshot(self.tokens) catch return &session.grid;
          }
-@@ -231,7 +253,7 @@ const EnabledStore = struct {
- 
+         return &session.grid;
+@@ -231,7 +262,7 @@ const EnabledStore = struct {
+
      fn find(self: *EnabledStore, pty: u64) ?*Session {
          if (pty == 0) return null;
 -        for (&self.entries) |*entry| {
@@ -1390,7 +1788,7 @@ index 808265e..def1743 100644
              if (entry.key == pty) return entry.session;
          }
          return null;
-@@ -240,19 +262,17 @@ const EnabledStore = struct {
+@@ -240,24 +271,43 @@ const EnabledStore = struct {
      fn ensureSession(self: *EnabledStore, pty: u64) ?*Session {
          if (pty == 0) return null;
          if (self.find(pty)) |session| return session;
@@ -1402,14 +1800,15 @@ index 808265e..def1743 100644
 -            return session;
 -        }
 -        return null;
-+        self.entries.append(self.allocator, .{}) catch return null;
-+        const entry = &self.entries.items[self.entries.items.len - 1];
 +        const session_io = self.io() orelse return null;
 +        const session = Session.create(self.allocator, session_io, 80, 24) catch return null;
-+        entry.* = .{ .key = pty, .session = session };
++        self.entries.append(self.allocator, .{ .key = pty, .session = session }) catch {
++            session.destroy();
++            return null;
++        };
 +        return session;
      }
- 
+
      pub fn hasSession(self: *const EnabledStore, pty: u64) bool {
          if (pty == 0) return false;
 -        for (&self.entries) |*entry| {
@@ -1417,7 +1816,32 @@ index 808265e..def1743 100644
              if (entry.key == pty and entry.session != null) return true;
          }
          return false;
-@@ -449,9 +469,17 @@ const EnabledStore = struct {
+     }
+
++    /// Reset an emulator at the accepted-spawn boundary rather than waiting
++    /// for the child's first output. Keys may be recycled after exit delivery;
++    /// the new tab must start blank even when the child is initially silent.
++    pub fn notePtySpawn(self: *EnabledStore, pty: u64) void {
++        self.forget(pty);
++    }
++
++    /// Release an emulator and all of its retained scrollback/render buffers.
++    /// Effects owns the transport separately and calls this only after the app
++    /// has observed its terminal exit and removes the bound terminal widget.
++    pub fn forget(self: *EnabledStore, pty: u64) void {
++        if (pty == 0) return;
++        for (self.entries.items, 0..) |entry, index| {
++            if (entry.key != pty) continue;
++            if (entry.session) |session| session.destroy();
++            _ = self.entries.orderedRemove(index);
++            return;
++        }
++    }
++
+     /// The effects engine's pty tap: every delivered pty event — live
+     /// drain and replay feed alike — passes through here at the same
+     /// instant the app's Msg is built, so the emulator's inputs are
+@@ -449,9 +499,18 @@ const EnabledStore = struct {
      /// caller's re-emit trigger.
      pub fn refreshDirty(self: *EnabledStore) bool {
          var any = false;
@@ -1433,10 +1857,11 @@ index 808265e..def1743 100644
 +                }
 +            }
 +            if (!visible) continue;
++            if (!session.canPublishSnapshot()) continue;
              any = true;
              session.rebuildSnapshot(self.tokens) catch {};
          }
-@@ -465,7 +493,7 @@ const EnabledStore = struct {
+@@ -465,7 +524,7 @@ const EnabledStore = struct {
      /// whether any bytes moved.
      pub fn flushPending(self: *EnabledStore) bool {
          var moved = false;
@@ -1445,7 +1870,16 @@ index 808265e..def1743 100644
              const session = entry.session orelse continue;
              if (session.ended) continue;
              if (session.outbound_len == 0 and session.response_len == 0) continue;
-@@ -602,7 +630,7 @@ const Session = if (enabled) struct {
+@@ -537,6 +596,8 @@ const Session = if (enabled) struct {
+     /// Session lifecycle: exactly one exit ends every spawn; output on
+     /// an ended session is a new spawn reusing the key.
+     ended: bool = false,
++    clock: runtime_clock.Clock = .system,
++    synchronized_since_ms: ?u64 = null,
+
+     /// View state for the source-wins scrollback echo and the
+     /// `on-terminal` change compare.
+@@ -602,7 +663,7 @@ const Session = if (enabled) struct {
              .bell = null,
              .clipboard_write = null,
              .color_scheme = null,
@@ -1454,10 +1888,30 @@ index 808265e..def1743 100644
              .enquiry = null,
              .size = null,
              .title_changed = null,
-@@ -703,6 +731,13 @@ const Session = if (enabled) struct {
+@@ -656,6 +717,7 @@ const Session = if (enabled) struct {
+         session.wheel_accum = 0;
+         session.macos_natural_keys_held = 0;
+         session.ended = false;
++        session.synchronized_since_ms = null;
+         session.grid.running = true;
+         session.snapshot_dirty = true;
+     }
+@@ -676,6 +738,11 @@ const Session = if (enabled) struct {
+             offset = end;
+         }
+         if (bytes.len == 0) session.moveResponsesToOutbound(gateway, key);
++        if (session.term.modes.get(.synchronized_output)) {
++            if (session.synchronized_since_ms == null) session.synchronized_since_ms = session.clock.monotonicMs();
++        } else {
++            session.synchronized_since_ms = null;
++        }
+         // The child produced output, so it is reading: push pending
+         // outbound the freed FIFO will now take.
+         session.flushOutbound(gateway, key);
+@@ -703,6 +770,13 @@ const Session = if (enabled) struct {
          session.response_len += bytes.len;
      }
- 
+
 +    /// Advertise the libghostty-vt defaults (VT220 + ANSI color). Leaving
 +    /// this callback null makes DA1 queries disappear even though write_pty
 +    /// is wired, which stalls shells such as fish during startup.
@@ -1468,8 +1922,27 @@ index 808265e..def1743 100644
      fn clearResponses(session: *Session) void {
          session.response_len = 0;
      }
-@@ -1240,9 +1275,8 @@ const Session = if (enabled) struct {
- 
+@@ -1238,14 +1312,31 @@ const Session = if (enabled) struct {
+
+     // --------------------------------------------------------- snapshot
+
++    /// DEC synchronized output brackets one logical TUI frame. Keep the last
++    /// published snapshot until the closing marker, with Ghostty's one-second
++    /// safety timeout for a producer that never closes its transaction.
++    fn canPublishSnapshot(session: *Session) bool {
++        if (session.ended or !session.term.modes.get(.synchronized_output)) {
++            session.synchronized_since_ms = null;
++            return true;
++        }
++        const now = session.clock.monotonicMs();
++        const started = session.synchronized_since_ms orelse now;
++        session.synchronized_since_ms = started;
++        if (now -| started < 1000) return false;
++        session.term.modes.set(.synchronized_output, false);
++        session.synchronized_since_ms = null;
++        return true;
++    }
++
      /// Rebuild the published `canvas.TerminalGrid` from the emulator's
      /// render state, colors RESOLVED per the painter's contract: the
 -    /// theme-derived ANSI-16 story (untouched palette entries derive
@@ -1480,19 +1953,23 @@ index 808265e..def1743 100644
      /// invisible folded in, and a spacer cell's background pre-resolved
      /// to extend its wide primary's.
      fn rebuildSnapshot(session: *Session, tokens: canvas.DesignTokens) !void {
-@@ -1260,7 +1294,7 @@ const Session = if (enabled) struct {
- 
++        if (!session.canPublishSnapshot()) return;
+         const gpa = session.gpa;
+         // Push the theme colors into the emulator's DEFAULTS (never the
+         // OSC overrides) so ghostty itself composes the final
+@@ -1260,7 +1351,7 @@ const Session = if (enabled) struct {
+
          try session.render.update(gpa, &session.term);
          const rs = &session.render;
 -        const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
 +        const palette = Palette.init(&rs.colors, &session.term.colors.palette);
- 
+
          const row_count = @min(rs.row_data.len, canvas.max_terminal_rows);
          var col_count: usize = 0;
-@@ -1464,58 +1498,24 @@ fn rgbToColor(rgb: anytype) canvas.Color {
+@@ -1464,58 +1555,24 @@ fn rgbToColor(rgb: anytype) canvas.Color {
      return canvas.Color.rgb8(rgb.r, rgb.g, rgb.b);
  }
- 
+
 -/// The theme mapping, stated plainly: where the emulator's palette entry
 -/// still holds its DEFAULT value, the ANSI-16 slot derives from the
 -/// active theme tokens so a themed app and its terminal read as one
@@ -1512,7 +1989,7 @@ index 808265e..def1743 100644
 -    /// explicit OSC 4 set is honored even when it equals the default
 -    /// RGB — the mask, not RGB equality, decides "untouched".
      dynamic: *const vt.color.DynamicPalette,
- 
+
 -    fn init(tokens: canvas.DesignTokens, terminal_colors: *const vt.RenderState.Colors, dynamic: *const vt.color.DynamicPalette) Palette {
 -        const colors = tokens.colors;
 -        const dark = colors.background.r + colors.background.g + colors.background.b < 1.5;
@@ -1545,7 +2022,7 @@ index 808265e..def1743 100644
 -            },
          };
      }
- 
+
      fn indexed(palette: *const Palette, index: u8) canvas.Color {
 -        if (index < 16 and !palette.dynamic.mask.isSet(index)) {
 -            return palette.ansi[index];
@@ -1553,10 +2030,11 @@ index 808265e..def1743 100644
          const live = palette.dynamic.current[index];
          return canvas.Color.rgb8(live.r, live.g, live.b);
      }
-@@ -1558,12 +1558,4 @@ const Palette = if (enabled) struct {
+@@ -1557,13 +1614,4 @@ const Palette = if (enabled) struct {
+             1,
          );
      }
- 
+-
 -    fn scale(color: canvas.Color, factor: f32) canvas.Color {
 -        return canvas.Color.rgba(
 -            @min(1, color.r * factor),
@@ -1567,10 +2045,10 @@ index 808265e..def1743 100644
 -    }
  } else struct {};
 diff --git a/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig b/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig
-index 951dbaa..98bf911 100644
+index 951dbaa..2cb876c 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig
-@@ -87,12 +87,21 @@ test "binding a pty key publishes a live grid that carries fed output as real ce
+@@ -87,12 +87,90 @@ test "binding a pty key publishes a live grid that carries fed output as real ce
      try testing.expect(refreshed.rows.len > 0);
      try testing.expectEqual(@as(u21, 'h'), refreshed.rows[0].cells[0].cp);
      try testing.expectEqualStrings("h", refreshed.rows[0].cells[0].cluster);
@@ -1593,10 +2071,105 @@ index 951dbaa..98bf911 100644
 +    try testing.expectApproxEqAbs(@as(f32, 1) / 255.0, rgb_cell.fg.r, 0.001);
 +    try testing.expectApproxEqAbs(@as(f32, 2) / 255.0, rgb_cell.fg.g, 0.001);
 +    try testing.expectApproxEqAbs(@as(f32, 3) / 255.0, rgb_cell.fg.b, 0.001);
++}
++
++test "failed session creation never retains an empty store entry" {
++    if (comptime !terminal_session.enabled) return error.SkipZigTest;
++    for (0..24) |fail_index| {
++        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
++        var store = TerminalSessions.init(failing.allocator());
++        store.beginBuild(.{});
++        _ = resolveGrid(&store, 77);
++        for (store.entries.items) |entry| try testing.expect(entry.session != null);
++        store.deinit();
++    }
++}
++
++test "alternate screen switches across PTY chunks and restores the primary screen" {
++    if (comptime !terminal_session.enabled) return error.SkipZigTest;
++    var store = TerminalSessions.init(testing.allocator);
++    defer store.deinit();
++    store.beginBuild(.{});
++    _ = store.reconcile(91, 0, 20, 6);
++    feedOutput(&store, 91, "PRIMARY-MARKER");
++    _ = resolveGrid(&store, 91) orelse return error.TestExpectedGrid;
++
++    // PTY read boundaries may split a control sequence at any byte.
++    feedOutput(&store, 91, "\x1b[?10");
++    feedOutput(&store, 91, "49h\x1b[2J\x1b[HALTERNATE-MARKER");
++    const alternate = resolveGrid(&store, 91) orelse return error.TestExpectedGrid;
++    try testing.expect(std.mem.indexOf(u8, gridText(alternate), "ALTERNATE-MARKER") != null);
++    try testing.expect(std.mem.indexOf(u8, gridText(alternate), "PRIMARY-MARKER") == null);
++    try testing.expectEqual(@as(u21, 'A'), alternate.rows[0].cells[0].cp);
++
++    feedOutput(&store, 91, "\x1b[?1049l");
++    const primary = resolveGrid(&store, 91) orelse return error.TestExpectedGrid;
++    try testing.expect(std.mem.indexOf(u8, gridText(primary), "PRIMARY-MARKER") != null);
++    try testing.expect(std.mem.indexOf(u8, gridText(primary), "ALTERNATE-MARKER") == null);
++    try testing.expectEqual(@as(u21, 'P'), primary.rows[0].cells[0].cp);
++}
++
++test "synchronized TUI output publishes only the completed frame" {
++    if (comptime !terminal_session.enabled) return error.SkipZigTest;
++    var store = TerminalSessions.init(testing.allocator);
++    defer store.deinit();
++    store.beginBuild(.{});
++    _ = store.reconcile(92, 0, 20, 6);
++    feedOutput(&store, 92, "COMPLETE-FRAME");
++    _ = resolveGrid(&store, 92) orelse return error.TestExpectedGrid;
++    feedOutput(&store, 92, "\x1b[?2026h\x1b[2J\x1b[HPARTIAL");
++    const held = resolveGrid(&store, 92) orelse return error.TestExpectedGrid;
++    try testing.expect(std.mem.indexOf(u8, gridText(held), "COMPLETE-FRAME") != null);
++    feedOutput(&store, 92, "-FRAME\x1b[?2026l");
++    const complete = resolveGrid(&store, 92) orelse return error.TestExpectedGrid;
++    try testing.expect(std.mem.indexOf(u8, gridText(complete), "PARTIAL-FRAME") != null);
++    try testing.expect(std.mem.indexOf(u8, gridText(complete), "COMPLETE-FRAME") == null);
++}
++
++test "an unfinished synchronized frame is published after the safety timeout" {
++    if (comptime !terminal_session.enabled) return error.SkipZigTest;
++    var store = TerminalSessions.init(testing.allocator);
++    defer store.deinit();
++    store.beginBuild(.{});
++    _ = resolveGrid(&store, 93) orelse return error.TestExpectedGrid;
++    var clock: @import("clock.zig").TestClock = .{};
++    store.entries.items[0].session.?.clock = clock.clock();
++    feedOutput(&store, 93, "\x1b[?2026hTIMEOUT-FRAME");
++    try testing.expect(!store.refreshDirty());
++    clock.advanceMs(1000);
++    try testing.expect(store.refreshDirty());
++    const grid = resolveGrid(&store, 93) orelse return error.TestExpectedGrid;
++    try testing.expect(std.mem.indexOf(u8, gridText(grid), "TIMEOUT-FRAME") != null);
  }
- 
+
  test "pointer gestures select terminal cells words and lines for clipboard copy" {
-@@ -428,6 +437,12 @@ test "emulator query answers write back to the pty through the ring" {
+@@ -386,7 +464,7 @@ test "typing while scrolled back snaps the viewport to the live screen" {
+     try testing.expectEqual(@as(u32, 0), (store.currentState(5) orelse return error.TestExpectedState).scrollback);
+ }
+
+-test "an exit parks the session and output on the reused key resets to a clean terminal" {
++test "an accepted respawn clears a reused key before the first output" {
+     if (comptime !terminal_session.enabled) return error.SkipZigTest;
+     var store = TerminalSessions.init(testing.allocator);
+     defer store.deinit();
+@@ -404,8 +482,14 @@ test "an exit parks the session and output on the reused key resets to a clean t
+     try testing.expect(!store.textInput(2, "late"));
+     try testing.expect(!store.keyEvent(2, .{ .phase = .key_down, .key = "enter" }));
+
+-    // A new spawn reused the key: its first output resets the emulator
+-    // before feeding, so the old screen and modes never leak in.
++    // A new spawn reused the key: accepting it resets the emulator before the
++    // child emits anything, so the new tab cannot flash the old scrollback.
++    store.notePtySpawn(2);
++    try testing.expect(!store.hasSession(2));
++    const blank = resolveGrid(&store, 2) orelse return error.TestExpectedGrid;
++    try testing.expect(blank.running);
++    try testing.expect(std.mem.indexOf(u8, gridText(blank), "old session") == null);
++
+     feedOutput(&store, 2, "fresh prompt $ ");
+     const fresh = resolveGrid(&store, 2) orelse return error.TestExpectedGrid;
+     try testing.expect(fresh.running);
+@@ -428,6 +512,12 @@ test "emulator query answers write back to the pty through the ring" {
      feedOutput(&store, 4, "\x1b[6n");
      try testing.expect(std.mem.indexOf(u8, gw.written.items, "\x1b[") != null);
      try testing.expect(std.mem.indexOf(u8, gw.written.items, "R") != null);
@@ -1607,7 +2180,7 @@ index 951dbaa..98bf911 100644
 +    feedOutput(&store, 4, "\x1b[c");
 +    try testing.expectEqualStrings("\x1b[?62;22c", gw.written.items);
  }
- 
+
  test "the wide-cell spacer extends its primary's background in the published snapshot" {
 diff --git a/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig b/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
 index becd14f..063c209 100644
@@ -1641,7 +2214,7 @@ index becd14f..063c209 100644
              entry.key_len = key.len;
              @memcpy(entry.key[0..key.len], key);
 @@ -2700,17 +2700,18 @@ pub fn TsCoreHost(comptime core: type) type {
- 
+
          fn findPty(key: []const u8) ?usize {
              if (key.len == 0) return null;
 -            for (&ptys, 0..) |*entry, index| {
@@ -1650,7 +2223,7 @@ index becd14f..063c209 100644
              }
              return null;
          }
- 
+
          fn freePtyIndex() ?usize {
 -            for (&ptys, 0..) |*entry, index| {
 +            for (ptys.items, 0..) |*entry, index| {
@@ -1660,7 +2233,7 @@ index becd14f..063c209 100644
 +            ptys.append(std.heap.page_allocator, .{}) catch return null;
 +            return ptys.items.len - 1;
          }
- 
+
          /// `PtyMsgFn` for pty sessions: every event routes the entry's
 @@ -2722,10 +2723,10 @@ pub fn TsCoreHost(comptime core: type) type {
                  @panic("ts core host: a pty event arrived outside the bridge's pty key namespace");
@@ -1676,7 +2249,7 @@ index becd14f..063c209 100644
              if (event.kind == .exit) entry.used = false;
              // Live delivery is same-frame, so the key rides the frame arena.
 diff --git a/node_modules/@native-sdk/cli/src/runtime/ui_app.zig b/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
-index 02589cb..3913738 100644
+index 02589cb..3534ef6 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
 @@ -1321,8 +1321,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
@@ -1697,7 +2270,38 @@ index 02589cb..3913738 100644
              self.arenas[0].deinit();
              self.arenas[1].deinit();
              self.markup_arenas[0].deinit();
-@@ -1779,6 +1779,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1554,7 +1554,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             // emulator query answers) and grid sizes back through the
+             // JOURNALED pty verbs. Idempotent, like every bind here.
+             if (comptime terminal_session.enabled) {
+-                self.effects.pty_tap = .{ .context = @ptrCast(self), .notify = terminalPtyTap };
++                self.effects.pty_tap = .{
++                    .context = @ptrCast(self),
++                    .notify = terminalPtyTap,
++                    .spawn = terminalPtySpawn,
++                    .forget = terminalPtyForget,
++                };
+                 self.terminal_sessions.setGateway(.{
+                     .context = @ptrCast(self),
+                     .write = terminalGatewayWrite,
+@@ -1568,6 +1573,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             self.terminal_sessions.notePtyEvent(event);
+         }
+
++        fn terminalPtySpawn(context: *anyopaque, key: u64) void {
++            const self: *Self = @ptrCast(@alignCast(context));
++            self.terminal_sessions.notePtySpawn(key);
++        }
++
++        fn terminalPtyForget(context: *anyopaque, key: u64) void {
++            const self: *Self = @ptrCast(@alignCast(context));
++            self.terminal_sessions.forget(key);
++        }
++
+         fn terminalGatewayWrite(context: *anyopaque, key: u64, bytes: []const u8) bool {
+             const self: *Self = @ptrCast(@alignCast(context));
+             return self.effects.ptyWrite(key, bytes);
+@@ -1779,6 +1794,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                      if (rebuild_error == null) rebuild_error = err;
                  };
              }
@@ -1709,7 +2313,7 @@ index 02589cb..3913738 100644
              if (rebuild_error) |err| return err;
              // A Msg dispatched FROM a secondary window still rebuilt the
              // main canvas above (one model, every window's view derives
-@@ -1822,7 +1827,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1822,7 +1842,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              // an earlier dispatch, so replay's file-order feed always
              // finds the parked request (see Effects.DrainBoundary).
              var boundary = self.effects.drainBoundary();
@@ -1724,7 +2328,7 @@ index 02589cb..3913738 100644
                  self.applyMsg(msg);
                  dispatched = true;
              }
-@@ -2231,13 +2242,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -2231,13 +2257,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                      proposed.y,
                  ) orelse continue;
                  applied = true;
@@ -1742,7 +2346,7 @@ index 02589cb..3913738 100644
              }
              // An applied change moved the published snapshot AFTER this
              // rebuild handed its layout over: refresh the retained
-@@ -2270,13 +2278,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -2270,13 +2293,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
          fn drainTerminalStates(self: *Self, runtime: *Runtime, window_id: platform.WindowId) anyerror!void {
              if (comptime !terminal_session.enabled) return;
              if (self.terminal_state_draining) return;
@@ -1758,3 +2362,13 @@ index 02589cb..3913738 100644
                  const tree = self.tree orelse continue;
                  if (tree.msgForTerminal(pending.id, pending.state)) |msg| {
                      try self.dispatch(runtime, window_id, msg);
+@@ -4638,6 +4658,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             // identically. A no-op when nothing is pending.
+             if (comptime terminal_session.enabled) {
+                 _ = self.terminal_sessions.flushPending();
++                // Also service the synchronized-output timeout when a child
++                // stops producing bytes before its closing frame marker.
++                try self.repaintTerminals(runtime, frame_event.window_id);
+             }
+             try self.presentFrame(
+                 runtime,

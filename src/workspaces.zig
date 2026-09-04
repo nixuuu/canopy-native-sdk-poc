@@ -76,6 +76,20 @@ pub const SidebarRow = struct {
     is_git: bool = false,
 };
 
+const ParsedWorktree = struct {
+    path: PathText = .{},
+    name: NameText = .{},
+    branch: BranchText = .{},
+    is_main: bool = false,
+};
+
+fn parseWorktree(path: []const u8, branch: []const u8, is_main: bool) ?ParsedWorktree {
+    if (!std.fs.path.isAbsolute(path)) return null;
+    var parsed = ParsedWorktree{ .is_main = is_main };
+    if (!parsed.path.set(path) or !parsed.name.set(pathBasename(path)) or !parsed.branch.set(branch)) return null;
+    return parsed;
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     projects: std.ArrayListUnmanaged(Project) = .empty,
@@ -207,7 +221,8 @@ pub const Store = struct {
 
     pub fn applyWorktreePorcelain(store: *Store, project_id: u64, bytes: []const u8) bool {
         const project = store.findProject(project_id) orelse return false;
-        for (project.worktrees.items) |*worktree| worktree.active = false;
+        var parsed: std.ArrayListUnmanaged(ParsedWorktree) = .empty;
+        defer parsed.deinit(store.allocator);
 
         var current_path: []const u8 = "";
         var current_branch: []const u8 = "(unknown)";
@@ -218,7 +233,8 @@ pub const Store = struct {
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (std.mem.startsWith(u8, line, "worktree ")) {
                 if (current_path.len > 0) {
-                    store.upsertWorktree(project, current_path, if (detached) "(detached)" else current_branch, ordinal == 0);
+                    const entry = parseWorktree(current_path, if (detached) "(detached)" else current_branch, ordinal == 0) orelse return false;
+                    parsed.append(store.allocator, entry) catch return false;
                     ordinal += 1;
                 }
                 current_path = line["worktree ".len..];
@@ -229,32 +245,51 @@ pub const Store = struct {
             } else if (std.mem.eql(u8, line, "detached")) {
                 detached = true;
             } else if (line.len == 0 and current_path.len > 0) {
-                store.upsertWorktree(project, current_path, if (detached) "(detached)" else current_branch, ordinal == 0);
+                const entry = parseWorktree(current_path, if (detached) "(detached)" else current_branch, ordinal == 0) orelse return false;
+                parsed.append(store.allocator, entry) catch return false;
                 ordinal += 1;
                 current_path = "";
                 current_branch = "(unknown)";
                 detached = false;
             }
         }
-        if (current_path.len > 0) store.upsertWorktree(project, current_path, if (detached) "(detached)" else current_branch, ordinal == 0);
-        return true;
-    }
-
-    fn upsertWorktree(store: *Store, project: *Project, path: []const u8, branch: []const u8, is_main: bool) void {
-        for (project.worktrees.items) |*worktree| {
-            if (!worktree.path.eql(path)) continue;
-            worktree.active = true;
-            worktree.is_main = is_main;
-            _ = worktree.branch.set(branch);
-            _ = worktree.name.set(pathBasename(path));
-            return;
+        if (current_path.len > 0) {
+            const entry = parseWorktree(current_path, if (detached) "(detached)" else current_branch, ordinal == 0) orelse return false;
+            parsed.append(store.allocator, entry) catch return false;
         }
-        var worktree = Worktree{ .id = store.next_workspace_id, .is_main = is_main };
-        store.next_workspace_id +%= 1;
-        if (!worktree.path.set(path)) return;
-        _ = worktree.name.set(pathBasename(path));
-        _ = worktree.branch.set(branch);
-        project.worktrees.append(store.allocator, worktree) catch {};
+
+        var new_count: usize = 0;
+        for (parsed.items) |entry| {
+            var exists = false;
+            for (project.worktrees.items) |worktree| if (worktree.path.eql(entry.path.slice())) {
+                exists = true;
+                break;
+            };
+            if (!exists) new_count += 1;
+        }
+        project.worktrees.ensureUnusedCapacity(store.allocator, new_count) catch return false;
+
+        for (project.worktrees.items) |*worktree| worktree.active = false;
+        for (parsed.items) |entry| {
+            for (project.worktrees.items) |*worktree| {
+                if (!worktree.path.eql(entry.path.slice())) continue;
+                worktree.active = true;
+                worktree.is_main = entry.is_main;
+                worktree.name = entry.name;
+                worktree.branch = entry.branch;
+                break;
+            } else {
+                project.worktrees.appendAssumeCapacity(.{
+                    .id = store.next_workspace_id,
+                    .path = entry.path,
+                    .name = entry.name,
+                    .branch = entry.branch,
+                    .is_main = entry.is_main,
+                });
+                store.next_workspace_id +%= 1;
+            }
+        }
+        return true;
     }
 
     pub fn detach(store: *Store, project_id: u64) bool {
@@ -403,6 +438,31 @@ test "worktree porcelain creates main and linked worktrees" {
     try std.testing.expectEqual(@as(usize, 2), project.worktrees.items.len);
     try std.testing.expect(project.worktrees.items[0].is_main);
     try std.testing.expectEqualStrings("feature/test", project.worktrees.items[1].branch.slice());
+}
+
+test "invalid worktree porcelain leaves the previous snapshot unchanged" {
+    const store = try Store.create(std.testing.allocator);
+    defer store.destroy();
+    const attached = store.attachPlaceholder("/tmp/repo").?;
+    try std.testing.expect(store.markGit(attached.project_id, "/tmp/repo"));
+    try std.testing.expect(store.applyWorktreePorcelain(attached.project_id,
+        \\worktree /tmp/repo
+        \\HEAD 1111111
+        \\branch refs/heads/main
+        \\
+    ));
+    const project = store.findProject(attached.project_id).?;
+    const next_workspace_id = store.next_workspace_id;
+
+    try std.testing.expect(!store.applyWorktreePorcelain(attached.project_id,
+        \\worktree relative/path
+        \\branch refs/heads/broken
+        \\
+    ));
+    try std.testing.expectEqual(@as(usize, 1), project.worktrees.items.len);
+    try std.testing.expect(project.worktrees.items[0].active);
+    try std.testing.expectEqualStrings("main", project.worktrees.items[0].branch.slice());
+    try std.testing.expectEqual(next_workspace_id, store.next_workspace_id);
 }
 
 test "attached project persistence round-trips arbitrary path bytes" {

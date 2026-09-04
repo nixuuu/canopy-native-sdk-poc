@@ -66,14 +66,25 @@ The implementation mirrors Canopy Desktop's important ownership boundary:
 project -> worktree -> terminal tabs -> native PTY
 ```
 
-`src/main.zig` owns the model and process effects. `src/app.native` is the small
-composition root; focused templates in `src/components/` render the titlebar,
-project sidebar, terminal workspace, empty state, and operation dialogs. Their
-sources are embedded in the binary. ReleaseFast uses `CompiledMarkupImports`
-with no runtime parser or file watcher; Debug builds retain import-aware hot
-reload. Native SDK owns PTY transport and terminal emulation behind each numeric
-key. Tabs from another worktree remain alive but are filtered from the current
-tab strip, so switching worktrees restores that worktree's last active tab.
+`src/main.zig` owns the root model, typed effects, and orchestration. Pure
+boundaries keep data handling out of that reducer: `db_page.zig` decodes bounded
+SQLite pages, `tool_launch.zig` builds validated Claude/Codex argv and
+environment overlays, and `terminal_tabs.zig` owns terminal metadata, PTY-key
+reuse, and bounded tab projection. `src/app.native` is the small composition
+root; focused templates in `src/components/` render the titlebar, project
+sidebar, terminal workspace, empty state, and operation dialogs. One embedded
+component inventory feeds both Debug and ReleaseFast, preventing their import
+sets from drifting. ReleaseFast uses `CompiledMarkupImports` with no runtime
+parser or file watcher; Debug builds retain import-aware hot reload. Native SDK
+owns PTY transport and terminal emulation behind each numeric key. Tabs from
+another worktree remain alive but are filtered from the current tab strip, so
+switching worktrees restores that worktree's last active tab.
+
+`npm test` also runs the real Ghostty session and terminal painter suites via
+`zig build test-terminal`. The upstream SDK-wide tests use an inert VT seam,
+so they are not sufficient to verify alternate screens or full-screen TUI
+rendering. Terminal frames honor synchronized-output markers, and viewport
+height is independent of its width.
 
 Attached directory paths are stored under the platform app-data directory. At
 startup missing paths are discarded, repositories are rediscovered, and plain

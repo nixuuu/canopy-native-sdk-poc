@@ -11,7 +11,9 @@ const native_sdk = @import("native_sdk");
 const preferences_mod = @import("preferences.zig");
 const profile_editor = @import("profile_editor.zig");
 const profiles_mod = @import("profiles.zig");
+const terminal_tabs = @import("terminal_tabs.zig");
 const theme = @import("theme.zig");
+const tool_launch = @import("tool_launch.zig");
 const workspaces = @import("workspaces.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -25,38 +27,14 @@ const window_height: f32 = 760;
 const max_rendered_tab_buttons: usize = 12;
 const fallback_user_shell = "/bin/zsh";
 const terminal_bootstrap = "cd -- \"$1\" && exec \"$2\" -l";
-const posix_tool_bootstrap = "cd -- \"$1\" && shift && exec \"$@\"";
-const fish_tool_bootstrap = "cd -- $argv[1]; and exec $argv[2..-1]";
 
-pub const TerminalPhase = enum { starting, running, closing, exited, failed };
-pub const TerminalTool = enum { shell, claude, codex };
+pub const TerminalPhase = terminal_tabs.Phase;
+pub const TerminalTool = terminal_tabs.Tool;
+pub const TerminalTab = terminal_tabs.Tab;
+pub const TerminalTabRow = terminal_tabs.Row;
+pub const TabStore = terminal_tabs.Store;
 pub const PreferencesSection = enum { general, appearance, worktrees, claude, codex };
 const ProfileDbOperation = enum { none, save, delete };
-
-pub const TerminalTab = struct {
-    id: u64 = 0,
-    workspace_id: u64 = 0,
-    pty: u64 = 0,
-    title: workspaces.NameText = .{},
-    path: workspaces.PathText = .{},
-    branch: workspaces.BranchText = .{},
-    tool: TerminalTool = .shell,
-    profile_id: profiles_mod.IdText = .{},
-    phase: TerminalPhase = .starting,
-    exit_code: i32 = 0,
-};
-
-pub const TerminalTabRow = struct {
-    id: u64,
-    pty: u64,
-    title: []const u8,
-    path: []const u8,
-    branch: []const u8,
-    tool: TerminalTool,
-    phase: TerminalPhase,
-    exit_code: i32,
-    selected: bool,
-};
 
 pub const PathPayload = struct {
     bytes: [workspaces.max_path_bytes]u8 = @splat(0),
@@ -99,36 +77,6 @@ const GitOperation = struct {
     force: bool = false,
     target_path: workspaces.PathText = .{},
     branch: workspaces.BranchText = .{},
-};
-
-pub const TabStore = struct {
-    allocator: std.mem.Allocator,
-    items: std.ArrayListUnmanaged(TerminalTab) = .empty,
-    free_pty_keys: std.ArrayListUnmanaged(u64) = .empty,
-
-    pub fn create(allocator: std.mem.Allocator) !*TabStore {
-        const store = try allocator.create(TabStore);
-        store.* = .{ .allocator = allocator };
-        return store;
-    }
-
-    pub fn destroy(store: *TabStore) void {
-        const allocator = store.allocator;
-        store.items.deinit(allocator);
-        store.free_pty_keys.deinit(allocator);
-        allocator.destroy(store);
-    }
-
-    fn allocatePtyKey(store: *TabStore, next: *u64) u64 {
-        if (store.free_pty_keys.pop()) |key| return key;
-        const key = next.*;
-        next.* +%= 1;
-        return key;
-    }
-
-    fn releasePtyKey(store: *TabStore, key: u64) void {
-        store.free_pty_keys.append(store.allocator, key) catch {};
-    }
 };
 
 pub const Model = struct {
@@ -316,55 +264,15 @@ pub const Model = struct {
     }
 
     pub fn tabs(model: *const Model, arena: std.mem.Allocator) []const TerminalTabRow {
-        const stored = model.tab_store.items.items;
-        var workspace_count: usize = 0;
-        var active_ordinal: usize = 0;
-        const active = model.activeTabId(model.active_workspace_id);
-        for (stored) |tab| {
-            if (tab.workspace_id != model.active_workspace_id) continue;
-            if (tab.id == active) active_ordinal = workspace_count;
-            workspace_count += 1;
-        }
-        const visible_count = @min(workspace_count, max_rendered_tab_buttons);
-        const half = max_rendered_tab_buttons / 2;
-        const preferred_start = active_ordinal -| half;
-        const start = @min(preferred_start, workspace_count -| visible_count);
-        const out = arena.alloc(TerminalTabRow, visible_count) catch return &.{};
-        var ordinal: usize = 0;
-        var count: usize = 0;
-        for (stored) |*tab| {
-            if (tab.workspace_id != model.active_workspace_id) continue;
-            defer ordinal += 1;
-            if (ordinal < start or ordinal >= start + visible_count) continue;
-            out[count] = .{
-                .id = tab.id,
-                .pty = tab.pty,
-                .title = tab.title.slice(),
-                .path = tab.path.slice(),
-                .branch = tab.branch.slice(),
-                .tool = tab.tool,
-                .phase = tab.phase,
-                .exit_code = tab.exit_code,
-                .selected = tab.id == active,
-            };
-            count += 1;
-        }
-        return out[0..count];
+        return model.tab_store.rows(arena, model.active_workspace_id, model.activeTabId(model.active_workspace_id), max_rendered_tab_buttons);
     }
 
     pub fn activeWorkspaceTerminalCount(model: *const Model) usize {
-        var count: usize = 0;
-        for (model.tab_store.items.items) |tab| {
-            if (tab.workspace_id == model.active_workspace_id) count += 1;
-        }
-        return count;
+        return model.tab_store.countForWorkspace(model.active_workspace_id);
     }
 
     pub fn hasTabs(model: *const Model) bool {
-        for (model.tab_store.items.items) |tab| {
-            if (tab.workspace_id == model.active_workspace_id) return true;
-        }
-        return false;
+        return model.tab_store.hasWorkspace(model.active_workspace_id);
     }
 
     pub fn activeWorkspaceName(model: *const Model) []const u8 {
@@ -1106,17 +1014,13 @@ fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
     });
 }
 
-fn removeTab(model: *Model, index: usize) void {
+fn removeTab(model: *Model, fx: *Effects, index: usize) void {
     const removed = model.tab_store.items.orderedRemove(index);
+    fx.ptyForget(removed.pty);
     model.tab_store.releasePtyKey(removed.pty);
 
     if (model.activeTabId(removed.workspace_id) == removed.id) {
-        var replacement: u64 = 0;
-        for (model.tab_store.items.items) |tab| {
-            if (tab.workspace_id != removed.workspace_id or tab.phase == .closing) continue;
-            replacement = tab.id;
-        }
-        model.setActiveTab(removed.workspace_id, replacement);
+        model.setActiveTab(removed.workspace_id, model.tab_store.replacementForWorkspace(removed.workspace_id));
     }
 }
 
@@ -1131,7 +1035,7 @@ fn closeTerminal(model: *Model, fx: *Effects, tab_id: u64) void {
     const index = found orelse return;
     const phase = model.tab_store.items.items[index].phase;
     if (phase == .exited or phase == .failed) {
-        removeTab(model, index);
+        removeTab(model, fx, index);
         model.status_text = "Terminal closed";
         return;
     }
@@ -1206,7 +1110,7 @@ fn closeTabsForWorkspace(model: *Model, fx: *Effects, workspace_id: u64) void {
     while (index > 0) {
         index -= 1;
         const tab = model.tab_store.items.items[index];
-        if (tab.workspace_id == workspace_id and (tab.phase == .exited or tab.phase == .failed)) removeTab(model, index);
+        if (tab.workspace_id == workspace_id and (tab.phase == .exited or tab.phase == .failed)) removeTab(model, fx, index);
     }
 }
 
@@ -1504,92 +1408,7 @@ fn startToolChecks(model: *Model, fx: *Effects) void {
     fx.spawn(.{ .key = codex_check_key, .argv = &.{ shell, "-lc", "/usr/bin/which codex" }, .output = .collect, .on_exit = Effects.exitMsg(.tool_check_done) });
 }
 
-pub fn resolvedToolExecutable(output: []const u8) ?[]const u8 {
-    var result: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or !std.fs.path.isAbsolute(line) or std.mem.indexOfScalar(u8, line, 0) != null) continue;
-        result = line;
-    }
-    return result;
-}
-
-const ToolArgv = struct {
-    items: [32][]const u8 = undefined,
-    len: usize = 0,
-
-    fn append(argv: *ToolArgv, value: []const u8) bool {
-        if (argv.len == argv.items.len) return false;
-        argv.items[argv.len] = value;
-        argv.len += 1;
-        return true;
-    }
-
-    fn slice(argv: *const ToolArgv) []const []const u8 {
-        return argv.items[0..argv.len];
-    }
-};
-
-const ToolEnv = struct {
-    items: [native_sdk.max_effect_pty_env_entries]native_sdk.PtyEnvEntry = undefined,
-    len: usize = 0,
-
-    fn put(env: *ToolEnv, name: []const u8, value: []const u8) bool {
-        if (name.len == 0 or env.len == env.items.len) return false;
-        env.items[env.len] = .{ .name = name, .value = value };
-        env.len += 1;
-        return true;
-    }
-
-    fn putOptional(env: *ToolEnv, name: []const u8, value: []const u8) bool {
-        return value.len == 0 or env.put(name, value);
-    }
-
-    fn slice(env: *const ToolEnv) []const native_sdk.PtyEnvEntry {
-        return env.items[0..env.len];
-    }
-};
-
-const blocked_tool_env = [_][]const u8{
-    "PATH",                "HOME",                         "USER",                "SHELL",                 "TERM",
-    "LD_PRELOAD",          "LD_LIBRARY_PATH",              "LD_AUDIT",            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH", "NODE_OPTIONS",                 "NODE_EXTRA_CA_CERTS", "ELECTRON_RUN_AS_NODE",  "PYTHONPATH",
-    "PYTHONHOME",          "RUBYLIB",                      "PERL5LIB",            "CLASSPATH",             "JAVA_TOOL_OPTIONS",
-    "_JAVA_OPTIONS",       "GIT_SSH_COMMAND",              "GIT_ASKPASS",         "SSH_AUTH_SOCK",         "EDITOR",
-    "VISUAL",              "HTTP_PROXY",                   "HTTPS_PROXY",         "ALL_PROXY",             "FTP_PROXY",
-    "NO_PROXY",            "SSL_CERT_FILE",                "SSL_CERT_DIR",        "REQUESTS_CA_BUNDLE",    "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",      "NODE_TLS_REJECT_UNAUTHORIZED", "CC",                  "CXX",                   "LDFLAGS",
-    "CFLAGS",              "CANOPY_HOOK_PORT",             "CANOPY_HOOK_PATH",    "CANOPY_HOOK_TOKEN",
-};
-
-fn toolEnvAllowed(name: []const u8) bool {
-    for (blocked_tool_env) |blocked| if (std.ascii.eqlIgnoreCase(name, blocked)) return false;
-    return true;
-}
-
-fn appendCustomEnv(env: *ToolEnv, arena: std.mem.Allocator, source: []const u8) void {
-    if (source.len == 0) return;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{}) catch return;
-    const object = switch (parsed) {
-        .object => |value| value,
-        else => return,
-    };
-    var iterator = object.iterator();
-    while (iterator.next()) |entry| {
-        if (!toolEnvAllowed(entry.key_ptr.*)) continue;
-        const value = switch (entry.value_ptr.*) {
-            .string => |text| text,
-            else => continue,
-        };
-        _ = env.put(entry.key_ptr.*, value);
-    }
-}
-
-fn appendPair(argv: *ToolArgv, flag: []const u8, value: []const u8) bool {
-    if (value.len == 0) return true;
-    return argv.append(flag) and argv.append(value);
-}
+pub const resolvedToolExecutable = tool_launch.resolvedExecutable;
 
 fn toolAvailable(model: *const Model, tool: TerminalTool) bool {
     return switch (tool) {
@@ -1629,48 +1448,15 @@ fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mod.Pr
         return;
     }
 
-    var argv: ToolArgv = .{};
-    var env: ToolEnv = .{};
     var env_arena = std.heap.ArenaAllocator.init(model.tab_store.allocator);
     defer env_arena.deinit();
-    const shell = model.userShell();
-    const executable = model.toolExecutable(tool);
-    if (executable.len == 0 or !env.put("SHELL", shell) or !env.put("COLORTERM", "truecolor")) return;
-    if (std.mem.eql(u8, std.fs.path.basename(shell), "fish")) {
-        const required = [_][]const u8{ shell, "-lc", fish_tool_bootstrap, workspace.path.slice(), executable };
-        for (required) |arg| if (!argv.append(arg)) return;
-    } else {
-        const required = [_][]const u8{ shell, "-lc", posix_tool_bootstrap, "canopy-tool", workspace.path.slice(), executable };
-        for (required) |arg| if (!argv.append(arg)) return;
-    }
-    const prefs = &profile.prefs;
-    switch (profile.agent_type) {
-        .claude => {
-            if (!appendPair(&argv, "--settings", prefs.settings_json.slice())) return;
-            if (!appendPair(&argv, "--model", prefs.model.slice())) return;
-            if (!appendPair(&argv, "--permission-mode", prefs.permission_mode.slice())) return;
-            if (!appendPair(&argv, "--effort", prefs.effort_level.slice())) return;
-            if (!appendPair(&argv, "--append-system-prompt", prefs.append_system_prompt.slice())) return;
-            if (!env.putOptional("ANTHROPIC_BASE_URL", prefs.base_url.slice())) return;
-            if (prefs.provider.eql("bedrock") and !env.put("CLAUDE_CODE_USE_BEDROCK", "1")) return;
-            if (prefs.provider.eql("vertex") and !env.put("CLAUDE_CODE_USE_VERTEX", "1")) return;
-            if (prefs.provider.eql("foundry") and !env.put("CLAUDE_CODE_USE_FOUNDRY", "1")) return;
-        },
-        .codex => {
-            if (!argv.append("--enable") or !argv.append("hooks")) return;
-            if (!appendPair(&argv, "--model", prefs.model.slice())) return;
-            if (prefs.dangerously_bypass_approvals_and_sandbox) {
-                if (!argv.append("--dangerously-bypass-approvals-and-sandbox")) return;
-            } else {
-                if (!appendPair(&argv, "--ask-for-approval", prefs.approval_mode.slice())) return;
-                if (!appendPair(&argv, "--sandbox", prefs.sandbox.slice())) return;
-                if (prefs.full_auto and !argv.append("--full-auto")) return;
-            }
-            if (!appendPair(&argv, "--profile", prefs.profile.slice())) return;
-            if (!env.putOptional("OPENAI_BASE_URL", prefs.base_url.slice())) return;
-        },
-    }
-    appendCustomEnv(&env, env_arena.allocator(), prefs.custom_env.slice());
+    const launch = tool_launch.Spec.build(
+        env_arena.allocator(),
+        model.userShell(),
+        workspace.path.slice(),
+        model.toolExecutable(tool),
+        profile,
+    ) orelse return;
 
     const tab_id = model.next_tab_id;
     const pty_key = model.tab_store.allocatePtyKey(&model.next_pty_key);
@@ -1691,11 +1477,11 @@ fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mod.Pr
     model.status_text = if (tool == .claude) "Starting Claude Code" else "Starting Codex";
     fx.ptySpawn(.{
         .key = pty_key,
-        .argv = argv.slice(),
+        .argv = launch.argv(),
         .cols = 100,
         .rows = 30,
         .term = "xterm-256color",
-        .env = env.slice(),
+        .env = launch.env(),
         .on_event = Effects.ptyMsg(.terminal_event),
     });
 }
@@ -1710,6 +1496,254 @@ fn launchProfileTool(model: *Model, fx: *Effects, runtime_id: u64) void {
     if (!model.profiles_loaded) return;
     const profile = model.profile_store.find(runtime_id) orelse return;
     spawnProfileTool(model, fx, profile);
+}
+
+fn handlePreferencesLoadResult(model: *Model, fx: *Effects, result: native_sdk.EffectDbResult) void {
+    if (result.key != preferences_load_key) return;
+    switch (result.kind) {
+        .page => if (result.outcome != .ok or !preferences_mod.decodePage(&model.preferences_saved, result.bytes)) {
+            model.preferences_load_valid = false;
+        },
+        .done => {
+            if (result.outcome != .ok) model.preferences_load_valid = false;
+            finishPreferencesLoad(model, fx);
+        },
+        .exec => model.preferences_load_valid = false,
+    }
+}
+
+fn handlePreferencesWriteResult(model: *Model, result: native_sdk.EffectDbResult) void {
+    if (result.key != preferences_write_key or result.kind != .exec) return;
+    if (result.outcome == .ok) {
+        commitPreferences(model);
+    } else {
+        model.preferences_saving = false;
+        model.status_text = if (result.outcome == .busy) "Preferences database is busy; try again" else "Preferences could not be saved";
+    }
+}
+
+fn handleProfilesLoadResult(model: *Model, result: native_sdk.EffectDbResult) void {
+    if (result.key != profiles_load_key) return;
+    switch (result.kind) {
+        .page => if (result.outcome != .ok or !model.profile_store.appendEncodedPage(result.bytes)) {
+            model.profiles_load_valid = false;
+        },
+        .done => {
+            if (result.outcome != .ok) model.profiles_load_valid = false;
+            finishProfilesLoad(model);
+        },
+        .exec => model.profiles_load_valid = false,
+    }
+}
+
+fn handleProfileWriteResult(model: *Model, fx: *Effects, result: native_sdk.EffectDbResult) void {
+    if (result.key != profile_write_key or result.kind != .exec) return;
+    const operation = model.profile_db_operation;
+    model.profile_db_operation = .none;
+    model.profiles_saving = false;
+    if (result.outcome != .ok) {
+        model.status_text = if (result.outcome == .busy) "Profiles database is busy; try again" else "Agent profile could not be saved";
+        return;
+    }
+    const select_id = if (operation == .save) model.profile_draft.database_id.text() else "";
+    model.profile_dirty = false;
+    reloadProfiles(model, fx, select_id);
+    model.status_text = if (operation == .delete) "Agent profile deleted" else "Agent profile saved";
+}
+
+fn handleToolCheckResult(model: *Model, exit: native_sdk.EffectExit) void {
+    const resolved = if (exit.reason == .exited and exit.code == 0) resolvedToolExecutable(exit.output) else null;
+    if (exit.key == claude_check_key) {
+        model.claude_available = if (resolved) |path| model.setToolExecutable(.claude, path) else false;
+    } else if (exit.key == codex_check_key) {
+        model.codex_available = if (resolved) |path| model.setToolExecutable(.codex, path) else false;
+    } else return;
+    if (model.tool_checks_remaining > 0) model.tool_checks_remaining -= 1;
+}
+
+fn editProfileDraft(model: *Model, field: profile_editor.TextField, edit: canvas.TextInputEvent) void {
+    model.profile_draft.applyTextEdit(field, edit);
+    model.profile_dirty = true;
+}
+
+fn handleStoreResult(model: *Model, fx: *Effects, result: native_sdk.EffectFileResult) void {
+    if (result.op == .read) {
+        model.restore_ready = true;
+        if (result.outcome == .ok) {
+            _ = model.project_store.restoreAttached(result.bytes);
+            model.active_workspace_id = model.project_store.firstWorkspaceId();
+            model.restore_scan_active = true;
+            model.restore_scan_index = 0;
+            detectNextRestoredProject(model, fx);
+        } else {
+            model.status_text = "Ready";
+        }
+    } else if (result.op == .write) {
+        model.persist_write_active = false;
+        if (result.outcome != .ok) model.status_text = "Attached projects could not be persisted";
+        if (model.persist_dirty) {
+            model.persist_dirty = false;
+            persistProjects(model, fx);
+        }
+    }
+}
+
+fn handleTerminalEvent(model: *Model, fx: *Effects, event: native_sdk.EffectPtyEvent) void {
+    var index: usize = 0;
+    while (index < model.tab_store.items.items.len) : (index += 1) {
+        if (model.tab_store.items.items[index].pty != event.key) continue;
+        switch (event.kind) {
+            .output => {
+                if (model.tab_store.items.items[index].phase != .closing) {
+                    model.tab_store.items.items[index].phase = .running;
+                    model.status_text = "Shell running";
+                }
+            },
+            .exit => {
+                if (model.tab_store.items.items[index].phase == .closing) {
+                    removeTab(model, fx, index);
+                    model.status_text = "Terminal closed";
+                } else {
+                    model.tab_store.items.items[index].exit_code = event.code;
+                    model.tab_store.items.items[index].phase = if (event.reason == .exited) .exited else .failed;
+                    model.status_text = if (event.reason == .exited) "Shell exited" else "Shell failed";
+                }
+            },
+            .write => unreachable,
+        }
+        maybeFinishPendingTeardown(model, fx);
+        return;
+    }
+}
+
+fn handleGitResult(model: *Model, fx: *Effects, exit: native_sdk.EffectExit) void {
+    if (model.git_op.kind == .none or exit.key != model.git_op.key) return;
+    const operation = model.git_op;
+    model.git_op = .{};
+    const succeeded = exit.reason == .exited and exit.code == 0 and !exit.output_truncated;
+    switch (operation.kind) {
+        .restore_check => if (succeeded) {
+            detectRepository(model, fx, operation.project_id);
+        } else {
+            _ = model.project_store.detach(operation.project_id);
+            model.active_workspace_id = model.project_store.firstWorkspaceId();
+            persistProjects(model, fx);
+            detectNextRestoredProject(model, fx);
+        },
+        .detect_repo => {
+            if (succeeded) {
+                const root = std.mem.trim(u8, exit.output, " \r\n");
+                if (model.project_store.findAttachedByKey(root)) |existing| {
+                    if (existing.id != operation.project_id) {
+                        _ = model.project_store.detach(operation.project_id);
+                        model.active_workspace_id = for (existing.worktrees.items) |worktree| {
+                            if (worktree.active) break worktree.id;
+                        } else 0;
+                        persistProjects(model, fx);
+                        refreshWorktrees(model, fx, existing.id);
+                        return;
+                    }
+                }
+                if (model.project_store.markGit(operation.project_id, root)) {
+                    refreshWorktrees(model, fx, operation.project_id);
+                } else {
+                    model.status_text = "The Git root path is invalid";
+                    detectNextRestoredProject(model, fx);
+                }
+            } else {
+                model.status_text = "Folder attached";
+                detectNextRestoredProject(model, fx);
+            }
+        },
+        .list_worktrees => {
+            if (succeeded) {
+                _ = model.project_store.applyWorktreePorcelain(operation.project_id, exit.output);
+                const project = model.project_store.findProject(operation.project_id) orelse return;
+                var selected: u64 = 0;
+                if (model.select_after_refresh.len > 0) {
+                    for (project.worktrees.items) |worktree| {
+                        if (worktree.active and worktree.path.eql(model.select_after_refresh.slice())) selected = worktree.id;
+                    }
+                    model.select_after_refresh.len = 0;
+                }
+                if (selected == 0) {
+                    for (project.worktrees.items) |worktree| {
+                        if (worktree.active) {
+                            selected = worktree.id;
+                            break;
+                        }
+                    }
+                }
+                if (selected != 0 and (model.active_workspace_id == 0 or operation.project_id == model.create_project_id or model.restore_scan_active)) model.active_workspace_id = selected;
+                if (operation.project_id == model.create_project_id) model.create_project_id = 0;
+                if (model.create_failed) {
+                    model.create_failed = false;
+                    model.status_text = "Worktree creation failed; branch retained and Git state refreshed";
+                } else {
+                    model.status_text = "Worktrees refreshed";
+                }
+            } else {
+                if (model.create_failed) {
+                    model.create_failed = false;
+                    model.status_text = "Worktree creation failed; inspect Git state manually";
+                } else {
+                    model.status_text = "Could not list Git worktrees";
+                }
+            }
+            detectNextRestoredProject(model, fx);
+        },
+        .validate_branch => if (succeeded) {
+            checkWorktreeTarget(model, fx, operation);
+        } else {
+            model.status_text = "That is not a valid Git branch name";
+        },
+        .check_target => if (succeeded) {
+            checkBranchAvailable(model, fx, operation);
+        } else {
+            model.status_text = "The generated worktree target already exists";
+        },
+        .check_branch => if (exit.reason == .exited and exit.code == 1) {
+            createBranch(model, fx, operation);
+        } else if (succeeded) {
+            model.status_text = "That local branch already exists";
+        } else {
+            model.status_text = "Git could not check branch availability";
+        },
+        .create_branch => if (succeeded) {
+            createWorktree(model, fx, operation);
+        } else {
+            model.status_text = "Git could not create the branch (it may now exist)";
+        },
+        .create_worktree => if (succeeded) {
+            _ = model.select_after_refresh.set(operation.target_path.slice());
+            refreshWorktrees(model, fx, operation.project_id);
+        } else {
+            model.create_failed = true;
+            _ = model.select_after_refresh.set(operation.target_path.slice());
+            refreshWorktrees(model, fx, operation.project_id);
+        },
+        .remove_status => {
+            model.remove_dirty = !succeeded or std.mem.trim(u8, exit.output, " \r\n").len > 0;
+            preflightRemoveSubmodules(model, fx, operation.workspace_id);
+        },
+        .remove_submodules => {
+            const no_submodules = exit.reason == .exited and exit.code == 1;
+            model.remove_has_submodules = if (succeeded) std.mem.trim(u8, exit.output, " \r\n").len > 0 else !no_submodules;
+            preflightRemoveUnmerged(model, fx, operation.workspace_id);
+        },
+        .remove_unmerged => {
+            model.remove_unmerged_count = if (succeeded) countNonEmptyLines(exit.output) else 1;
+            finishRemovePreflight(model, fx);
+        },
+        .remove_worktree => if (succeeded) {
+            _ = model.project_store.removeWorktree(operation.workspace_id);
+            if (model.active_workspace_id == operation.workspace_id) model.active_workspace_id = model.project_store.firstWorkspaceId();
+            refreshWorktrees(model, fx, operation.project_id);
+        } else {
+            model.status_text = "Git refused to remove the worktree";
+        },
+        .none => {},
+    }
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -1860,65 +1894,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.preferences_dirty = true;
         },
         .save_preferences => savePreferences(model, fx),
-        .preferences_load_done => |result| {
-            if (result.key != preferences_load_key) return;
-            switch (result.kind) {
-                .page => {
-                    if (result.outcome != .ok or !preferences_mod.decodePage(&model.preferences_saved, result.bytes)) model.preferences_load_valid = false;
-                },
-                .done => {
-                    if (result.outcome != .ok) model.preferences_load_valid = false;
-                    finishPreferencesLoad(model, fx);
-                },
-                .exec => model.preferences_load_valid = false,
-            }
-        },
-        .preferences_db_done => |result| {
-            if (result.key != preferences_write_key or result.kind != .exec) return;
-            if (result.outcome == .ok) {
-                commitPreferences(model);
-            } else {
-                model.preferences_saving = false;
-                model.status_text = if (result.outcome == .busy) "Preferences database is busy; try again" else "Preferences could not be saved";
-            }
-        },
+        .preferences_load_done => |result| handlePreferencesLoadResult(model, fx, result),
+        .preferences_db_done => |result| handlePreferencesWriteResult(model, result),
         .worktrees_base_failed => model.status_text = "Worktree base directory could not be created",
-        .profiles_load_done => |result| {
-            if (result.key != profiles_load_key) return;
-            switch (result.kind) {
-                .page => {
-                    if (result.outcome != .ok or !model.profile_store.appendEncodedPage(result.bytes)) model.profiles_load_valid = false;
-                },
-                .done => {
-                    if (result.outcome != .ok) model.profiles_load_valid = false;
-                    finishProfilesLoad(model);
-                },
-                .exec => model.profiles_load_valid = false,
-            }
-        },
-        .profile_db_done => |result| {
-            if (result.key != profile_write_key or result.kind != .exec) return;
-            const operation = model.profile_db_operation;
-            model.profile_db_operation = .none;
-            model.profiles_saving = false;
-            if (result.outcome != .ok) {
-                model.status_text = if (result.outcome == .busy) "Profiles database is busy; try again" else "Agent profile could not be saved";
-                return;
-            }
-            const select_id = if (operation == .save) model.profile_draft.database_id.text() else "";
-            model.profile_dirty = false;
-            reloadProfiles(model, fx, select_id);
-            model.status_text = if (operation == .delete) "Agent profile deleted" else "Agent profile saved";
-        },
-        .tool_check_done => |exit| {
-            const resolved = if (exit.reason == .exited and exit.code == 0) resolvedToolExecutable(exit.output) else null;
-            if (exit.key == claude_check_key) {
-                model.claude_available = if (resolved) |path| model.setToolExecutable(.claude, path) else false;
-            } else if (exit.key == codex_check_key) {
-                model.codex_available = if (resolved) |path| model.setToolExecutable(.codex, path) else false;
-            } else return;
-            if (model.tool_checks_remaining > 0) model.tool_checks_remaining -= 1;
-        },
+        .profiles_load_done => |result| handleProfilesLoadResult(model, result),
+        .profile_db_done => |result| handleProfileWriteResult(model, fx, result),
+        .tool_check_done => |exit| handleToolCheckResult(model, exit),
         .toggle_claude_profiles => model.claude_expanded = !model.claude_expanded,
         .toggle_codex_profiles => model.codex_expanded = !model.codex_expanded,
         .launch_claude => launchDefaultTool(model, fx, .claude),
@@ -1947,54 +1928,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.profile_delete_dialog_open = false;
         },
         .save_profile => saveProfile(model, fx),
-        .edit_profile_name => |edit| {
-            model.profile_draft.name.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_model => |edit| {
-            model.profile_draft.model.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_permission_mode => |edit| {
-            model.profile_draft.permission_mode.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_effort_level => |edit| {
-            model.profile_draft.effort_level.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_provider => |edit| {
-            model.profile_draft.provider.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_approval_mode => |edit| {
-            model.profile_draft.approval_mode.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_sandbox => |edit| {
-            model.profile_draft.sandbox.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_base_url => |edit| {
-            model.profile_draft.base_url.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_append_prompt => |edit| {
-            model.profile_draft.append_system_prompt.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_custom_env => |edit| {
-            model.profile_draft.custom_env.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_settings_json => |edit| {
-            model.profile_draft.settings_json.apply(edit);
-            model.profile_dirty = true;
-        },
-        .edit_profile_codex_profile => |edit| {
-            model.profile_draft.profile.apply(edit);
-            model.profile_dirty = true;
-        },
+        .edit_profile_name => |edit| editProfileDraft(model, .name, edit),
+        .edit_profile_model => |edit| editProfileDraft(model, .model, edit),
+        .edit_profile_permission_mode => |edit| editProfileDraft(model, .permission_mode, edit),
+        .edit_profile_effort_level => |edit| editProfileDraft(model, .effort_level, edit),
+        .edit_profile_provider => |edit| editProfileDraft(model, .provider, edit),
+        .edit_profile_approval_mode => |edit| editProfileDraft(model, .approval_mode, edit),
+        .edit_profile_sandbox => |edit| editProfileDraft(model, .sandbox, edit),
+        .edit_profile_base_url => |edit| editProfileDraft(model, .base_url, edit),
+        .edit_profile_append_prompt => |edit| editProfileDraft(model, .append_system_prompt, edit),
+        .edit_profile_custom_env => |edit| editProfileDraft(model, .custom_env, edit),
+        .edit_profile_settings_json => |edit| editProfileDraft(model, .settings_json, edit),
+        .edit_profile_codex_profile => |edit| editProfileDraft(model, .profile, edit),
         .toggle_profile_full_auto => {
             model.profile_draft.full_auto = !model.profile_draft.full_auto;
             model.profile_dirty = true;
@@ -2003,183 +1948,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.profile_draft.dangerously_bypass_approvals_and_sandbox = !model.profile_draft.dangerously_bypass_approvals_and_sandbox;
             model.profile_dirty = true;
         },
-        .git_done => |exit| {
-            if (model.git_op.kind == .none or exit.key != model.git_op.key) return;
-            const operation = model.git_op;
-            model.git_op = .{};
-            const succeeded = exit.reason == .exited and exit.code == 0 and !exit.output_truncated;
-            switch (operation.kind) {
-                .restore_check => if (succeeded) {
-                    detectRepository(model, fx, operation.project_id);
-                } else {
-                    _ = model.project_store.detach(operation.project_id);
-                    model.active_workspace_id = model.project_store.firstWorkspaceId();
-                    persistProjects(model, fx);
-                    detectNextRestoredProject(model, fx);
-                },
-                .detect_repo => {
-                    if (succeeded) {
-                        const root = std.mem.trim(u8, exit.output, " \r\n");
-                        if (model.project_store.findAttachedByKey(root)) |existing| {
-                            if (existing.id != operation.project_id) {
-                                _ = model.project_store.detach(operation.project_id);
-                                model.active_workspace_id = for (existing.worktrees.items) |worktree| {
-                                    if (worktree.active) break worktree.id;
-                                } else 0;
-                                persistProjects(model, fx);
-                                refreshWorktrees(model, fx, existing.id);
-                                return;
-                            }
-                        }
-                        if (model.project_store.markGit(operation.project_id, root)) {
-                            refreshWorktrees(model, fx, operation.project_id);
-                        } else {
-                            model.status_text = "The Git root path is invalid";
-                            detectNextRestoredProject(model, fx);
-                        }
-                    } else {
-                        model.status_text = "Folder attached";
-                        detectNextRestoredProject(model, fx);
-                    }
-                },
-                .list_worktrees => {
-                    if (succeeded) {
-                        _ = model.project_store.applyWorktreePorcelain(operation.project_id, exit.output);
-                        const project = model.project_store.findProject(operation.project_id) orelse return;
-                        var selected: u64 = 0;
-                        if (model.select_after_refresh.len > 0) {
-                            for (project.worktrees.items) |worktree| {
-                                if (worktree.active and worktree.path.eql(model.select_after_refresh.slice())) selected = worktree.id;
-                            }
-                            model.select_after_refresh.len = 0;
-                        }
-                        if (selected == 0) {
-                            for (project.worktrees.items) |worktree| {
-                                if (worktree.active) {
-                                    selected = worktree.id;
-                                    break;
-                                }
-                            }
-                        }
-                        if (selected != 0 and (model.active_workspace_id == 0 or operation.project_id == model.create_project_id or model.restore_scan_active)) model.active_workspace_id = selected;
-                        if (operation.project_id == model.create_project_id) model.create_project_id = 0;
-                        if (model.create_failed) {
-                            model.create_failed = false;
-                            model.status_text = "Worktree creation failed; branch retained and Git state refreshed";
-                        } else {
-                            model.status_text = "Worktrees refreshed";
-                        }
-                    } else {
-                        if (model.create_failed) {
-                            model.create_failed = false;
-                            model.status_text = "Worktree creation failed; inspect Git state manually";
-                        } else {
-                            model.status_text = "Could not list Git worktrees";
-                        }
-                    }
-                    detectNextRestoredProject(model, fx);
-                },
-                .validate_branch => if (succeeded) {
-                    checkWorktreeTarget(model, fx, operation);
-                } else {
-                    model.status_text = "That is not a valid Git branch name";
-                },
-                .check_target => if (succeeded) {
-                    checkBranchAvailable(model, fx, operation);
-                } else {
-                    model.status_text = "The generated worktree target already exists";
-                },
-                .check_branch => if (exit.reason == .exited and exit.code == 1) {
-                    createBranch(model, fx, operation);
-                } else if (succeeded) {
-                    model.status_text = "That local branch already exists";
-                } else {
-                    model.status_text = "Git could not check branch availability";
-                },
-                .create_branch => if (succeeded) {
-                    createWorktree(model, fx, operation);
-                } else {
-                    model.status_text = "Git could not create the branch (it may now exist)";
-                },
-                .create_worktree => if (succeeded) {
-                    _ = model.select_after_refresh.set(operation.target_path.slice());
-                    refreshWorktrees(model, fx, operation.project_id);
-                } else {
-                    model.create_failed = true;
-                    _ = model.select_after_refresh.set(operation.target_path.slice());
-                    refreshWorktrees(model, fx, operation.project_id);
-                },
-                .remove_status => {
-                    model.remove_dirty = !succeeded or std.mem.trim(u8, exit.output, " \r\n").len > 0;
-                    preflightRemoveSubmodules(model, fx, operation.workspace_id);
-                },
-                .remove_submodules => {
-                    const no_submodules = exit.reason == .exited and exit.code == 1;
-                    model.remove_has_submodules = if (succeeded) std.mem.trim(u8, exit.output, " \r\n").len > 0 else !no_submodules;
-                    preflightRemoveUnmerged(model, fx, operation.workspace_id);
-                },
-                .remove_unmerged => {
-                    model.remove_unmerged_count = if (succeeded) countNonEmptyLines(exit.output) else 1;
-                    finishRemovePreflight(model, fx);
-                },
-                .remove_worktree => if (succeeded) {
-                    _ = model.project_store.removeWorktree(operation.workspace_id);
-                    if (model.active_workspace_id == operation.workspace_id) model.active_workspace_id = model.project_store.firstWorkspaceId();
-                    refreshWorktrees(model, fx, operation.project_id);
-                } else {
-                    model.status_text = "Git refused to remove the worktree";
-                },
-                .none => {},
-            }
-        },
-        .store_done => |result| {
-            if (result.op == .read) {
-                model.restore_ready = true;
-                if (result.outcome == .ok) {
-                    _ = model.project_store.restoreAttached(result.bytes);
-                    model.active_workspace_id = model.project_store.firstWorkspaceId();
-                    model.restore_scan_active = true;
-                    model.restore_scan_index = 0;
-                    detectNextRestoredProject(model, fx);
-                } else {
-                    model.status_text = "Ready";
-                }
-            } else if (result.op == .write) {
-                model.persist_write_active = false;
-                if (result.outcome != .ok) model.status_text = "Attached projects could not be persisted";
-                if (model.persist_dirty) {
-                    model.persist_dirty = false;
-                    persistProjects(model, fx);
-                }
-            }
-        },
-        .terminal_event => |event| {
-            var index: usize = 0;
-            while (index < model.tab_store.items.items.len) : (index += 1) {
-                if (model.tab_store.items.items[index].pty != event.key) continue;
-                switch (event.kind) {
-                    .output => {
-                        if (model.tab_store.items.items[index].phase != .closing) {
-                            model.tab_store.items.items[index].phase = .running;
-                            model.status_text = "Shell running";
-                        }
-                    },
-                    .exit => {
-                        if (model.tab_store.items.items[index].phase == .closing) {
-                            removeTab(model, index);
-                            model.status_text = "Terminal closed";
-                        } else {
-                            model.tab_store.items.items[index].exit_code = event.code;
-                            model.tab_store.items.items[index].phase = if (event.reason == .exited) .exited else .failed;
-                            model.status_text = if (event.reason == .exited) "Shell exited" else "Shell failed";
-                        }
-                    },
-                    .write => unreachable,
-                }
-                maybeFinishPendingTeardown(model, fx);
-                return;
-            }
-        },
+        .git_done => |exit| handleGitResult(model, fx, exit),
+        .store_done => |result| handleStoreResult(model, fx, result),
+        .terminal_event => |event| handleTerminalEvent(model, fx, event),
         .sidebar_resized => |fraction| model.sidebar_fraction = fraction,
         .set_appearance => |appearance| model.appearance = appearance,
         .chrome_changed => |chrome| model.chrome_leading = @max(76, chrome.insets.left + 64),
@@ -2258,23 +2029,7 @@ const app_markup_sources = [_]canvas.ui_markup.SourceFile{
     .{ .path = "components/preferences-worktrees.native", .source = @embedFile("components/preferences-worktrees.native") },
     .{ .path = "components/profile-preferences.native", .source = @embedFile("components/profile-preferences.native") },
 };
-const app_compiled_sources = [_]canvas.ui_markup.SourceFile{
-    .{ .path = "app.native", .source = app_markup },
-    .{ .path = "components/primitives.native", .source = @embedFile("components/primitives.native") },
-    .{ .path = "components/titlebar.native", .source = @embedFile("components/titlebar.native") },
-    .{ .path = "components/project-sidebar.native", .source = @embedFile("components/project-sidebar.native") },
-    .{ .path = "components/tools-sidebar.native", .source = @embedFile("components/tools-sidebar.native") },
-    .{ .path = "components/terminal-workspace.native", .source = @embedFile("components/terminal-workspace.native") },
-    .{ .path = "components/empty-state.native", .source = @embedFile("components/empty-state.native") },
-    .{ .path = "components/dialogs.native", .source = @embedFile("components/dialogs.native") },
-    .{ .path = "components/preferences.native", .source = @embedFile("components/preferences.native") },
-    .{ .path = "components/preferences-header.native", .source = @embedFile("components/preferences-header.native") },
-    .{ .path = "components/preferences-sidebar.native", .source = @embedFile("components/preferences-sidebar.native") },
-    .{ .path = "components/preferences-general.native", .source = @embedFile("components/preferences-general.native") },
-    .{ .path = "components/preferences-appearance.native", .source = @embedFile("components/preferences-appearance.native") },
-    .{ .path = "components/preferences-worktrees.native", .source = @embedFile("components/preferences-worktrees.native") },
-    .{ .path = "components/profile-preferences.native", .source = @embedFile("components/profile-preferences.native") },
-};
+const app_compiled_sources = [_]canvas.ui_markup.SourceFile{.{ .path = "app.native", .source = app_markup }} ++ app_markup_sources;
 const CompiledCanopyView = canvas.CompiledMarkupImports(Model, Msg, "app.native", &app_compiled_sources);
 // The SDK schema generator requires STRICT tables. Electron Canopy's shipped
 // table is intentionally ordinary SQLite, so keep this tiny migration explicit
@@ -2507,7 +2262,10 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("db_page.zig");
     _ = @import("tests.zig");
     _ = @import("profiles.zig");
+    _ = @import("terminal_tabs.zig");
     _ = @import("theme.zig");
+    _ = @import("tool_launch.zig");
 }
