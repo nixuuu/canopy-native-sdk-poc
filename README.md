@@ -206,6 +206,15 @@ it at `Contents/Resources/ghostty`, with `share/terminfo` copied alongside as
 
 ## Rendering and resize diagnostics
 
+The header sidebar button toggles the docked project rail. Its user-selected
+width is stored in logical points, not a window percentage. Below 960 points
+the rail collapses automatically; the same button reveals it over the terminal.
+Escape, an outside click, selecting a worktree or launching a sidebar tool
+closes the overlay. Returning to a wide window restores the dock unless it was
+manually collapsed. Disclosure motion lasts 180 ms, honors Reduce Motion and
+requests frames only while moving. The native terminal is cropped behind the
+overlay without resizing its PTY or stopping its process.
+
 The Canopy SDK patch keeps the canvas frame clock active in AppKit tracking
 modes using a cancellable, one-shot common-mode timer. It uses the display's
 30–120 Hz cadence rather than a separate fixed 60 Hz application timer, and

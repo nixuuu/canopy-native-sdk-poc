@@ -13,6 +13,8 @@ extern fn canopy_ghostty_next_event(host: *anyopaque, event: *Event) bool;
 extern fn canopy_ghostty_surface(host: *anyopaque, tab: u64, cwd: [*:0]const u8, command: [*:0]const u8, env: [*]const launch.Env, count: usize) ?*anyopaque;
 extern fn canopy_ghostty_close(host: *anyopaque, tab: u64) void;
 extern fn canopy_ghostty_visibility(host: *anyopaque, tab: u64, visible: bool, focus: bool) void;
+extern fn canopy_ghostty_cover(host: *anyopaque, tab: u64, covered: f64, overlay: bool) void;
+extern fn canopy_ghostty_begin_layout(host: *anyopaque, tab: u64) void;
 
 const allocator = std.heap.page_allocator;
 const container = "ghostty-surface";
@@ -25,6 +27,7 @@ pub const Host = struct {
     surfaces: std.AutoHashMapUnmanaged(u64, *anyopaque) = .empty,
     installed: bool = false,
     mounted: u64 = 0,
+    overlay_active: bool = false,
     frame: ?geometry.RectF = null,
     observed_tab_count: usize = 0,
     observed_next_tab_id: u64 = 0,
@@ -69,6 +72,7 @@ pub const Host = struct {
                     1 => try ui.dispatch(runtime, 1, .{ .terminal_event = .{ .key = tab.pty, .kind = .exit, .code = event.code } }),
                     2 => try ui.dispatch(runtime, 1, .{ .close_tab = tab.id }),
                     3 => try ui.dispatch(runtime, 1, .open_active_terminal),
+                    4 => try ui.dispatch(runtime, 1, .dismiss_sidebar),
                     else => {},
                 }
                 break;
@@ -142,11 +146,15 @@ pub const Host = struct {
             self.detach(runtime);
             return;
         }
+        const covered = std.math.clamp(model.sidebarOverlayWidth() - frame.?.x, 0, @max(0, frame.?.width - 1));
+        frame.?.x += covered;
+        frame.?.width -= covered;
         if (!self.installed) {
             _ = try runtime.createView(.{ .window_id = 1, .label = container, .kind = .stack, .parent = "main-canvas", .frame = frame.?, .layer = 1, .visible = false });
             self.installed = true;
         }
         if (self.frame == null or !std.meta.eql(self.frame.?, frame.?)) {
+            if (self.mounted == selected) canopy_ghostty_begin_layout(raw, selected);
             _ = try runtime.updateView(1, container, .{ .frame = frame.? });
             self.frame = frame;
         }
@@ -156,6 +164,13 @@ pub const Host = struct {
             try runtime.adoptViewSurface(1, container, view.?);
             self.mounted = selected;
             canopy_ghostty_visibility(raw, selected, true, true);
+        }
+        canopy_ghostty_cover(raw, selected, covered, model.sidebarOverlayVisible());
+        if (self.overlay_active != model.sidebarOverlayVisible()) {
+            self.overlay_active = model.sidebarOverlayVisible();
+            if (self.overlay_active) {
+                try runtime.focusView(1, "main-canvas");
+            } else canopy_ghostty_visibility(raw, selected, true, true);
         }
     }
 };

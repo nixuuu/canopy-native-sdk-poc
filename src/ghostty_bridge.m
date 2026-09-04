@@ -20,6 +20,8 @@
 @property(nonatomic, assign) CanopyTerminalFocusGate focusGate;
 @property(nonatomic, assign) BOOL visibilityKnown;
 @property(nonatomic, assign) BOOL appliedVisible;
+@property(nonatomic, assign) BOOL sidebarOverlay;
+@property(nonatomic, assign) BOOL suppressMouseUp;
 @property(nonatomic, assign) double appliedScale;
 @property(nonatomic, assign) uint32_t appliedPixelWidth;
 @property(nonatomic, assign) uint32_t appliedPixelHeight;
@@ -159,7 +161,7 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
     }
 }
 - (void)sendKey:(NSEvent *)event text:(NSString *)text action:(ghostty_input_action_e)action {
-    if (!self.surface) return;
+    if (!self.surface || self.sidebarOverlay) return;
     ghostty_input_key_s key = {0};
     key.action = action;
     key.keycode = event.keyCode;
@@ -177,6 +179,10 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
     self.keySent = YES;
 }
 - (void)keyDown:(NSEvent *)event {
+    if (self.sidebarOverlay) {
+        if (event.keyCode == 53) [self.host queue:self.tab kind:4 code:0];
+        return;
+    }
     self.keyEvent = event;
     self.keySent = NO;
     ghostty_input_mods_e translated = self.surface ? ghostty_surface_key_translation_mods(self.surface, mods(event.modifierFlags)) : mods(event.modifierFlags);
@@ -202,6 +208,7 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
     return YES;
 }
 - (void)insertText:(id)value replacementRange:(NSRange)range {
+    if (self.sidebarOverlay) return;
     NSString *text = [value isKindOfClass:NSAttributedString.class] ? [value string] : value;
     BOOL composed = self.hasMarkedText;
     [self unmarkText];
@@ -225,19 +232,32 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
     return [self.window convertRectToScreen:[self convertRect:NSMakeRect(x,y,w,h) toView:nil]];
 }
 - (void)copy:(id)sender { if (self.surface) ghostty_surface_binding_action(self.surface,"copy_to_clipboard",17); }
-- (void)paste:(id)sender { if (self.surface) ghostty_surface_binding_action(self.surface,"paste_from_clipboard",20); }
-- (void)mouseMoved:(NSEvent *)event { NSPoint p=[self convertPoint:event.locationInWindow fromView:nil]; if(self.surface) ghostty_surface_mouse_pos(self.surface,p.x,p.y,mods(event.modifierFlags)); }
-- (void)mouseDown:(NSEvent *)event { [self.window makeFirstResponder:self]; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_LEFT,mods(event.modifierFlags)); }
-- (void)mouseUp:(NSEvent *)event { [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_LEFT,mods(event.modifierFlags)); }
+- (void)paste:(id)sender { if (self.surface && !self.sidebarOverlay) ghostty_surface_binding_action(self.surface,"paste_from_clipboard",20); }
+- (void)mouseMoved:(NSEvent *)event { if (self.sidebarOverlay) return; NSPoint p=[self convertPoint:event.locationInWindow fromView:nil]; if(self.surface) ghostty_surface_mouse_pos(self.surface,p.x,p.y,mods(event.modifierFlags)); }
+- (void)mouseDown:(NSEvent *)event {
+    if (self.sidebarOverlay) {
+        self.suppressMouseUp = YES;
+        [self.host queue:self.tab kind:4 code:0];
+        return;
+    }
+    [self.window makeFirstResponder:self]; [self mouseMoved:event];
+    if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_LEFT,mods(event.modifierFlags));
+}
+- (void)mouseUp:(NSEvent *)event {
+    if (self.suppressMouseUp) { self.suppressMouseUp = NO; return; }
+    if (self.sidebarOverlay) return;
+    [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_LEFT,mods(event.modifierFlags));
+}
 - (void)mouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
-- (void)rightMouseDown:(NSEvent *)event { [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_RIGHT,mods(event.modifierFlags)); }
-- (void)rightMouseUp:(NSEvent *)event { [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_RIGHT,mods(event.modifierFlags)); }
+- (void)rightMouseDown:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_RIGHT,mods(event.modifierFlags)); }
+- (void)rightMouseUp:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_RIGHT,mods(event.modifierFlags)); }
 - (void)rightMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
-- (void)otherMouseDown:(NSEvent *)event { [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_MIDDLE,mods(event.modifierFlags)); }
-- (void)otherMouseUp:(NSEvent *)event { [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_MIDDLE,mods(event.modifierFlags)); }
+- (void)otherMouseDown:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_MIDDLE,mods(event.modifierFlags)); }
+- (void)otherMouseUp:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_MIDDLE,mods(event.modifierFlags)); }
 - (void)otherMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
 - (void)mouseExited:(NSEvent *)event { if(self.surface) ghostty_surface_mouse_pos(self.surface,-1,-1,mods(event.modifierFlags)); }
 - (void)scrollWheel:(NSEvent *)event {
+    if (self.sidebarOverlay) return;
     unsigned momentum=GHOSTTY_MOUSE_MOMENTUM_NONE;
     switch(event.momentumPhase) {
         case NSEventPhaseBegan: momentum=GHOSTTY_MOUSE_MOMENTUM_BEGAN; break;
@@ -359,6 +379,26 @@ void canopy_ghostty_visibility(void *raw, uint64_t tab, bool visible, bool focus
     [view syncOcclusion];
     if(focus && visible) [view.window makeFirstResponder:view];
     [view syncFocus];
+}
+void canopy_ghostty_begin_layout(void *raw, uint64_t tab) {
+    CanopyGhosttyView *view=((__bridge CanopyGhosttyHost *)raw).views[@(tab)];
+    // Container clipping is not a terminal resize. Suppress AppKit's temporary
+    // child resize until the full (uncropped) frame is applied below.
+    view.autoresizingMask = NSViewNotSizable;
+}
+void canopy_ghostty_cover(void *raw, uint64_t tab, double covered, bool overlay) {
+    CanopyGhosttyView *view=((__bridge CanopyGhosttyHost *)raw).views[@(tab)];
+    view.sidebarOverlay = overlay;
+    if (!view.superview) return;
+    // Crop the native container, not the terminal grid: opening navigation
+    // must not resize the PTY or wrap its output. Its exposed right side stays
+    // live; the uncovered canvas owns sidebar input and drawing on the left.
+    view.superview.wantsLayer = YES;
+    view.superview.layer.masksToBounds = YES;
+    NSRect bounds = view.superview.bounds;
+    NSRect frame = NSMakeRect(-covered, 0, bounds.size.width + covered, bounds.size.height);
+    if (!NSEqualRects(view.frame, frame)) view.frame = frame;
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 }
 void canopy_ghostty_tick(void *raw) {
     CanopyGhosttyHost *host=(__bridge CanopyGhosttyHost *)raw;

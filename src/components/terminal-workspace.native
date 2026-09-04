@@ -3,7 +3,7 @@
 <template name="terminal-workspace">
   <!-- The root app already paints this background. Do not rasterize the
        full terminal area again underneath the opaque native surface. -->
-  <column min-width="520">
+  <column min-width="520" global-key="terminal-workspace">
     <if test="{hasTabs}">
       <row height="32" background="surface" cross="center">
         <button width="24" height="24" size="icon" variant="ghost" icon="chevron-left" on-press="previous_tab" label="Previous terminal"></button>

@@ -2,6 +2,92 @@ const std = @import("std");
 const app = @import("main.zig");
 const profiles = @import("profiles.zig");
 const workspaces = @import("workspaces.zig");
+const sdk = @import("native_sdk");
+
+test "compact sidebar overlay leaves terminal layout unchanged and dismisses on selection" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    const attached = stores.projects.attachPlaceholder("/tmp/sidebar-overlay-test").?;
+    model.active_workspace_id = attached.workspace_id;
+    model.use_ghostty = true;
+    try stores.tabs.items.append(stores.tabs.allocator, .{ .id = 1, .workspace_id = attached.workspace_id, .pty = 1, .phase = .running });
+    try model.active_tab_by_workspace.put(std.testing.allocator, attached.workspace_id, 1);
+    model.canvas_width = 860;
+    _ = model.sidebar.advance(860, 0, true);
+    var viewport: ?sdk.geometry.RectF = null;
+    for ([_]bool{ false, true, false }) |open| {
+        model.sidebar.overlay_open = open;
+        _ = model.sidebar.advance(860, 1, true);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var ui = sdk.canvas.Ui(app.Msg).init(arena.allocator());
+        const tree = try ui.finalize(app.CompiledCanopyView.build(&ui, &model));
+        const nodes = try arena.allocator().alloc(sdk.canvas.WidgetLayoutNode, 1024);
+        const layout = try sdk.canvas.layoutWidgetTree(tree.root, sdk.geometry.RectF.init(0, 0, 860, 760), nodes);
+        var trees: usize = 0;
+        var found = false;
+        for (layout.nodes) |node| {
+            if (node.widget.kind == .tree) trees += 1;
+            if (!std.mem.eql(u8, node.widget.semantics.label, "Ghostty terminal viewport")) continue;
+            found = true;
+            if (viewport) |previous| try std.testing.expectEqual(previous, node.frame);
+            viewport = node.frame;
+        }
+        try std.testing.expect(found);
+        try std.testing.expectEqual(@as(usize, if (open) 1 else 0), trees);
+    }
+    model.sidebar.overlay_open = true;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    app.update(&model, .{ .select_workspace = attached.workspace_id }, &fx);
+    try std.testing.expect(!model.sidebar.overlay_open);
+    try std.testing.expectEqual(@as(usize, 1), stores.tabs.items.items.len);
+}
+
+test "sidebar keeps logical width across window resize and restores after clamping" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    const attached = stores.projects.attachPlaceholder("/tmp/sidebar-width-test").?;
+    model.active_workspace_id = attached.workspace_id;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+
+    // A real divider message selects 420 points at the current viewport.
+    app.update(&model, .{ .sidebar_resized = 420 / (model.canvas_width - 1) }, &fx);
+    try std.testing.expectApproxEqAbs(@as(f32, 420), model.sidebar_width, 0.001);
+    for ([_]f32{ 1180, 1600, 860, 1180, 2000 }) |width| {
+        model.canvas_width = width;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var ui = sdk.canvas.Ui(app.Msg).init(arena.allocator());
+        const tree = try ui.finalize(app.CompiledCanopyView.build(&ui, &model));
+        const nodes = try arena.allocator().alloc(sdk.canvas.WidgetLayoutNode, 1024);
+        const layout = try sdk.canvas.layoutWidgetTree(tree.root, sdk.geometry.RectF.init(0, 0, width, 760), nodes);
+        var sidebar_id: u64 = 0;
+        for (layout.nodes) |node| {
+            if (node.widget.kind == .split) {
+                sidebar_id = node.widget.children[0].id;
+                break;
+            }
+        }
+        try std.testing.expect(sidebar_id != 0);
+        var found = false;
+        for (layout.nodes) |node| {
+            if (node.widget.id != sidebar_id) continue;
+            found = true;
+            try std.testing.expectApproxEqAbs(@min(@as(f32, 420), width - 1 - 520), node.frame.width, 0.01);
+        }
+        try std.testing.expect(found);
+        try std.testing.expectApproxEqAbs(@as(f32, 420), model.sidebar_width, 0.001);
+    }
+    // A later drag uses the current viewport, not the startup window size.
+    app.update(&model, .{ .sidebar_resized = 300 / (model.canvas_width - 1) }, &fx);
+    model.canvas_width = 1180;
+    try std.testing.expectApproxEqAbs(@as(f32, 300), model.sidebarFraction() * (model.canvas_width - 1), 0.001);
+}
 
 const Stores = struct {
     tabs: *app.TabStore,

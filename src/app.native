@@ -13,10 +13,23 @@
     <separator />
 
     <if test="{hasProjects}">
-      <split grow="1" value="{sidebar_fraction}" on-resize="sidebar_resized" gap="1">
-        <use template="project-sidebar" />
-        <use template="terminal-workspace" />
-      </split>
+      <stack grow="1">
+        <if test="{sidebarDockVisible}">
+          <split grow="1" value="{sidebarFraction}" on-resize="sidebar_resized" gap="1">
+            <column min-width="{sidebarDockMinimum}">
+              <use template="project-sidebar" width="{sidebar_width}" />
+            </column>
+            <use template="terminal-workspace" />
+          </split>
+        </if>
+        <else><use template="terminal-workspace" /></else>
+        <if test="{sidebarOverlayVisible}">
+          <split grow="1" value="{sidebarOverlayFraction}" gap="1" label="Sidebar overlay">
+            <column min-width="{sidebarOverlayWidth}" background="surface"><use template="project-sidebar" width="{sidebarOverlayFullWidth}" /></column>
+            <column min-width="{canvas_width - sidebarOverlayWidth - 1}" on-press="dismiss_sidebar" label="Dismiss sidebar" />
+          </split>
+        </if>
+      </stack>
     </if>
     <else>
       <use template="project-empty-state" />

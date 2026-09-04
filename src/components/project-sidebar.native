@@ -1,7 +1,7 @@
 <!-- Projects and their discovered worktrees. -->
 <import src="tools-sidebar.native"/>
-<template name="project-sidebar">
-  <column min-width="210" background="surface">
+<template name="project-sidebar" args="width=210">
+  <column width="{width}" grow="1" background="surface">
     <row height="30" padding="8" cross="center">
       <text size="sm" foreground="text_muted" grow="1">PROJECTS</text>
       <badge>{projectCount}</badge>

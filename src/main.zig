@@ -89,7 +89,9 @@ pub const Model = struct {
     tab_store: *TabStore = undefined,
     next_tab_id: u64 = 1,
     next_pty_key: u64 = 1,
-    sidebar_fraction: f32 = 0.15,
+    sidebar_width: f32 = 210,
+    canvas_width: f32 = window_width,
+    sidebar: @import("sidebar_state.zig").State = .{},
     chrome_leading: f32 = 76,
     appearance: native_sdk.Appearance = .{},
     status_text: []const u8 = "Ready",
@@ -158,6 +160,9 @@ pub const Model = struct {
     codex_executable: workspaces.PathText = .{},
 
     pub const view_unbound = .{
+        "sidebar_width",
+        "canvas_width",
+        "sidebar",
         "terminalActionsBlocked",
         "canCloseActiveTab",
         "active_tab_by_workspace",
@@ -261,6 +266,40 @@ pub const Model = struct {
             .claude => model.claude_executable.slice(),
             .codex => model.codex_executable.slice(),
         };
+    }
+
+    // The SDK splitter speaks fractions; user intent stays in logical points.
+    // Layout clamps to pane minima without overwriting the preferred width.
+    pub fn sidebarFraction(model: *const Model) f32 {
+        return @max(0.000001, model.sidebar_width * model.sidebar.dock.value / @max(1, model.canvas_width - 1));
+    }
+
+    pub fn sidebarDockVisible(model: *const Model) bool {
+        return model.sidebar.dock.value > 0;
+    }
+
+    pub fn sidebarDockMinimum(model: *const Model) f32 {
+        return if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating()) 210 else 0;
+    }
+
+    pub fn sidebarOverlayVisible(model: *const Model) bool {
+        return model.sidebar.overlay.value > 0 or model.sidebar.overlay_open;
+    }
+
+    pub fn sidebarOverlayWidth(model: *const Model) f32 {
+        return model.sidebarOverlayFullWidth() * model.sidebar.overlay.value;
+    }
+
+    pub fn sidebarOverlayFullWidth(model: *const Model) f32 {
+        return @min(@max(280, model.sidebar_width), model.canvas_width - 80);
+    }
+
+    pub fn sidebarOverlayFraction(model: *const Model) f32 {
+        return @max(0.000001, model.sidebarOverlayWidth() / @max(1, model.canvas_width - 1));
+    }
+
+    pub fn sidebarToggleLabel(model: *const Model) []const u8 {
+        return if (if (model.sidebar.compact) model.sidebar.overlay_open else !model.sidebar.collapsed) "Hide sidebar" else "Show sidebar";
     }
 
     pub fn sidebarRows(model: *const Model, arena: std.mem.Allocator) []const workspaces.SidebarRow {
@@ -708,6 +747,8 @@ pub const Msg = union(enum) {
     store_done: native_sdk.EffectFileResult,
     terminal_event: native_sdk.EffectPtyEvent,
     sidebar_resized: f32,
+    toggle_sidebar,
+    dismiss_sidebar,
     set_appearance: native_sdk.Appearance,
     chrome_changed: native_sdk.WindowChrome,
 
@@ -1806,9 +1847,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .folder_dialog_failed => model.status_text = "The folder picker could not be opened",
         .select_workspace => |id| if (model.project_store.workspaceAvailable(id)) {
             model.active_workspace_id = id;
+            model.sidebar.overlay_open = false;
             model.status_text = "Worktree selected";
         },
-        .open_terminal => |id| openTerminal(model, fx, id),
+        .open_terminal => |id| {
+            model.sidebar.overlay_open = false;
+            openTerminal(model, fx, id);
+        },
         .open_active_terminal => openTerminal(model, fx, model.active_workspace_id),
         .activate_tab => |id| {
             for (model.tab_store.items.items) |tab| {
@@ -1941,9 +1986,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tool_check_done => |exit| handleToolCheckResult(model, exit),
         .toggle_claude_profiles => model.claude_expanded = !model.claude_expanded,
         .toggle_codex_profiles => model.codex_expanded = !model.codex_expanded,
-        .launch_claude => launchDefaultTool(model, fx, .claude),
-        .launch_codex => launchDefaultTool(model, fx, .codex),
-        .launch_profile => |id| launchProfileTool(model, fx, id),
+        .launch_claude => {
+            model.sidebar.overlay_open = false;
+            launchDefaultTool(model, fx, .claude);
+        },
+        .launch_codex => {
+            model.sidebar.overlay_open = false;
+            launchDefaultTool(model, fx, .codex);
+        },
+        .launch_profile => |id| {
+            model.sidebar.overlay_open = false;
+            launchProfileTool(model, fx, id);
+        },
         .new_profile => createProfileDraft(model),
         .select_profile => |id| selectProfile(model, id),
         .confirm_profile_switch => {
@@ -1990,7 +2044,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .git_done => |exit| handleGitResult(model, fx, exit),
         .store_done => |result| handleStoreResult(model, fx, result),
         .terminal_event => |event| handleTerminalEvent(model, fx, event),
-        .sidebar_resized => |fraction| model.sidebar_fraction = fraction,
+        .sidebar_resized => |fraction| {
+            if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating() and std.math.isFinite(fraction)) model.sidebar_width = @max(210, std.math.clamp(fraction, 0, 1) * @max(1, model.canvas_width - 1));
+        },
+        .toggle_sidebar => model.sidebar.toggle(),
+        .dismiss_sidebar => model.sidebar.overlay_open = false,
         .set_appearance => |appearance| model.appearance = appearance,
         .chrome_changed => |chrome| model.chrome_leading = @max(76, chrome.insets.left + 64),
     }
@@ -2069,7 +2127,7 @@ const app_markup_sources = [_]canvas.ui_markup.SourceFile{
     .{ .path = "components/profile-preferences.native", .source = @embedFile("components/profile-preferences.native") },
 };
 const app_compiled_sources = [_]canvas.ui_markup.SourceFile{.{ .path = "app.native", .source = app_markup }} ++ app_markup_sources;
-const CompiledCanopyView = canvas.CompiledMarkupImports(Model, Msg, "app.native", &app_compiled_sources);
+pub const CompiledCanopyView = canvas.CompiledMarkupImports(Model, Msg, "app.native", &app_compiled_sources);
 // The SDK schema generator requires STRICT tables. Electron Canopy's shipped
 // table is intentionally ordinary SQLite, so keep this tiny migration explicit
 // to preserve its structural compatibility for a future importer.
@@ -2119,6 +2177,10 @@ pub fn initialModel(tab_store: *TabStore, project_store: *workspaces.Store, prof
     return .{ .tab_store = tab_store, .project_store = project_store, .profile_store = profile_store };
 }
 
+fn sidebarKey(key: canvas.WidgetKeyboardEvent) ?Msg {
+    return if (std.ascii.eqlIgnoreCase(key.key, "escape")) .dismiss_sidebar else null;
+}
+
 fn appOptions(io: std.Io) CanopyApp.Options {
     return .{
         .name = "canopy-native-sdk-poc",
@@ -2134,6 +2196,7 @@ fn appOptions(io: std.Io) CanopyApp.Options {
         else
             null,
         .on_chrome = onChrome,
+        .on_key = sidebarKey,
     };
 }
 
@@ -2206,9 +2269,16 @@ const CanopyHost = struct {
             // This reducer arm changes only a scalar; preserve the typed
             // update route without rebuilding once for each mouse sample.
             if (pending.sidebar) |fraction| update(&host.ui_app.model, .{ .sidebar_resized = fraction }, &host.ui_app.effects);
+            // Convert the staged drag against the layout that produced it,
+            // then derive the split fraction for this frame's new width.
+            host.ui_app.model.canvas_width = event_value.gpu_surface_frame.size.width;
+            const moved = host.ui_app.model.sidebar.advance(host.ui_app.model.canvas_width, event_value.gpu_surface_frame.timestamp_ns, host.ui_app.model.appearance.reduce_motion);
             if (pending.resize) |resize| {
                 try host.ui_app.app().event(runtime, .{ .gpu_surface_resized = resize });
-            } else if (pending.sidebar != null) try host.ui_app.rebuild(runtime, 1);
+            } else if (host.ui_app.installed and (pending.sidebar != null or moved)) try host.ui_app.rebuild(runtime, 1);
+        }
+        if (event_value == .gpu_surface_resized and std.mem.eql(u8, event_value.gpu_surface_resized.label, canvas_label)) {
+            host.ui_app.model.canvas_width = event_value.gpu_surface_resized.frame.width;
         }
         try host.ui_app.app().event(runtime, event_value);
         while (host.menu.takeClose()) try host.ui_app.dispatch(runtime, 1, .close_active_tab);
@@ -2216,6 +2286,11 @@ const CanopyHost = struct {
         try host.presentPendingFolderDialog(runtime);
         if (builtin.os.tag == .macos and !host.geometry_pending.any()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
+        // Request the next display tick only while a disclosure is moving.
+        // A toggle's dispatch already requests its first frame.
+        if (host.ui_app.model.sidebar.animating()) {
+            if (runtime.findViewIndex(1, canvas_label)) |index| try runtime.requestCanvasFrameForView(index);
+        }
     }
 
     fn stageGeometry(host: *CanopyHost, event_value: native_sdk.Event) bool {

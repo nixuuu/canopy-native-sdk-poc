@@ -2,6 +2,7 @@
 <template name="app-titlebar">
   <row height="40" padding="6" gap="6" cross="center" background="surface" window-drag="true" label="Canopy title bar">
     <spacer width="{chrome_leading}" />
+    <if test="{hasProjects}"><button width="28" height="28" size="icon" variant="ghost" icon="panel-left" on-press="toggle_sidebar" label="{sidebarToggleLabel}"></button></if>
     <text size="sm" foreground="text_muted">canopy</text>
     <spacer grow="1" />
     <text size="sm">{activeWorkspaceName}</text>
