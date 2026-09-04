@@ -35,10 +35,14 @@
               <text size="sm" foreground="text_muted" grow="1" overflow="ellipsis">{tab.path}</text>
               <if test="{tab.phase == 'starting'}"><text size="sm">Starting...</text></if>
               <if test="{tab.phase == 'closing'}"><text size="sm">Closing...</text></if>
-              <if test="{tab.phase == 'exited'}"><text size="sm">Exited {tab.exit_code}</text></if>
+              <if test="{tab.phase == 'exited'}">
+                <if test="{use_ghostty}"><text size="sm">Exited</text></if>
+                <else><text size="sm">Exited {tab.exit_code}</text></else>
+              </if>
               <if test="{tab.phase == 'failed'}"><text size="sm" foreground="destructive">Failed</text></if>
             </row>
-            <terminal pty="{tab.pty}" autofocus="true" grow="1" focus-ring="background" label="{tab.title}" />
+            <if test="{use_ghostty}"><panel grow="1" label="Ghostty terminal viewport" /></if>
+            <else><terminal pty="{tab.pty}" autofocus="true" grow="1" focus-ring="background" label="{tab.title}" /></else>
           </column>
         </if>
       </for>

@@ -42,6 +42,23 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
 
+    /// Whether the user explicitly set an environment override after resets.
+    /// Used to distinguish terminal policy from inherited launcher metadata.
+    pub fn hasExplicitEnvironment(self: *const Snapshot, name: []const u8) bool {
+        var present = false;
+        for (self.entries.items) |entry| {
+            if (entry.layer != .user or !std.mem.eql(u8, entry.key, "env")) continue;
+            const setting = std.mem.trim(u8, entry.value, " \t");
+            if (setting.len == 0) {
+                present = false;
+                continue;
+            }
+            const eq = std.mem.indexOfScalar(u8, setting, '=') orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, setting[0..eq], " \t"), name)) present = setting[eq + 1 ..].len > 0;
+        }
+        return present;
+    }
+
     /// A snapshot is loaded once. Reload builds a replacement snapshot so a
     /// failed reload can never partially mutate configuration already in use.
     pub fn load(self: *Snapshot, io: std.Io, options: Options) !void {

@@ -1,4 +1,20 @@
 const std = @import("std");
+
+test "explicit NO_COLOR policy follows Ghostty environment resets" {
+    var snapshot = config.Snapshot.init(std.testing.allocator);
+    defer snapshot.deinit();
+    const a = snapshot.arena.allocator();
+    try std.testing.expect(!snapshot.hasExplicitEnvironment("NO_COLOR"));
+    try snapshot.entries.append(a, .{ .key = "env", .value = "NO_COLOR=1", .source = 0, .line = 1, .layer = .user });
+    try std.testing.expect(snapshot.hasExplicitEnvironment("NO_COLOR"));
+    try snapshot.entries.append(a, .{ .key = "env", .value = "OTHER=1", .source = 0, .line = 2, .layer = .user });
+    try std.testing.expect(snapshot.hasExplicitEnvironment("NO_COLOR"));
+    try snapshot.entries.append(a, .{ .key = "env", .value = "NO_COLOR=", .source = 0, .line = 3, .layer = .user });
+    try std.testing.expect(!snapshot.hasExplicitEnvironment("NO_COLOR"));
+    try snapshot.entries.append(a, .{ .key = "env", .value = "NO_COLOR=1", .source = 0, .line = 4, .layer = .user });
+    try snapshot.entries.append(a, .{ .key = "env", .value = "", .source = 0, .line = 5, .layer = .user });
+    try std.testing.expect(!snapshot.hasExplicitEnvironment("NO_COLOR"));
+}
 const config = @import("ghostty_config.zig");
 const testing = std.testing;
 

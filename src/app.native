@@ -22,7 +22,7 @@
       <use template="project-empty-state" />
     </else>
 
-    <status-bar>{status_text} · Native PTY / libghostty-vt · host-limited sessions</status-bar>
+    <status-bar>{status_text} · Ghostty · host-limited sessions</status-bar>
   </column>
 
   <if test="{create_dialog_open}"><use template="create-worktree-dialog" /></if>

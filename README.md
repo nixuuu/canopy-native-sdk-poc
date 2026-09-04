@@ -16,8 +16,8 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
 - dynamically allocated terminal sessions, limited by host resources rather
   than an application constant;
 - the user's actual login shell started inside the selected worktree;
-- terminal focus, input, resize, scrollback, selection, ANSI colors, and rendering
-  handled by Native SDK's `libghostty-vt` integration;
+- terminal focus, input, resize, scrollback, selection, fonts, colors and Metal
+  rendering handled by full embedded Ghostty on macOS;
 - compact Canopy-inspired chrome with a sans-serif UI and a light/dark theme
   that follows the macOS appearance and accessibility preferences;
 - an Electron Canopy-style Preferences dialog with matching 920px geometry,
@@ -29,13 +29,15 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
   groups, create/update/delete flows, unsaved-change protection, and per-tool
   running-session counters;
 - opening, activating, and closing terminal tabs;
+- Cmd+W closes the active worktree's selected tab (including its PTY), not
+  the window; it is inactive with no selected tab or while a modal is open;
 - window geometry restore and hidden-inset native macOS chrome;
 - terminal shutdown fencing: removal/detach waits for every owned PTY exit
   before mutating Git state or hiding the project.
 
 ## Run
 
-Requirements: macOS 11+, Node.js 24+, and Zig 0.16.0.
+Requirements: macOS 13+, Xcode with Metal tools, Node.js 24+, and Zig 0.16.0.
 
 ```sh
 npm install
@@ -60,11 +62,13 @@ the lazy Ghostty terminal dependency remain reproducibly pinned in
 
 ## Architecture
 
-### Ghostty configuration (read-only foundation)
+### Full Ghostty renderer and configuration
 
-The app reads Ghostty configuration once during startup, without changing the
-current Native SDK renderer or executing any directives. Inspect the snapshot
-without opening a window or modifying application storage:
+The macOS app embeds the full pinned GhosttyKit library, not only libghostty-vt.
+Ghostty owns PTY transport, emulation, CoreText font discovery/fallback, glyph
+shaping, Metal rendering, shell input and terminal queries. Native SDK owns the
+surrounding UI. Inspect the read-only configuration snapshot without opening a
+window, applying directives or modifying application storage:
 
 ```bash
 ./zig-out/bin/canopy-native-sdk-poc --inspect-ghostty-config
@@ -82,8 +86,10 @@ locations). Both `light:...,dark:...` branches are retained separately.
 The reader preserves unknown keys, repeated values, explicit resets and source
 line numbers. It is not yet Ghostty's complete typed validator/default resolver:
 conditional directives beyond paired themes, CLI overrides and hot reload are
-not interpreted. These belong to the later full Ghostty integration. Config is
-kept outside the UI model; diagnostics never dump arbitrary option values.
+not interpreted by the snapshot inspector. The renderer loads the discovered
+user files through Ghostty's typed configuration API, including themes, fonts,
+palette, padding, cursor options and custom shaders. Config is kept outside the
+UI model; diagnostics never dump arbitrary option values.
 Limits protect startup from malformed inputs: 256 KiB/file, 2 MiB total, 64 file
 attempts, 16,384 entries and 128 diagnostics. No config files are created or
 rewritten, including when no default config exists.
@@ -105,16 +111,21 @@ root; focused templates in `src/components/` render the titlebar, project
 sidebar, terminal workspace, empty state, and operation dialogs. One embedded
 component inventory feeds both Debug and ReleaseFast, preventing their import
 sets from drifting. ReleaseFast uses `CompiledMarkupImports` with no runtime
-parser or file watcher; Debug builds retain import-aware hot reload. Native SDK
-owns PTY transport and terminal emulation behind each numeric key. Tabs from
+parser or file watcher; Debug builds retain import-aware hot reload. On macOS,
+`ghostty_host.zig` reconciles tab lifecycles with `ghostty_bridge.m`, a small
+AppKit adapter for the pinned C API. Each tab owns a Ghostty surface and PTY;
+only the selected surface is adopted into one Native SDK view container.
+Background surfaces are marked occluded; switching does not restart processes.
+The native container is detached while any modal is open. Tabs from
 another worktree remain alive but are filtered from the current tab strip, so
 switching worktrees restores that worktree's last active tab.
 
 `npm test` also runs the real Ghostty session and terminal painter suites via
 `zig build test-terminal`. The upstream SDK-wide tests use an inert VT seam,
 so they are not sufficient to verify alternate screens or full-screen TUI
-rendering. Terminal frames honor synchronized-output markers, and viewport
-height is independent of its width.
+rendering in the legacy backend. These suites remain regression coverage, not
+proof of the new Metal renderer. Full-renderer verification requires a real
+macOS window; Native SDK's canvas screenshot does not capture adopted NSViews.
 
 Attached directory paths are stored under the platform app-data directory. At
 startup missing paths are discarded, repositories are rediscovered, and plain
@@ -163,12 +174,15 @@ Tool commands and worktree paths stay separate argv entries. Discovery runs
 `/usr/bin/which` inside the user's actual login shell and retains the resulting
 absolute executable path; PTY launch reuses that exact path inside the same
 login environment, so another global installation cannot win through a
-different `PATH`. No configured value is interpolated into shell source.
-Per-profile environment values use a bounded Native SDK PTY environment
-overlay, with the same protected system, linker, runtime, proxy/TLS, Git/SSH,
-and editor variable filter as Electron Canopy. The overlay is copied into the
-PTY request, merged over the host environment, and securely wiped after the
-child consumes it.
+different `PATH`. `terminal_launch.zig` serializes argv using POSIX single-quote
+escaping for Ghostty's macOS login wrapper; configured values cannot become
+shell syntax. Per-profile environment values retain the protected system,
+linker, runtime, proxy/TLS, Git/SSH and editor variable filter. The handoff owns
+its command/environment until surface creation, then releases them; Ghostty
+copies the environment into its own session. Raw values never enter UI rows.
+Inherited `NO_COLOR` from the app launcher/build tool is removed in the PTY
+child (not globally). An explicit `NO_COLOR` in a profile or Ghostty `env`
+configuration remains authoritative.
 
 Native SDK/CLI is pinned to `0.10.1` by `package-lock.json`. The reproducible
 patch in `patches/` replaces its fixed four-session tables with dynamic stores
@@ -179,33 +193,43 @@ shells such as fish do not stall during capability detection. Ghostty remains
 pinned to
 `7aa9591746ffa4d2eee458960c76554352832595` in `build.zig.zon`.
 
-Every PTY advertises `COLORTERM=truecolor` while retaining the widely available
-`xterm-256color` terminfo contract. The renderer preserves libghostty-vt's full
-ANSI/256-color palette and OSC overrides verbatim; `38;2`/`48;2` RGB colors pass
-through without quantization or theme-driven dimming.
+Ghostty owns the terminal identity and bundled terminfo resources, with
+`COLORTERM=truecolor`. Fonts and colors now come from Ghostty configuration,
+independently of the surrounding Canopy UI theme.
+
+`scripts/build-ghostty.mjs` builds GhosttyKit from the hash-verified Zig source
+dependency, caches the combined static library under `zig-out/ghostty`, and
+installs runtime resources beside the executable in `zig-out/share/ghostty`.
+Keep that directory when distributing the binary; a macOS bundle should carry
+it at `Contents/Resources/ghostty`, with `share/terminfo` copied alongside as
+`Contents/Resources/terminfo`. First compilation is substantially slower.
 
 ## Known PoC boundaries
 
 - Native SDK is pre-1.0; this PoC carries a focused patch that should eventually
   become a maintained fork or upstream contribution.
-- `ptySpawn` has no public `cwd` option. The PoC passes the worktree and selected
-  login shell as separate argv items to a minimal `/bin/sh` bootstrap, avoiding
-  path interpolation while preserving fish/zsh/bash startup behavior.
+- Full Ghostty embedding is macOS-only in this slice. The C API is internal and
+  revision-bound; updating Ghostty requires reviewing the AppKit adapter.
+- Ghostty window-management actions (splits, new windows, fullscreen, quick
+  terminal) are not implemented by Canopy. Terminal actions and new/close tab
+  bindings are handled; this is not the complete Ghostty application UI.
+- Configuration is loaded at startup, not hot-reloaded. Canopy's explicit
+  shell/tool command and worktree override Ghostty's default command/directory.
 - Tab metadata is not persisted yet; terminal processes are intentionally not
   restorable sessions.
 - Worktree creation currently covers new local branches only; attaching an
   existing branch and choosing a base branch are not implemented yet.
 - Preference compatibility currently covers startup restore and the worktree
   directory. Electron-only encrypted credentials are intentionally untouched,
-  and terminal font-size wiring awaits a Native SDK terminal typography API.
+  and terminal typography is configured in Ghostty's config file.
 - Claude/Codex API keys currently use the CLI's own login or inherited process
   environment. Native SDK has an OS credential store, but its current text
   control has no secure model-free password binding, so the PoC does not expose
   an unsafe secret field. Codex `settingsJson` is persisted compatibly; Canopy's
   hook server and `.codex/hooks.json` ref-counted lifecycle remain future work.
-- Closing a live tab keeps it in `closing` until Native SDK confirms process-tree
-  shutdown. Dynamic transport and emulator entries are then retired without
-  imposing a new application-level session limit.
+- Closing a live tab keeps it in `closing` until Ghostty surface teardown
+  completes. Callbacks use never-reused tab identities, preventing a delayed
+  callback from changing a newly opened tab that recycled a legacy PTY key.
 
 ## Next production slice
 

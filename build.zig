@@ -8,6 +8,29 @@ pub fn build(b: *std.Build) void {
         .manifest = "app.json",
         .terminal_sessions = true,
     });
+    if (app.exe.root_module.resolved_target.?.result.os.tag == .macos) {
+        const ghostty = b.lazyDependency("ghostty", .{}) orelse return;
+        const output = b.pathFromRoot("zig-out/ghostty");
+        const prepare = b.addSystemCommand(&.{ "node", "scripts/build-ghostty.mjs", ghostty.path("").getPath(b), output });
+        app.exe.step.dependOn(&prepare.step);
+        app.exe.root_module.addIncludePath(ghostty.path("include"));
+        const flags: []const []const u8 = if (b.sysroot) |sysroot|
+            &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-isysroot", sysroot, b.fmt("-I{s}/usr/include", .{sysroot}) }
+        else
+            &.{ "-fobjc-arc", "-fno-sanitize=builtin" };
+        app.exe.root_module.addCSourceFile(.{ .file = b.path("src/ghostty_bridge.m"), .flags = flags });
+        app.exe.root_module.addCSourceFile(.{ .file = b.path("src/app_menu.m"), .flags = flags });
+        app.exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ output, "lib/libghostty.a" }) });
+        for ([_][]const u8{ "Metal", "MetalKit", "CoreText", "QuartzCore", "CoreGraphics", "Carbon", "IOSurface", "IOKit" }) |framework|
+            app.exe.root_module.linkFramework(framework, .{});
+        app.exe.root_module.linkSystemLibrary("c++", .{});
+        const resources = b.addInstallDirectory(.{ .source_dir = .{ .cwd_relative = b.pathJoin(&.{ output, "share/ghostty" }) }, .install_dir = .prefix, .install_subdir = "share/ghostty" });
+        resources.step.dependOn(&prepare.step);
+        app.install.step.dependOn(&resources.step);
+        const terminfo = b.addInstallDirectory(.{ .source_dir = .{ .cwd_relative = b.pathJoin(&.{ output, "share/terminfo" }) }, .install_dir = .prefix, .install_subdir = "share/terminfo" });
+        terminfo.step.dependOn(&prepare.step);
+        app.install.step.dependOn(&terminfo.step);
+    }
 
     // SDK-wide tests use the inert VT seam. Run terminal regressions against
     // the exact Ghostty-enabled module graph used by this application's tests.

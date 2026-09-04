@@ -1,4 +1,4 @@
-//! Model-owned terminal metadata; Native SDK owns each PTY and VT emulator.
+//! Model-owned terminal metadata; the selected backend owns PTY and rendering.
 
 const std = @import("std");
 const profiles = @import("profiles.zig");
@@ -8,6 +8,7 @@ pub const Phase = enum { starting, running, closing, exited, failed };
 pub const Tool = enum { shell, claude, codex };
 
 pub const Tab = struct {
+    pending_launch: ?*@import("terminal_launch.zig").Pending = null,
     id: u64 = 0,
     workspace_id: u64 = 0,
     pty: u64 = 0,
@@ -45,6 +46,7 @@ pub const Store = struct {
 
     pub fn destroy(store: *Store) void {
         const allocator = store.allocator;
+        for (store.items.items) |tab| if (tab.pending_launch) |pending| pending.destroy();
         store.items.deinit(allocator);
         store.free_pty_keys.deinit(allocator);
         allocator.destroy(store);

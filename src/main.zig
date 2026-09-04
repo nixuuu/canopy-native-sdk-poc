@@ -1,8 +1,8 @@
 //! Canopy Native SDK proof of concept.
 //!
 //! Projects contain worktrees, worktrees own their terminal tabs, and every
-//! process mutation leaves the view as an effect. Native SDK owns the PTY,
-//! Ghostty VT state, input routing, resizing, selection, and rendering.
+//! process mutation leaves the view as a host request. On macOS full Ghostty
+//! owns the PTY and renderer; Native SDK owns the application chrome.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -81,6 +81,7 @@ const GitOperation = struct {
 };
 
 pub const Model = struct {
+    use_ghostty: bool = false,
     project_store: *workspaces.Store = undefined,
     profile_store: *profiles_mod.Store = undefined,
     active_workspace_id: u64 = 0,
@@ -157,6 +158,8 @@ pub const Model = struct {
     codex_executable: workspaces.PathText = .{},
 
     pub const view_unbound = .{
+        "terminalActionsBlocked",
+        "canCloseActiveTab",
         "active_tab_by_workspace",
         "active_workspace_id",
         "project_store",
@@ -613,6 +616,14 @@ pub const Model = struct {
         return model.active_tab_by_workspace.get(workspace_id) orelse 0;
     }
 
+    pub fn terminalActionsBlocked(model: *const Model) bool {
+        return model.preferences_open or model.create_dialog_open or model.remove_dialog_open or model.detach_dialog_open or model.profile_switch_dialog_open or model.profile_delete_dialog_open;
+    }
+
+    pub fn canCloseActiveTab(model: *const Model) bool {
+        return !model.terminalActionsBlocked() and model.activeTabId(model.active_workspace_id) != 0;
+    }
+
     fn setActiveTab(model: *Model, workspace_id: u64, tab_id: u64) void {
         model.active_tab_by_workspace.put(model.tab_store.allocator, workspace_id, tab_id) catch {};
     }
@@ -634,6 +645,7 @@ pub const Msg = union(enum) {
     previous_tab,
     next_tab,
     close_tab: u64,
+    close_active_tab,
     begin_create_worktree: u64,
     edit_create_branch: canvas.TextInputEvent,
     cancel_create_worktree,
@@ -712,6 +724,7 @@ pub const Msg = union(enum) {
         "git_done",
         "store_done",
         "terminal_event",
+        "close_active_tab",
         "set_appearance",
         "chrome_changed",
     };
@@ -1001,9 +1014,23 @@ fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
     // source. A neutral POSIX wrapper performs only the safe `cd`, then the
     // user's actual login shell owns its startup files and environment.
     const user_shell = model.userShell();
+    const argv = &.{ "/bin/sh", "-c", terminal_bootstrap, "canopy-shell", workspace.path.slice(), user_shell };
+    const env = &[_]native_sdk.PtyEnvEntry{
+        .{ .name = "SHELL", .value = user_shell },
+        .{ .name = "COLORTERM", .value = "truecolor" },
+    };
+    if (model.use_ghostty) {
+        const added = &model.tab_store.items.items[model.tab_store.items.items.len - 1];
+        added.pending_launch = @import("terminal_launch.zig").Pending.create(model.tab_store.allocator, workspace.path.slice(), argv, env) catch {
+            added.phase = .failed;
+            model.status_text = "Could not prepare Ghostty session";
+            return;
+        };
+        return;
+    }
     fx.ptySpawn(.{
         .key = pty_key,
-        .argv = &.{ "/bin/sh", "-c", terminal_bootstrap, "canopy-shell", workspace.path.slice(), user_shell },
+        .argv = argv,
         .cols = 100,
         .rows = 30,
         .term = "xterm-256color",
@@ -1017,7 +1044,8 @@ fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
 
 fn removeTab(model: *Model, fx: *Effects, index: usize) void {
     const removed = model.tab_store.items.orderedRemove(index);
-    fx.ptyForget(removed.pty);
+    if (removed.pending_launch) |pending| pending.destroy();
+    if (!model.use_ghostty) fx.ptyForget(removed.pty);
     model.tab_store.releasePtyKey(removed.pty);
 
     if (model.activeTabId(removed.workspace_id) == removed.id) {
@@ -1042,7 +1070,7 @@ fn closeTerminal(model: *Model, fx: *Effects, tab_id: u64) void {
     }
 
     model.tab_store.items.items[index].phase = .closing;
-    fx.ptyKill(model.tab_store.items.items[index].pty);
+    if (!model.use_ghostty) fx.ptyKill(model.tab_store.items.items[index].pty);
     if (model.activeTabId(model.tab_store.items.items[index].workspace_id) == tab_id) {
         var replacement: u64 = 0;
         for (model.tab_store.items.items) |tab| {
@@ -1104,7 +1132,7 @@ fn closeTabsForWorkspace(model: *Model, fx: *Effects, workspace_id: u64) void {
         if (tab.workspace_id != workspace_id or tab.phase == .closing) continue;
         if (tab.phase == .exited or tab.phase == .failed) continue;
         tab.phase = .closing;
-        fx.ptyKill(tab.pty);
+        if (!model.use_ghostty) fx.ptyKill(tab.pty);
     }
     // Already-ended tabs have no terminal event left to await.
     var index = model.tab_store.items.items.len;
@@ -1476,6 +1504,15 @@ fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mod.Pr
     };
     model.setActiveTab(workspace.id, tab_id);
     model.status_text = if (tool == .claude) "Starting Claude Code" else "Starting Codex";
+    if (model.use_ghostty) {
+        const added = &model.tab_store.items.items[model.tab_store.items.items.len - 1];
+        added.pending_launch = @import("terminal_launch.zig").Pending.create(model.tab_store.allocator, workspace.path.slice(), launch.argv(), launch.env()) catch {
+            added.phase = .failed;
+            model.status_text = "Could not prepare Ghostty session";
+            return;
+        };
+        return;
+    }
     fx.ptySpawn(.{
         .key = pty_key,
         .argv = launch.argv(),
@@ -1784,6 +1821,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .previous_tab => cycleTab(model, false),
         .next_tab => cycleTab(model, true),
         .close_tab => |id| closeTerminal(model, fx, id),
+        .close_active_tab => if (model.canCloseActiveTab()) closeTerminal(model, fx, model.activeTabId(model.active_workspace_id)),
         .begin_create_worktree => |project_id| {
             const project = model.project_store.findProject(project_id) orelse return;
             if (!project.attached or !project.is_git or model.busy()) return;
@@ -2100,6 +2138,8 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 }
 
 const CanopyHost = struct {
+    menu: @import("app_menu.zig").Host = .{},
+    terminals: @import("ghostty_host.zig").Host = .{},
     ui_app: *CanopyApp,
     io: std.Io,
     // Host-only, not Model: raw Ghostty directives can contain secrets and
@@ -2123,6 +2163,7 @@ const CanopyHost = struct {
         errdefer allocator.destroy(host);
         const ui_app = try CanopyApp.create(allocator, appOptions(io));
         ui_app.model = initialModel(tab_store, project_store, profile_store);
+        ui_app.model.use_ghostty = builtin.os.tag == .macos;
         ui_app.model.setStorePath(store_path);
         _ = ui_app.model.preferences_db_path.set(preferences_db_path);
         _ = ui_app.model.default_worktrees_base.set(default_worktrees_base);
@@ -2132,6 +2173,8 @@ const CanopyHost = struct {
     }
 
     fn destroy(host: *CanopyHost, allocator: std.mem.Allocator) void {
+        host.menu.deinit();
+        host.terminals.deinit();
         host.ui_app.model.active_tab_by_workspace.deinit(host.ui_app.model.tab_store.allocator);
         host.ui_app.destroy();
         allocator.destroy(host);
@@ -2154,8 +2197,11 @@ const CanopyHost = struct {
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
         try host.ui_app.app().event(runtime, event_value);
+        while (host.menu.takeClose()) try host.ui_app.dispatch(runtime, 1, .close_active_tab);
         try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
+        if (builtin.os.tag == .macos) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
+        try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
     }
 
     fn ensureWorktreesBase(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
@@ -2171,6 +2217,9 @@ const CanopyHost = struct {
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
+        host.menu.deinit();
+        if (builtin.os.tag == .macos) host.terminals.detach(runtime);
+        host.terminals.deinit();
         try host.ui_app.app().stop(runtime);
         host.flushProjectsOnStop() catch |err| std.debug.print("canopy: final project snapshot failed ({s})\n", .{@errorName(err)});
     }
@@ -2226,7 +2275,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
     }
-    std.debug.print("canopy: Ghostty config loaded ({d} sources, {d} diagnostics; renderer unchanged)\n", .{ ghostty_config.sources.items.len, ghostty_config.diagnostics.items.len });
+    std.debug.print("canopy: Ghostty config loaded ({d} sources, {d} diagnostics; full renderer on macOS)\n", .{ ghostty_config.sources.items.len, ghostty_config.diagnostics.items.len });
     const tab_store = try TabStore.create(std.heap.page_allocator);
     defer tab_store.destroy();
     const project_store = try workspaces.Store.create(std.heap.page_allocator);

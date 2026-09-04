@@ -521,6 +521,106 @@ test "closing and reopening Codex retires the old PTY before recycling its key" 
     try std.testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
 }
 
+test "full Ghostty owns tool PTY and keeps launch alive until host teardown" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    model.use_ghostty = true;
+    const attached = stores.projects.attachPlaceholder("/tmp/canopy-ghostty").?;
+    model.active_workspace_id = attached.workspace_id;
+    _ = try addProfile(stores, 9, .codex, "Default");
+    model.profiles_loaded = true;
+    model.tool_checks_remaining = 0;
+    model.codex_available = true;
+    try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&model, .launch_codex, &fx);
+    const first = stores.tabs.items.items[0];
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+    try std.testing.expect(std.mem.indexOf(u8, first.pending_launch.?.command, "'/usr/local/bin/codex'") != null);
+    app.update(&model, .{ .close_tab = first.id }, &fx);
+    try std.testing.expect(!fx.ptyKillRequested(first.pty));
+    try std.testing.expectEqual(app.TerminalPhase.closing, stores.tabs.items.items[0].phase);
+    app.update(&model, .{ .terminal_event = .{ .key = first.pty, .kind = .exit, .reason = .cancelled } }, &fx);
+    try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
+    app.update(&model, .launch_codex, &fx);
+    try std.testing.expect(stores.tabs.items.items[0].id != first.id);
+    try std.testing.expectEqual(first.pty, stores.tabs.items.items[0].pty);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+}
+
+test "full Ghostty shell launch bypasses Native SDK PTY" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    model.use_ghostty = true;
+    model.active_workspace_id = stores.projects.attachPlaceholder("/tmp/canopy-ghostty-shell").?.workspace_id;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&model, .open_active_terminal, &fx);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+    try std.testing.expectEqual(@as(usize, 1), stores.tabs.items.items.len);
+    try std.testing.expect(stores.tabs.items.items[0].pending_launch != null);
+}
+
+test "close active tab is worktree scoped and leaves the last tab on teardown path" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    model.use_ghostty = true;
+    const one = stores.projects.attachPlaceholder("/tmp/menu-one").?.workspace_id;
+    const two = stores.projects.attachPlaceholder("/tmp/menu-two").?.workspace_id;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    try std.testing.expect(!model.canCloseActiveTab());
+    app.update(&model, .close_active_tab, &fx);
+    model.active_workspace_id = one;
+    app.update(&model, .open_active_terminal, &fx);
+    app.update(&model, .open_active_terminal, &fx);
+    model.active_workspace_id = two;
+    app.update(&model, .open_active_terminal, &fx);
+    model.active_workspace_id = one;
+    app.update(&model, .close_active_tab, &fx);
+    try std.testing.expectEqual(app.TerminalPhase.starting, stores.tabs.items.items[0].phase);
+    try std.testing.expectEqual(app.TerminalPhase.closing, stores.tabs.items.items[1].phase);
+    try std.testing.expectEqual(app.TerminalPhase.starting, stores.tabs.items.items[2].phase);
+    try std.testing.expect(model.canCloseActiveTab());
+    app.update(&model, .close_active_tab, &fx);
+    try std.testing.expectEqual(app.TerminalPhase.closing, stores.tabs.items.items[0].phase);
+    try std.testing.expect(!model.canCloseActiveTab());
+    app.update(&model, .close_active_tab, &fx);
+    try std.testing.expectEqual(@as(usize, 3), stores.tabs.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+}
+
+test "close tab shortcut cannot close terminals behind any application modal" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    model.use_ghostty = true;
+    model.active_workspace_id = stores.projects.attachPlaceholder("/tmp/menu-modal").?.workspace_id;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&model, .open_active_terminal, &fx);
+    inline for (.{ "preferences_open", "create_dialog_open", "remove_dialog_open", "detach_dialog_open", "profile_switch_dialog_open", "profile_delete_dialog_open" }) |field| {
+        @field(model, field) = true;
+        try std.testing.expect(!model.canCloseActiveTab());
+        app.update(&model, .close_active_tab, &fx);
+        try std.testing.expectEqual(app.TerminalPhase.starting, stores.tabs.items.items[0].phase);
+        @field(model, field) = false;
+    }
+    try std.testing.expect(model.canCloseActiveTab());
+}
+
 test "profile editor saves compatible prefs JSON before reloading rows" {
     const stores = try Stores.init();
     defer stores.deinit();
