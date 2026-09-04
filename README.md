@@ -206,6 +206,12 @@ it at `Contents/Resources/ghostty`, with `share/terminfo` copied alongside as
 
 ## Rendering and resize diagnostics
 
+The main window uses AppKit's Unified Compact toolbar density. The SDK's
+`hidden_inset_tall` creates the transparent toolbar; `app_chrome.m` switches
+only that toolbar to compact after UI installation (AppKit may emit resize
+callbacks synchronously during this change). Header alignment still
+follows the OS-reported traffic-light geometry, including fullscreen changes.
+
 The header sidebar button toggles the docked project rail. Its user-selected
 width is stored in logical points, not a window percentage, and persisted in
 SQLite as the Electron-compatible `preferences` key `sidebar.width` (numeric

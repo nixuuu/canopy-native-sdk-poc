@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
             &.{ "-fobjc-arc", "-fno-sanitize=builtin" };
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/ghostty_bridge.m"), .flags = flags });
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/app_menu.m"), .flags = flags });
+        app.exe.root_module.addCSourceFile(.{ .file = b.path("src/app_chrome.m"), .flags = flags });
         const clock_module = b.createModule(.{ .target = app.exe.root_module.resolved_target, .optimize = .Debug, .link_libc = true });
         clock_module.addIncludePath(sdk.path("src/platform/macos"));
         clock_module.addCSourceFile(.{ .file = b.path("src/frame_clock_tests.m"), .flags = flags });

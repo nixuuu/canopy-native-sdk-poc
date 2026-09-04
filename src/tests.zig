@@ -163,6 +163,7 @@ test "titlebar centers controls on native traffic lights and title on the window
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
     const samples = [_]sdk.WindowChrome{
+        .{ .insets = .{ .top = 38, .left = 78 }, .buttons = sdk.geometry.RectF.init(12, 12, 54, 14) },
         .{ .insets = .{ .top = 66, .left = 98 }, .buttons = sdk.geometry.RectF.init(20, 19, 58, 14) },
         .{ .insets = .{ .top = 52, .left = 98 }, .buttons = sdk.geometry.RectF.init(20, 19, 58, 14) },
         .{ .insets = .{ .top = 64, .left = 100 }, .buttons = sdk.geometry.RectF.init(20, 24, 60, 16) },

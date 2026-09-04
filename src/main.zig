@@ -23,6 +23,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 const canvas_label = "main-canvas";
+extern fn canopy_use_compact_titlebar() void;
 const window_width: f32 = 1180;
 pub const sidebar_divider_width: f32 = 3;
 const window_height: f32 = 760;
@@ -2281,6 +2282,7 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 }
 
 const CanopyHost = struct {
+    chrome_configured: bool = false,
     geometry_pending: @import("geometry_updates.zig").Pending = .{},
     menu: @import("app_menu.zig").Host = .{},
     terminals: @import("ghostty_host.zig").Host = .{},
@@ -2366,6 +2368,13 @@ const CanopyHost = struct {
         try host.presentPendingFolderDialog(runtime);
         if (builtin.os.tag == .macos and !host.geometry_pending.any()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
+        // AppKit can synchronously emit resizes when its toolbar style changes.
+        // Do this only after UiApp has finished installation, with the guard
+        // already set so a reentrant callback cannot initialize UI twice.
+        if (builtin.os.tag == .macos and host.ui_app.installed and !host.chrome_configured) {
+            host.chrome_configured = true;
+            canopy_use_compact_titlebar();
+        }
         if (!host.geometry_pending.any() and host.ui_app.model.sidebar_persistence.canSave()) {
             if (runtime.findViewIndex(1, canvas_label)) |index| {
                 if (runtime.views[index].canvas_widget_pressed_id == 0) try host.ui_app.dispatch(runtime, 1, .save_sidebar_width);
