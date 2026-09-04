@@ -3,6 +3,7 @@
 #import <QuartzCore/QuartzCore.h>
 #include "ghostty.h"
 #include "ghostty_bridge.h"
+#include "ghostty_activity.h"
 
 @class CanopyGhosttyHost;
 @interface CanopyGhosttyView : NSView <NSTextInputClient>
@@ -15,12 +16,17 @@
 @property(nonatomic, assign) NSEventModifierFlags translationFlags;
 @property(nonatomic, strong) NSTrackingArea *tracking;
 @property(nonatomic, assign) BOOL displayVisible;
+@property(nonatomic, assign) BOOL responderFocused;
+@property(nonatomic, assign) CanopyTerminalFocusGate focusGate;
+@property(nonatomic, assign) BOOL visibilityKnown;
+@property(nonatomic, assign) BOOL appliedVisible;
 @property(nonatomic, assign) double appliedScale;
 @property(nonatomic, assign) uint32_t appliedPixelWidth;
 @property(nonatomic, assign) uint32_t appliedPixelHeight;
 @property(nonatomic, assign) uint32_t appliedDisplayID;
 - (void)syncSize;
 - (void)syncOcclusion;
+- (void)syncFocus;
 @end
 
 @interface CanopyGhosttyHost : NSObject
@@ -49,8 +55,23 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
 @implementation CanopyGhosttyView
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
-- (BOOL)becomeFirstResponder { if (self.surface) ghostty_surface_set_focus(self.surface, true); return YES; }
-- (BOOL)resignFirstResponder { if (self.surface) ghostty_surface_set_focus(self.surface, false); return YES; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    // AppKit can consume the activating click before mouseDown/local monitors.
+    // Claim the keyboard here, but do not opt into click-through: activating a
+    // terminal must not also click a button or start a selection in its TUI.
+    [self.window makeFirstResponder:self];
+    return NO;
+}
+- (BOOL)becomeFirstResponder {
+    BOOL accepted = [super becomeFirstResponder];
+    if (accepted) { self.responderFocused = YES; [self syncFocus]; }
+    return accepted;
+}
+- (BOOL)resignFirstResponder {
+    BOOL accepted = [super resignFirstResponder];
+    if (accepted) { self.responderFocused = NO; [self syncFocus]; }
+    return accepted;
+}
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
     if (self.tracking) [self removeTrackingArea:self.tracking];
@@ -63,14 +84,55 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
     // window is resized. Ghostty can resize natively even when canvas layout
     // rebuilds are coalesced to the next display tick.
     if (self.superview) self.superview.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [NSNotificationCenter.defaultCenter removeObserver:self name:NSWindowDidChangeOcclusionStateNotification object:nil];
-    if (self.window) [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(windowOcclusionChanged:) name:NSWindowDidChangeOcclusionStateNotification object:self.window];
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    [center removeObserver:self];
+    self.responderFocused = self.window && self.window.firstResponder == self;
+    if (self.window) {
+        for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
+                                          NSWindowDidChangeOcclusionStateNotification, NSWindowDidMiniaturizeNotification,
+                                          NSWindowDidDeminiaturizeNotification]) {
+            [center addObserver:self selector:@selector(activityChanged:) name:name object:self.window];
+        }
+        for (NSNotificationName name in @[NSApplicationDidBecomeActiveNotification, NSApplicationDidResignActiveNotification]) {
+            [center addObserver:self selector:@selector(activityChanged:) name:name object:NSApp];
+        }
+    }
     [self syncSize]; [self syncOcclusion];
 }
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
-- (void)windowOcclusionChanged:(NSNotification *)notification { [self syncOcclusion]; }
+- (void)activityChanged:(NSNotification *)notification { [self syncOcclusion]; }
 - (void)syncOcclusion {
-    if (self.surface) ghostty_surface_set_occlusion(self.surface,self.displayVisible && self.window && (self.window.occlusionState & NSWindowOcclusionStateVisible));
+    if (!self.surface) return;
+    BOOL visible = self.displayVisible && self.window && !self.window.miniaturized &&
+        !self.isHiddenOrHasHiddenAncestor && (self.window.occlusionState & NSWindowOcclusionStateVisible);
+    if (!self.visibilityKnown || visible != self.appliedVisible) {
+        self.visibilityKnown = YES;
+        self.appliedVisible = visible;
+        ghostty_surface_set_occlusion(self.surface, visible);
+    }
+    [self syncFocus];
+}
+- (void)syncFocus {
+    if (!self.surface) return;
+    CanopyTerminalFocusGate gate = self.focusGate;
+    CanopyTerminalFocusState state = {
+        .app_active = NSApp.active,
+        .window_key = self.window && self.window.isKeyWindow,
+        .responder = self.responderFocused,
+        .presented = self.displayVisible && self.window != nil,
+        .visible = self.appliedVisible,
+    };
+    if (CanopyTerminalFocusUpdate(&gate, state)) {
+        self.focusGate = gate;
+        ghostty_surface_set_focus(self.surface, gate.focused);
+        // Edge-only diagnostics: never log terminal contents or sample on a timer.
+        const char *trace = getenv("CANOPY_GHOSTTY_ACTIVITY_TRACE");
+        if (trace && strcmp(trace, "1") == 0) {
+            fprintf(stderr, "canopy: terminal-activity tab=%llu focus=%d app=%d key=%d responder=%d presented=%d visible=%d\n",
+                    (unsigned long long)self.tab, gate.focused, state.app_active, state.window_key,
+                    state.responder, state.presented, state.visible);
+        }
+    }
 }
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self syncSize]; }
 - (void)setFrameSize:(NSSize)size { [super setFrameSize:size]; [self syncSize]; }
@@ -278,7 +340,7 @@ void *canopy_ghostty_surface(void *raw, uint64_t tab, const char *cwd, const cha
     options.env_vars=(ghostty_env_var_s *)env; options.env_var_count=count; options.wait_after_command=true;
     view.surface=ghostty_surface_new(host.app,&options);
     if(!view.surface) return NULL;
-    host.views[@(tab)]=view; [view syncSize]; return (__bridge void *)view;
+    host.views[@(tab)]=view; [view syncSize]; [view syncOcclusion]; return (__bridge void *)view;
 }
 void canopy_ghostty_set_wakeup(void *raw, void (*notify)(void *), void *context) {
     CanopyGhosttyHost *host=(__bridge CanopyGhosttyHost *)raw;
@@ -296,14 +358,18 @@ void canopy_ghostty_visibility(void *raw, uint64_t tab, bool visible, bool focus
     view.displayVisible=visible;
     [view syncOcclusion];
     if(focus && visible) [view.window makeFirstResponder:view];
-    if(!visible) ghostty_surface_set_focus(view.surface,false);
+    [view syncFocus];
 }
 void canopy_ghostty_tick(void *raw) {
     CanopyGhosttyHost *host=(__bridge CanopyGhosttyHost *)raw;
     if(host.stopping) return;
     BOOL focused=NSApp.active;
     BOOL dark=[[NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua,NSAppearanceNameDarkAqua]] isEqualToString:NSAppearanceNameDarkAqua];
-    if(focused != host.focused) { host.focused=focused; ghostty_app_set_focus(host.app,focused); }
+    if(focused != host.focused) {
+        host.focused=focused;
+        ghostty_app_set_focus(host.app,focused);
+        for (NSNumber *tab in host.views) [host.views[tab] syncFocus];
+    }
     if(dark != host.dark) { host.dark=dark; ghostty_app_set_color_scheme(host.app,dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT); }
     ghostty_app_tick(host.app);
 }

@@ -221,6 +221,22 @@ the whole widget tree for every intermediate mouse event. Native view
 autoresizing keeps the Ghostty container fluid in between canvas frames; its
 final frame still comes from the authoritative widget layout.
 
+Terminal surface focus is synchronized separately from Ghostty's app focus:
+only a visible selected surface whose responder, window and application are
+active can be focused. Window/app notifications pause background animation
+without polling, stealing keyboard focus or stopping PTY input/output. Switching
+tabs, minimizing, detaching the renderer for a modal and reactivating the window
+all use the same edge-deduplicated policy. `CANOPY_GHOSTTY_ACTIVITY_TRACE=1` logs
+those transitions only (no terminal contents). Measure idle energy in ReleaseFast
+without automation or GPU verification enabled. A focused terminal with custom
+shaders can still animate according to Ghostty's `custom-shader-animation`
+setting; Canopy does not rewrite or silently override that configuration.
+
+An activating click in the terminal claims keyboard focus without click-through
+to the TUI. For a manual focus regression check, focus a sidebar control, switch
+to another app, then click the terminal once and type. Repeat after closing
+Preferences and switching tabs; clicks on chrome must not focus the terminal.
+
 Canvas raster caching admits layout translations, including float32 roundoff
 around identity, but not real scaling/rotation/shear. The original transform is
 applied without snapping. The cache's existing 64 MiB budget remains unchanged.

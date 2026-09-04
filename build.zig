@@ -79,4 +79,10 @@ pub fn build(b: *std.Build) void {
     const policy_tests = b.addExecutable(.{ .name = "canopy-raster-policy-tests", .root_module = policy_module });
     const run_policy_tests = b.addRunArtifact(policy_tests);
     b.top_level_steps.get("test").?.step.dependOn(&run_policy_tests.step);
+
+    const activity_module = b.createModule(.{ .target = app.tests.root_module.resolved_target, .optimize = .Debug, .link_libc = true });
+    activity_module.addCSourceFile(.{ .file = b.path("src/ghostty_activity_tests.c"), .flags = &.{"-std=c11"} });
+    const activity_tests = b.addExecutable(.{ .name = "canopy-ghostty-activity-tests", .root_module = activity_module });
+    const run_activity_tests = b.addRunArtifact(activity_tests);
+    b.top_level_steps.get("test").?.step.dependOn(&run_activity_tests.step);
 }
