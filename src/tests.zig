@@ -1,21 +1,26 @@
 const std = @import("std");
 const app = @import("main.zig");
+const profiles = @import("profiles.zig");
 const workspaces = @import("workspaces.zig");
 
 const Stores = struct {
     tabs: *app.TabStore,
     projects: *workspaces.Store,
+    profiles: *profiles.Store,
 
     fn init() !Stores {
         const tabs = try app.TabStore.create(std.testing.allocator);
         errdefer tabs.destroy();
         const projects = try workspaces.Store.create(std.testing.allocator);
-        return .{ .tabs = tabs, .projects = projects };
+        errdefer projects.destroy();
+        const profile_store = try profiles.Store.create(std.testing.allocator);
+        return .{ .tabs = tabs, .projects = projects, .profiles = profile_store };
     }
 
     fn deinit(stores: Stores) void {
         stores.tabs.destroy();
         stores.projects.destroy();
+        stores.profiles.destroy();
     }
 };
 
@@ -29,7 +34,7 @@ fn finishSpawn(fx: *app.Effects, model: *app.Model, code: i32, output_lines: []c
 test "empty store exposes the attach-project state" {
     const stores = try Stores.init();
     defer stores.deinit();
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     try std.testing.expect(!model.hasProjects());
     try std.testing.expectEqual(@as(usize, 0), model.projectCount());
@@ -38,7 +43,7 @@ test "empty store exposes the attach-project state" {
 test "attached folder appears as a selected workspace" {
     const stores = try Stores.init();
     defer stores.deinit();
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     const attached = stores.projects.attachPlaceholder("/tmp/canopy-test-project").?;
     model.active_workspace_id = attached.workspace_id;
@@ -54,13 +59,15 @@ test "attached folder appears as a selected workspace" {
 test "tabs are projected per active worktree" {
     const stores = try Stores.init();
     defer stores.deinit();
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     const one = stores.projects.attachPlaceholder("/tmp/one").?;
     const two = stores.projects.attachPlaceholder("/tmp/two").?;
     model.active_workspace_id = one.workspace_id;
     var tab_one = app.TerminalTab{ .id = 7, .workspace_id = one.workspace_id, .pty = 41 };
     _ = tab_one.title.set("one");
+    _ = tab_one.path.set("/tmp/one");
+    _ = tab_one.branch.set("main");
     var tab_two = app.TerminalTab{ .id = 8, .workspace_id = two.workspace_id, .pty = 42 };
     _ = tab_two.title.set("two");
     try stores.tabs.items.append(stores.tabs.allocator, tab_one);
@@ -72,13 +79,15 @@ test "tabs are projected per active worktree" {
     const visible = model.tabs(arena_state.allocator());
     try std.testing.expectEqual(@as(usize, 1), visible.len);
     try std.testing.expectEqual(@as(u64, 7), visible[0].id);
+    try std.testing.expectEqualStrings("one", visible[0].title);
+    try std.testing.expectEqualStrings("/tmp/one", visible[0].path);
     try std.testing.expect(visible[0].selected);
 }
 
 test "tab storage grows while rendered chrome remains bounded" {
     const stores = try Stores.init();
     defer stores.deinit();
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     const attached = stores.projects.attachPlaceholder("/tmp/many-tabs").?;
     model.active_workspace_id = attached.workspace_id;
@@ -108,7 +117,7 @@ test "new worktree flow preflights target and branch before checkout" {
         \\branch refs/heads/main
         \\
     ));
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
@@ -152,7 +161,7 @@ test "new worktree flow preflights target and branch before checkout" {
 test "Git lane keeps exactly one command in flight and never queues user work" {
     const stores = try Stores.init();
     defer stores.deinit();
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
@@ -203,7 +212,7 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
     ));
     const project = stores.projects.findProject(attached.project_id).?;
     const linked = project.worktrees.items[1].id;
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
@@ -211,6 +220,12 @@ test "worktree removal waits for PTY exit and requires force for dirty state" {
 
     app.update(&model, .{ .open_terminal = linked }, &fx);
     try std.testing.expectEqual(@as(usize, 1), stores.tabs.items.items.len);
+    const shell_request = fx.pendingPtyAt(0) orelse return error.MissingPty;
+    try std.testing.expectEqualStrings("/bin/sh", shell_request.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/removal-repo-feature", shell_request.argv[4]);
+    try std.testing.expectEqualStrings("/bin/zsh", shell_request.argv[5]);
+    try std.testing.expectEqualStrings("/bin/zsh", envValue(shell_request, "SHELL") orelse "");
+    try std.testing.expectEqualStrings("truecolor", envValue(shell_request, "COLORTERM") orelse "");
     app.update(&model, .{ .request_remove_worktree = linked }, &fx);
     try finishSpawn(&fx, &model, 0, &.{" M README.md"});
     try finishSpawn(&fx, &model, 1, &.{});
@@ -257,7 +272,7 @@ test "worktree removal asks again when the fresh preflight changed" {
         \\
     ));
     const linked = stores.projects.findProject(attached.project_id).?.worktrees.items[1].id;
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
@@ -290,7 +305,7 @@ test "project persistence coalesces writes and picker waits for restore" {
     defer stores.deinit();
     const one = stores.projects.attachPlaceholder("/tmp/persist-one").?;
     const two = stores.projects.attachPlaceholder("/tmp/persist-two").?;
-    var model = app.initialModel(stores.tabs, stores.projects);
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     try std.testing.expect(model.store_path.set("/tmp/canopy-projects.store"));
     model.restore_ready = false;
@@ -316,4 +331,181 @@ test "project persistence coalesces writes and picker waits for restore" {
     while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
     try std.testing.expectEqual(@as(usize, 1), fx.pendingFileCount());
     try std.testing.expectEqualStrings("CANOPY_PROJECTS_V1\n", fx.pendingFileAt(0).?.bytes);
+}
+
+test "preferences save commits one SQLite transaction into application state" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    model.preferences_loaded = true;
+    try std.testing.expect(model.default_worktrees_base.set("/tmp/default-worktrees"));
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    app.update(&model, .open_preferences, &fx);
+    app.update(&model, .toggle_preferences_reopen, &fx);
+    app.update(&model, .use_dark_appearance, &fx);
+    model.preferences_base_dir.set("/tmp/custom-worktrees");
+    app.update(&model, .save_preferences, &fx);
+    try std.testing.expect(model.preferences_saving);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
+
+    try fx.feedDbResult(app.preferences_write_key, .exec, .ok, "");
+    while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
+    try std.testing.expect(model.preferences_open);
+    try std.testing.expect(!model.preferences_dirty);
+    try std.testing.expect(!model.preferences_saved.reopen_last_workspace);
+    try std.testing.expectEqual(@import("preferences.zig").AppearanceMode.dark, model.preferences_saved.appearance_mode);
+    try std.testing.expectEqualStrings("/tmp/custom-worktrees", stores.projects.worktrees_base.slice());
+    try std.testing.expectEqual(@as(u64, 1), model.worktrees_base_serial);
+}
+
+fn addProfile(stores: Stores, runtime_id: u64, agent_type: profiles.AgentType, name: []const u8) !*profiles.Profile {
+    var profile = profiles.Profile{ .runtime_id = runtime_id, .agent_type = agent_type };
+    try std.testing.expect(profile.id.set(if (agent_type == .claude) "profile-claude" else "profile-codex"));
+    try std.testing.expect(profile.name.set(name));
+    profile.is_default = std.mem.eql(u8, name, "Default");
+    try stores.profiles.items.append(std.testing.allocator, profile);
+    return &stores.profiles.items.items[stores.profiles.items.items.len - 1];
+}
+
+fn envValue(request: anytype, name: []const u8) ?[]const u8 {
+    for (request.env) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
+    return null;
+}
+
+test "tool discovery keeps the final absolute executable and ignores shell chatter" {
+    try std.testing.expectEqualStrings(
+        "/Users/test/.bun/bin/codex",
+        app.resolvedToolExecutable("load config\n/opt/homebrew/bin/codex\n/Users/test/.bun/bin/codex\n") orelse "",
+    );
+    try std.testing.expect(app.resolvedToolExecutable("codex is a function\nrelative/codex\n") == null);
+}
+
+test "preferred shell accepts an absolute user shell and fails closed to zsh" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+
+    model.setUserShell("/opt/homebrew/bin/fish");
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/fish", model.userShell());
+    model.setUserShell("relative/fish");
+    try std.testing.expectEqualStrings("/bin/zsh", model.userShell());
+}
+
+test "Claude profiles launch worktree-owned PTYs with matching argv and environment" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    const attached = stores.projects.attachPlaceholder("/tmp/canopy-profile-project").?;
+    model.active_workspace_id = attached.workspace_id;
+    const profile = try addProfile(stores, 1, .claude, "Default");
+    try std.testing.expect(profile.prefs.model.set("opus"));
+    try std.testing.expect(profile.prefs.permission_mode.set("plan"));
+    try std.testing.expect(profile.prefs.base_url.set("https://proxy.example"));
+    try std.testing.expect(profile.prefs.custom_env.set("{\"CANOPY_TEST_COLOR\":\"violet\",\"PATH\":\"blocked\"}"));
+    model.profiles_loaded = true;
+    model.tool_checks_remaining = 0;
+    model.claude_available = true;
+    try std.testing.expect(model.setToolExecutable(.claude, "/usr/local/bin/claude"));
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    app.update(&model, .launch_claude, &fx);
+    const request = fx.pendingPtyAt(0) orelse return error.MissingPty;
+    try std.testing.expectEqualStrings("/bin/zsh", request.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/canopy-profile-project", request.argv[4]);
+    try std.testing.expectEqualStrings("/usr/local/bin/claude", request.argv[5]);
+    try std.testing.expectEqualStrings("--model", request.argv[6]);
+    try std.testing.expectEqualStrings("opus", request.argv[7]);
+    try std.testing.expectEqualStrings("/bin/zsh", envValue(request, "SHELL") orelse "");
+    try std.testing.expectEqualStrings("truecolor", envValue(request, "COLORTERM") orelse "");
+    try std.testing.expectEqualStrings("https://proxy.example", envValue(request, "ANTHROPIC_BASE_URL") orelse "");
+    try std.testing.expectEqualStrings("violet", envValue(request, "CANOPY_TEST_COLOR") orelse "");
+    try std.testing.expect(envValue(request, "PATH") == null);
+    try std.testing.expectEqual(app.TerminalTool.claude, stores.tabs.items.items[0].tool);
+    try std.testing.expectEqualStrings("Claude Code", stores.tabs.items.items[0].title.slice());
+
+    app.update(&model, .launch_claude, &fx);
+    try std.testing.expectEqualStrings("Claude Code #2", stores.tabs.items.items[1].title.slice());
+}
+
+test "Codex dangerous bypass takes precedence over approval sandbox and full auto" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    const attached = stores.projects.attachPlaceholder("/tmp/canopy-codex-project").?;
+    model.active_workspace_id = attached.workspace_id;
+    const profile = try addProfile(stores, 7, .codex, "Work");
+    try std.testing.expect(profile.prefs.model.set("gpt-5.6"));
+    try std.testing.expect(profile.prefs.approval_mode.set("never"));
+    try std.testing.expect(profile.prefs.sandbox.set("danger-full-access"));
+    profile.prefs.full_auto = true;
+    profile.prefs.dangerously_bypass_approvals_and_sandbox = true;
+    try std.testing.expect(profile.prefs.profile.set("work"));
+    try std.testing.expect(profile.prefs.base_url.set("https://openai.example"));
+    model.profiles_loaded = true;
+    model.tool_checks_remaining = 0;
+    model.codex_available = true;
+    model.setUserShell("/opt/homebrew/bin/fish");
+    try std.testing.expect(model.setToolExecutable(.codex, "/Users/test/.bun/bin/codex"));
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    app.update(&model, .{ .launch_profile = 7 }, &fx);
+    const request = fx.pendingPtyAt(0) orelse return error.MissingPty;
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/fish", request.argv[0]);
+    try std.testing.expectEqualStrings("/tmp/canopy-codex-project", request.argv[3]);
+    try std.testing.expectEqualStrings("/Users/test/.bun/bin/codex", request.argv[4]);
+    try std.testing.expectEqualStrings("--enable", request.argv[5]);
+    try std.testing.expectEqualStrings("hooks", request.argv[6]);
+    try std.testing.expectEqualStrings("--model", request.argv[7]);
+    try std.testing.expectEqualStrings("gpt-5.6", request.argv[8]);
+    try std.testing.expectEqualStrings("--dangerously-bypass-approvals-and-sandbox", request.argv[9]);
+    try std.testing.expectEqualStrings("--profile", request.argv[10]);
+    try std.testing.expectEqualStrings("work", request.argv[11]);
+    for (request.argv) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "--ask-for-approval"));
+        try std.testing.expect(!std.mem.eql(u8, arg, "--sandbox"));
+        try std.testing.expect(!std.mem.eql(u8, arg, "--full-auto"));
+    }
+    try std.testing.expectEqualStrings("https://openai.example", envValue(request, "OPENAI_BASE_URL") orelse "");
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/fish", envValue(request, "SHELL") orelse "");
+    try std.testing.expectEqualStrings("truecolor", envValue(request, "COLORTERM") orelse "");
+    try std.testing.expectEqualStrings("Codex (Work)", stores.tabs.items.items[0].title.slice());
+}
+
+test "profile editor saves compatible prefs JSON before reloading rows" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    _ = try addProfile(stores, 1, .codex, "Default");
+    model.preferences_loaded = true;
+    model.profiles_loaded = true;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    app.update(&model, .open_preferences, &fx);
+    app.update(&model, .show_preferences_codex, &fx);
+    model.profile_draft.model.set("gpt-5.6");
+    model.profile_draft.sandbox.set("workspace-write");
+    model.profile_draft.full_auto = true;
+    model.profile_dirty = true;
+    app.update(&model, .save_profile, &fx);
+    try std.testing.expect(model.profiles_saving);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
+
+    try fx.feedDbResult(app.profile_write_key, .exec, .ok, "");
+    while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
+    try std.testing.expect(!model.profiles_saving);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
 }

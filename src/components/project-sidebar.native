@@ -1,0 +1,35 @@
+<!-- Projects and their discovered worktrees. -->
+<import src="tools-sidebar.native"/>
+<template name="project-sidebar">
+  <column min-width="210" background="surface">
+    <row height="30" padding="8" cross="center">
+      <text size="sm" foreground="text_muted" grow="1">PROJECTS</text>
+      <badge>{projectCount}</badge>
+    </row>
+    <separator />
+    <scroll grow="1" label="Projects and worktrees">
+      <tree padding="4" gap="0">
+        <for each="sidebarRows" key="key" as="row">
+          <if test="{row.kind == 'project'}">
+            <list-item height="28" padding="4" gap="5" cross="center" role="treeitem" expanded="true" label="{row.name}">
+              <icon name="chevron-down" width="10" height="10" foreground="text_muted" />
+              <text size="sm" grow="1" wrap="false">{row.name}</text>
+              <if test="{row.is_git}"><button width="20" height="20" size="icon" variant="ghost" icon="plus" on-press="begin_create_worktree:{row.project_id}" label="New worktree" disabled="{gitBusy}"></button></if>
+              <button width="20" height="20" size="icon" variant="ghost" icon="x" on-press="request_detach_project:{row.project_id}" label="Detach project" disabled="{gitBusy}"></button>
+            </list-item>
+          </if>
+          <if test="{row.kind == 'worktree'}">
+            <list-item height="28" padding="4" gap="5" cross="center" tree-level="2" role="treeitem" selected="{row.selected}" on-press="select_workspace:{row.workspace_id}" label="{row.detail}">
+              <spacer width="14" />
+              <icon name="git-branch" width="12" height="12" foreground="text_muted" />
+              <text size="sm" grow="1" wrap="false">{row.detail}</text>
+              <if test="{row.can_remove}"><button width="20" height="20" size="icon" variant="ghost" icon="trash" on-press="request_remove_worktree:{row.workspace_id}" label="Remove worktree" disabled="{gitBusy}"></button></if>
+              <button width="20" height="20" size="icon" variant="ghost" icon="terminal" on-press="open_terminal:{row.workspace_id}" label="Open terminal"></button>
+            </list-item>
+          </if>
+        </for>
+      </tree>
+    </scroll>
+    <use template="tools-sidebar" />
+  </column>
+</template>

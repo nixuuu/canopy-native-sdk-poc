@@ -1,0 +1,77 @@
+<!-- Canopy-style tool launchers scoped to the selected worktree. -->
+<template name="tools-sidebar">
+  <column label="Tools">
+    <separator />
+    <column padding="4" gap="1">
+    <row height="24" padding="4" cross="center">
+      <text size="sm" foreground="text_muted" grow="1">TOOLS</text>
+      <if test="{toolsReady}"><button width="20" height="20" size="icon" variant="ghost" icon="settings" on-press="open_claude_preferences" label="Configure agent profiles"></button></if>
+    </row>
+
+    <if test="{toolsLoading}">
+      <text size="sm" foreground="text_muted">Discovering installed tools...</text>
+    </if>
+    <else>
+      <if test="{claude_available}">
+        <if test="{claudeHasMultipleProfiles}">
+          <list-item height="28" padding="4" gap="5" cross="center" on-press="toggle_claude_profiles" expanded="{claude_expanded}" label="Claude Code profiles">
+            <icon name="chevron-right" width="10" height="10" foreground="text_muted" />
+            <icon name="terminal" width="12" height="12" foreground="accent" />
+            <text size="sm" grow="1">Claude Code</text>
+            <if test="{claudeRunningCount > 0}"><badge>{claudeRunningCount}</badge></if>
+            <else><badge variant="outline">{claudeProfileCount}</badge></else>
+          </list-item>
+          <if test="{claude_expanded}">
+            <for each="claudeProfiles" key="key" as="profile">
+              <list-item height="24" padding="4" gap="5" cross="center" tree-level="2" on-press="launch_profile:{profile.id}" label="{profile.name}">
+                <spacer width="18" />
+                <icon name="circle-dot" width="8" height="8" foreground="text_muted" />
+                <text size="sm" grow="1" wrap="false">{profile.name}</text>
+              </list-item>
+            </for>
+          </if>
+        </if>
+        <else>
+          <list-item height="28" padding="4" gap="5" cross="center" on-press="launch_claude" label="Launch Claude Code">
+            <icon name="terminal" width="12" height="12" foreground="accent" />
+            <text size="sm" grow="1">Claude Code</text>
+            <if test="{claudeRunningCount > 0}"><badge>{claudeRunningCount}</badge></if>
+          </list-item>
+        </else>
+      </if>
+
+      <if test="{codex_available}">
+        <if test="{codexHasMultipleProfiles}">
+          <list-item height="28" padding="4" gap="5" cross="center" on-press="toggle_codex_profiles" expanded="{codex_expanded}" label="Codex profiles">
+            <icon name="chevron-right" width="10" height="10" foreground="text_muted" />
+            <icon name="terminal" width="12" height="12" foreground="accent" />
+            <text size="sm" grow="1">Codex</text>
+            <if test="{codexRunningCount > 0}"><badge>{codexRunningCount}</badge></if>
+            <else><badge variant="outline">{codexProfileCount}</badge></else>
+          </list-item>
+          <if test="{codex_expanded}">
+            <for each="codexProfiles" key="key" as="profile">
+              <list-item height="24" padding="4" gap="5" cross="center" tree-level="2" on-press="launch_profile:{profile.id}" label="{profile.name}">
+                <spacer width="18" />
+                <icon name="circle-dot" width="8" height="8" foreground="text_muted" />
+                <text size="sm" grow="1" wrap="false">{profile.name}</text>
+              </list-item>
+            </for>
+          </if>
+        </if>
+        <else>
+          <list-item height="28" padding="4" gap="5" cross="center" on-press="launch_codex" label="Launch Codex">
+            <icon name="terminal" width="12" height="12" foreground="accent" />
+            <text size="sm" grow="1">Codex</text>
+            <if test="{codexRunningCount > 0}"><badge>{codexRunningCount}</badge></if>
+          </list-item>
+        </else>
+      </if>
+
+      <if test="{noAgentToolsAvailable}">
+        <text size="sm" foreground="text_muted">No configured agent CLI is available.</text>
+      </if>
+    </else>
+    </column>
+  </column>
+</template>

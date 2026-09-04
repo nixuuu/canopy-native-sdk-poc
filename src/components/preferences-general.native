@@ -1,0 +1,15 @@
+<template name="preferences-general">
+  <column padding="24" gap="12">
+    <column gap="4">
+      <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">STARTUP</span></text>
+      <text size="sm" foreground="text_muted">Choose what Canopy restores when the application starts.</text>
+    </column>
+    <row padding="12" gap="24" cross="start">
+      <column grow="1" gap="4">
+        <text size="lg">Reopen attached projects</text>
+        <text size="sm" foreground="text_muted">Restore the previous project list when Canopy starts.</text>
+      </column>
+      <switch selected="{preferencesReopenLast}" on-toggle="toggle_preferences_reopen" label="Reopen attached projects on startup" />
+    </row>
+  </column>
+</template>

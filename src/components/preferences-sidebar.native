@@ -1,0 +1,54 @@
+<!-- Grouped 208px navigation matching Electron Canopy's Preferences sidebar. -->
+<template name="preferences-sidebar">
+  <column width="208" background="background">
+    <scroll grow="1" label="Settings sections">
+      <column padding="8" gap="1">
+        <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">GENERAL</span></text>
+        <if test="{showPreferencesGeneralNav}">
+          <list-item height="28" padding="6" gap="8" selected="{preferencesGeneralSelected}" on-press="show_preferences_general" role="tab" label="General">
+            <if test="{preferencesGeneralSelected}"><icon name="settings" width="14" height="14" foreground="accent" /></if>
+            <else><icon name="settings" width="14" height="14" foreground="text_muted" /></else>
+            <text size="lg" grow="1">General</text>
+          </list-item>
+        </if>
+
+        <spacer height="8" />
+        <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">APPEARANCE</span></text>
+        <if test="{showPreferencesAppearanceNav}">
+          <list-item height="28" padding="6" gap="8" selected="{preferencesAppearanceSelected}" on-press="show_preferences_appearance" role="tab" label="Appearance">
+            <if test="{preferencesAppearanceSelected}"><icon name="sun" width="14" height="14" foreground="accent" /></if>
+            <else><icon name="sun" width="14" height="14" foreground="text_muted" /></else>
+            <text size="lg" grow="1">Appearance</text>
+          </list-item>
+        </if>
+
+        <spacer height="8" />
+        <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">DEV TOOLS</span></text>
+        <if test="{showPreferencesWorktreesNav}">
+          <list-item height="28" padding="6" gap="8" selected="{preferencesWorktreesSelected}" on-press="show_preferences_worktrees" role="tab" label="Worktrees">
+            <if test="{preferencesWorktreesSelected}"><icon name="git-branch" width="14" height="14" foreground="accent" /></if>
+            <else><icon name="git-branch" width="14" height="14" foreground="text_muted" /></else>
+            <text size="lg" grow="1">Worktrees</text>
+          </list-item>
+        </if>
+
+        <spacer height="8" />
+        <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">AI AGENTS</span></text>
+        <if test="{showPreferencesClaudeNav}">
+          <list-item height="28" padding="6" gap="8" selected="{preferencesClaudeSelected}" on-press="show_preferences_claude" role="tab" label="Claude">
+            <if test="{preferencesClaudeSelected}"><icon name="terminal" width="14" height="14" foreground="accent" /></if>
+            <else><icon name="terminal" width="14" height="14" foreground="text_muted" /></else>
+            <text size="lg" grow="1">Claude</text>
+          </list-item>
+        </if>
+        <if test="{showPreferencesCodexNav}">
+          <list-item height="28" padding="6" gap="8" selected="{preferencesCodexSelected}" on-press="show_preferences_codex" role="tab" label="Codex">
+            <if test="{preferencesCodexSelected}"><icon name="terminal" width="14" height="14" foreground="accent" /></if>
+            <else><icon name="terminal" width="14" height="14" foreground="text_muted" /></else>
+            <text size="lg" grow="1">Codex</text>
+          </list-item>
+        </if>
+      </column>
+    </scroll>
+  </column>
+</template>

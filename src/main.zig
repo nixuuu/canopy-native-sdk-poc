@@ -5,8 +5,13 @@
 //! Ghostty VT state, input routing, resizing, selection, and rendering.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
+const preferences_mod = @import("preferences.zig");
+const profile_editor = @import("profile_editor.zig");
+const profiles_mod = @import("profiles.zig");
+const theme = @import("theme.zig");
 const workspaces = @import("workspaces.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -18,9 +23,15 @@ const canvas_label = "main-canvas";
 const window_width: f32 = 1180;
 const window_height: f32 = 760;
 const max_rendered_tab_buttons: usize = 12;
-const terminal_bootstrap = "cd -- \"$1\" && exec /bin/zsh -il";
+const fallback_user_shell = "/bin/zsh";
+const terminal_bootstrap = "cd -- \"$1\" && exec \"$2\" -l";
+const posix_tool_bootstrap = "cd -- \"$1\" && shift && exec \"$@\"";
+const fish_tool_bootstrap = "cd -- $argv[1]; and exec $argv[2..-1]";
 
 pub const TerminalPhase = enum { starting, running, closing, exited, failed };
+pub const TerminalTool = enum { shell, claude, codex };
+pub const PreferencesSection = enum { general, appearance, worktrees, claude, codex };
+const ProfileDbOperation = enum { none, save, delete };
 
 pub const TerminalTab = struct {
     id: u64 = 0,
@@ -29,6 +40,8 @@ pub const TerminalTab = struct {
     title: workspaces.NameText = .{},
     path: workspaces.PathText = .{},
     branch: workspaces.BranchText = .{},
+    tool: TerminalTool = .shell,
+    profile_id: profiles_mod.IdText = .{},
     phase: TerminalPhase = .starting,
     exit_code: i32 = 0,
 };
@@ -39,6 +52,7 @@ pub const TerminalTabRow = struct {
     title: []const u8,
     path: []const u8,
     branch: []const u8,
+    tool: TerminalTool,
     phase: TerminalPhase,
     exit_code: i32,
     selected: bool,
@@ -119,13 +133,15 @@ pub const TabStore = struct {
 
 pub const Model = struct {
     project_store: *workspaces.Store = undefined,
+    profile_store: *profiles_mod.Store = undefined,
     active_workspace_id: u64 = 0,
     active_tab_by_workspace: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     tab_store: *TabStore = undefined,
     next_tab_id: u64 = 1,
     next_pty_key: u64 = 1,
-    sidebar_fraction: f32 = 0.255,
+    sidebar_fraction: f32 = 0.15,
     chrome_leading: f32 = 76,
+    appearance: native_sdk.Appearance = .{},
     status_text: []const u8 = "Ready",
     picker_serial: u64 = 0,
     next_git_key: u64 = 10_000,
@@ -157,14 +173,49 @@ pub const Model = struct {
     next_store_key: u64 = 9_100,
     persist_write_active: bool = false,
     persist_dirty: bool = false,
+    preferences_saved: preferences_mod.Values = .{},
+    preferences_draft: preferences_mod.Values = .{},
+    preferences_open: bool = false,
+    preferences_dirty: bool = false,
+    preferences_section: PreferencesSection = .general,
+    preferences_loaded: bool = false,
+    preferences_load_valid: bool = true,
+    preferences_saving: bool = false,
+    preferences_base_dir: canvas.TextBuffer(workspaces.max_path_bytes) = .{},
+    preferences_search: canvas.TextBuffer(128) = .{},
+    preferences_db_path: workspaces.PathText = .{},
+    default_worktrees_base: workspaces.PathText = .{},
+    worktrees_base_serial: u64 = 0,
+    profiles_loaded: bool = false,
+    profiles_load_valid: bool = true,
+    profiles_saving: bool = false,
+    profile_db_operation: ProfileDbOperation = .none,
+    selected_profile_id: u64 = 0,
+    profile_draft: profile_editor.Draft = .{},
+    profile_dirty: bool = false,
+    profile_switch_dialog_open: bool = false,
+    profile_pending_select_id: u64 = 0,
+    profile_delete_dialog_open: bool = false,
+    profile_pending_delete_id: u64 = 0,
+    profile_select_after_load: profiles_mod.IdText = .{},
+    claude_expanded: bool = false,
+    codex_expanded: bool = false,
+    claude_available: bool = false,
+    codex_available: bool = false,
+    tool_checks_remaining: u8 = 2,
+    user_shell: workspaces.PathText = .{},
+    claude_executable: workspaces.PathText = .{},
+    codex_executable: workspaces.PathText = .{},
 
     pub const view_unbound = .{
         "active_tab_by_workspace",
         "active_workspace_id",
         "project_store",
+        "profile_store",
         "tab_store",
         "next_tab_id",
         "next_pty_key",
+        "appearance",
         "picker_serial",
         "next_git_key",
         "git_op",
@@ -192,8 +243,73 @@ pub const Model = struct {
         "next_store_key",
         "persist_write_active",
         "persist_dirty",
+        "preferences_saved",
+        "preferences_draft",
+        "preferences_dirty",
+        "preferences_section",
+        "preferences_loaded",
+        "preferences_load_valid",
+        "preferences_saving",
+        "preferences_base_dir",
+        "preferences_search",
+        "preferences_db_path",
+        "default_worktrees_base",
+        "worktrees_base_serial",
+        "profiles_loaded",
+        "profiles_load_valid",
+        "profiles_saving",
+        "profile_db_operation",
+        "selected_profile_id",
+        "profile_draft",
+        "profile_dirty",
+        "profile_switch_dialog_open",
+        "profile_pending_select_id",
+        "profile_delete_dialog_open",
+        "profile_pending_delete_id",
+        "profile_select_after_load",
+        "claude_expanded",
+        "codex_expanded",
+        "claude_available",
+        "codex_available",
+        "tool_checks_remaining",
+        "user_shell",
+        "userShell",
+        "claude_executable",
+        "codex_executable",
         "busy",
+        "activeWorkspacePath",
+        "activeWorkspaceBranch",
     };
+
+    pub fn setUserShell(model: *Model, shell: []const u8) void {
+        const trimmed = std.mem.trim(u8, shell, " \t\r\n");
+        model.user_shell.len = 0;
+        if (trimmed.len == 0 or !std.fs.path.isAbsolute(trimmed) or std.mem.indexOfScalar(u8, trimmed, 0) != null) return;
+        _ = model.user_shell.set(trimmed);
+    }
+
+    pub fn userShell(model: *const Model) []const u8 {
+        return if (model.user_shell.len > 0) model.user_shell.slice() else fallback_user_shell;
+    }
+
+    pub fn setToolExecutable(model: *Model, tool: TerminalTool, executable: []const u8) bool {
+        const target = switch (tool) {
+            .shell => return false,
+            .claude => &model.claude_executable,
+            .codex => &model.codex_executable,
+        };
+        target.len = 0;
+        if (executable.len == 0 or !std.fs.path.isAbsolute(executable) or std.mem.indexOfScalar(u8, executable, 0) != null) return false;
+        return target.set(executable);
+    }
+
+    pub fn toolExecutable(model: *const Model, tool: TerminalTool) []const u8 {
+        return switch (tool) {
+            .shell => model.userShell(),
+            .claude => model.claude_executable.slice(),
+            .codex => model.codex_executable.slice(),
+        };
+    }
 
     pub fn sidebarRows(model: *const Model, arena: std.mem.Allocator) []const workspaces.SidebarRow {
         return model.project_store.sidebarRows(arena, model.active_workspace_id);
@@ -216,7 +332,7 @@ pub const Model = struct {
         const out = arena.alloc(TerminalTabRow, visible_count) catch return &.{};
         var ordinal: usize = 0;
         var count: usize = 0;
-        for (stored) |tab| {
+        for (stored) |*tab| {
             if (tab.workspace_id != model.active_workspace_id) continue;
             defer ordinal += 1;
             if (ordinal < start or ordinal >= start + visible_count) continue;
@@ -226,6 +342,7 @@ pub const Model = struct {
                 .title = tab.title.slice(),
                 .path = tab.path.slice(),
                 .branch = tab.branch.slice(),
+                .tool = tab.tool,
                 .phase = tab.phase,
                 .exit_code = tab.exit_code,
                 .selected = tab.id == active,
@@ -329,6 +446,260 @@ pub const Model = struct {
         return project.name.slice();
     }
 
+    pub fn preferencesGeneralSelected(model: *const Model) bool {
+        return model.preferences_section == .general;
+    }
+
+    pub fn preferencesAppearanceSelected(model: *const Model) bool {
+        return model.preferences_section == .appearance;
+    }
+
+    pub fn preferencesWorktreesSelected(model: *const Model) bool {
+        return model.preferences_section == .worktrees;
+    }
+
+    pub fn preferencesClaudeSelected(model: *const Model) bool {
+        return model.preferences_section == .claude;
+    }
+
+    pub fn preferencesCodexSelected(model: *const Model) bool {
+        return model.preferences_section == .codex;
+    }
+
+    pub fn preferencesProfileSelected(model: *const Model) bool {
+        return model.preferences_section == .claude or model.preferences_section == .codex;
+    }
+
+    fn preferencesBasicSelected(model: *const Model) bool {
+        return !model.preferencesProfileSelected();
+    }
+
+    pub fn preferencesShowSave(model: *const Model) bool {
+        return model.preferencesBasicSelected() and model.preferences_dirty;
+    }
+
+    pub fn preferencesSectionTitle(model: *const Model) []const u8 {
+        return switch (model.preferences_section) {
+            .general => "General",
+            .appearance => "Appearance",
+            .worktrees => "Worktrees",
+            .claude => "Claude",
+            .codex => "Codex",
+        };
+    }
+
+    pub fn preferencesSectionDescription(model: *const Model) []const u8 {
+        return switch (model.preferences_section) {
+            .general => "Startup behavior and workspace restoration",
+            .appearance => "Application color mode and accessibility",
+            .worktrees => "Defaults used when creating Git worktrees",
+            .claude => "Claude Code integration",
+            .codex => "Codex integration",
+        };
+    }
+
+    pub fn preferencesSearchText(model: *const Model) []const u8 {
+        return model.preferences_search.text();
+    }
+
+    pub fn showPreferencesGeneralNav(model: *const Model) bool {
+        return model.preferencesSearchMatches("General startup reopen workspace status");
+    }
+
+    pub fn showPreferencesAppearanceNav(model: *const Model) bool {
+        return model.preferencesSearchMatches("Appearance theme color mode accessibility");
+    }
+
+    pub fn showPreferencesWorktreesNav(model: *const Model) bool {
+        return model.preferencesSearchMatches("Worktrees Git directory base path");
+    }
+
+    pub fn showPreferencesClaudeNav(model: *const Model) bool {
+        return model.preferencesSearchMatches("Claude Anthropic model permission effort provider");
+    }
+
+    pub fn showPreferencesCodexNav(model: *const Model) bool {
+        return model.preferencesSearchMatches("Codex OpenAI model approval sandbox profile");
+    }
+
+    pub fn preferencesReopenLast(model: *const Model) bool {
+        return model.preferences_draft.reopen_last_workspace;
+    }
+
+    pub fn preferencesAppearanceSystem(model: *const Model) bool {
+        return model.preferences_draft.appearance_mode == .system;
+    }
+
+    pub fn preferencesAppearanceLight(model: *const Model) bool {
+        return model.preferences_draft.appearance_mode == .light;
+    }
+
+    pub fn preferencesAppearanceDark(model: *const Model) bool {
+        return model.preferences_draft.appearance_mode == .dark;
+    }
+
+    pub fn preferencesBaseDirText(model: *const Model) []const u8 {
+        return model.preferences_base_dir.text();
+    }
+
+    pub fn preferencesBaseDirInvalid(model: *const Model) bool {
+        const value = std.mem.trim(u8, model.preferences_base_dir.text(), " ");
+        return value.len > 0 and !std.fs.path.isAbsolute(value);
+    }
+
+    pub fn preferencesSaveDisabled(model: *const Model) bool {
+        return model.preferences_saving or !model.preferences_dirty or model.preferencesBaseDirInvalid();
+    }
+
+    pub fn preferencesDisabled(model: *const Model) bool {
+        return !model.preferences_loaded or model.preferences_saving or model.profiles_saving;
+    }
+
+    pub fn preferencesSaveLabel(model: *const Model) []const u8 {
+        return if (model.preferences_saving) "Saving..." else "Save";
+    }
+
+    pub fn preferencesDefaultBaseDir(model: *const Model) []const u8 {
+        return model.default_worktrees_base.slice();
+    }
+
+    pub fn toolsReady(model: *const Model) bool {
+        return model.profiles_loaded and model.tool_checks_remaining == 0;
+    }
+
+    pub fn toolsLoading(model: *const Model) bool {
+        return !model.toolsReady();
+    }
+
+    pub fn noAgentToolsAvailable(model: *const Model) bool {
+        return !model.claude_available and !model.codex_available;
+    }
+
+    pub fn claudeHasMultipleProfiles(model: *const Model) bool {
+        return model.profile_store.count(.claude) > 1;
+    }
+
+    pub fn codexHasMultipleProfiles(model: *const Model) bool {
+        return model.profile_store.count(.codex) > 1;
+    }
+
+    pub fn claudeProfileCount(model: *const Model) usize {
+        return model.profile_store.count(.claude);
+    }
+
+    pub fn codexProfileCount(model: *const Model) usize {
+        return model.profile_store.count(.codex);
+    }
+
+    pub fn claudeProfiles(model: *const Model, arena: std.mem.Allocator) []const profiles_mod.ProfileRow {
+        return model.profile_store.rows(arena, .claude, 0);
+    }
+
+    pub fn codexProfiles(model: *const Model, arena: std.mem.Allocator) []const profiles_mod.ProfileRow {
+        return model.profile_store.rows(arena, .codex, 0);
+    }
+
+    pub fn profileRows(model: *const Model, arena: std.mem.Allocator) []const profiles_mod.ProfileRow {
+        const agent_type: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
+        return model.profile_store.rows(arena, agent_type, model.selected_profile_id);
+    }
+
+    pub fn claudeRunningCount(model: *const Model) usize {
+        return model.runningCount(.claude);
+    }
+
+    pub fn codexRunningCount(model: *const Model) usize {
+        return model.runningCount(.codex);
+    }
+
+    pub fn profileNameText(model: *const Model) []const u8 {
+        return model.profile_draft.name.text();
+    }
+
+    pub fn profileModelText(model: *const Model) []const u8 {
+        return model.profile_draft.model.text();
+    }
+
+    pub fn profileBaseUrlText(model: *const Model) []const u8 {
+        return model.profile_draft.base_url.text();
+    }
+
+    pub fn profileAppendPromptText(model: *const Model) []const u8 {
+        return model.profile_draft.append_system_prompt.text();
+    }
+
+    pub fn profileCustomEnvText(model: *const Model) []const u8 {
+        return model.profile_draft.custom_env.text();
+    }
+
+    pub fn profileSettingsJsonText(model: *const Model) []const u8 {
+        return model.profile_draft.settings_json.text();
+    }
+
+    pub fn profileCodexConfigProfileText(model: *const Model) []const u8 {
+        return model.profile_draft.profile.text();
+    }
+
+    pub fn profilePermissionValue(model: *const Model) []const u8 {
+        return model.profile_draft.permission_mode.text();
+    }
+
+    pub fn profileEffortValue(model: *const Model) []const u8 {
+        return model.profile_draft.effort_level.text();
+    }
+
+    pub fn profileProviderValue(model: *const Model) []const u8 {
+        return model.profile_draft.provider.text();
+    }
+
+    pub fn profileApprovalValue(model: *const Model) []const u8 {
+        return model.profile_draft.approval_mode.text();
+    }
+
+    pub fn profileSandboxValue(model: *const Model) []const u8 {
+        return model.profile_draft.sandbox.text();
+    }
+
+    pub fn profileFullAuto(model: *const Model) bool {
+        return model.profile_draft.full_auto;
+    }
+
+    pub fn profileDangerousBypass(model: *const Model) bool {
+        return model.profile_draft.dangerously_bypass_approvals_and_sandbox;
+    }
+
+    pub fn profileSaveDisabled(model: *const Model) bool {
+        const name = std.mem.trim(u8, model.profile_draft.name.text(), " ");
+        return model.profiles_saving or !model.profile_dirty or name.len == 0;
+    }
+
+    pub fn profileSaveLabel(model: *const Model) []const u8 {
+        return if (model.profiles_saving) "Saving..." else "Save profile";
+    }
+
+    pub fn profileDeleteName(model: *const Model) []const u8 {
+        const profile = model.profile_store.find(model.profile_pending_delete_id) orelse return "profile";
+        return profile.name.slice();
+    }
+
+    fn runningCount(model: *const Model, tool: TerminalTool) usize {
+        var count: usize = 0;
+        for (model.tab_store.items.items) |tab| {
+            if (tab.workspace_id == model.active_workspace_id and tab.tool == tool and tab.phase != .closing and tab.phase != .exited and tab.phase != .failed) count += 1;
+        }
+        return count;
+    }
+
+    fn preferencesSearchMatches(model: *const Model, haystack: []const u8) bool {
+        const needle = std.mem.trim(u8, model.preferences_search.text(), " ");
+        if (needle.len == 0) return true;
+        if (needle.len > haystack.len) return false;
+        for (0..haystack.len - needle.len + 1) |start| {
+            if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+        }
+        return false;
+    }
+
     fn activeTabId(model: *const Model, workspace_id: u64) u64 {
         return model.active_tab_by_workspace.get(workspace_id) orelse 0;
     }
@@ -364,19 +735,75 @@ pub const Msg = union(enum) {
     request_detach_project: u64,
     cancel_detach_project,
     confirm_detach_project,
+    open_preferences,
+    open_claude_preferences,
+    close_preferences,
+    show_preferences_general,
+    show_preferences_appearance,
+    show_preferences_worktrees,
+    show_preferences_claude,
+    show_preferences_codex,
+    edit_preferences_search: canvas.TextInputEvent,
+    toggle_preferences_reopen,
+    use_system_appearance,
+    use_light_appearance,
+    use_dark_appearance,
+    edit_preferences_base_dir: canvas.TextInputEvent,
+    save_preferences,
+    preferences_load_done: native_sdk.EffectDbResult,
+    preferences_db_done: native_sdk.EffectDbResult,
+    worktrees_base_failed,
+    profiles_load_done: native_sdk.EffectDbResult,
+    profile_db_done: native_sdk.EffectDbResult,
+    tool_check_done: native_sdk.EffectExit,
+    toggle_claude_profiles,
+    toggle_codex_profiles,
+    launch_claude,
+    launch_codex,
+    launch_profile: u64,
+    new_profile,
+    select_profile: u64,
+    confirm_profile_switch,
+    cancel_profile_switch,
+    request_delete_profile: u64,
+    confirm_delete_profile,
+    cancel_delete_profile,
+    save_profile,
+    edit_profile_name: canvas.TextInputEvent,
+    edit_profile_model: canvas.TextInputEvent,
+    edit_profile_permission_mode: canvas.TextInputEvent,
+    edit_profile_effort_level: canvas.TextInputEvent,
+    edit_profile_provider: canvas.TextInputEvent,
+    edit_profile_approval_mode: canvas.TextInputEvent,
+    edit_profile_sandbox: canvas.TextInputEvent,
+    edit_profile_base_url: canvas.TextInputEvent,
+    edit_profile_append_prompt: canvas.TextInputEvent,
+    edit_profile_custom_env: canvas.TextInputEvent,
+    edit_profile_settings_json: canvas.TextInputEvent,
+    edit_profile_codex_profile: canvas.TextInputEvent,
+    toggle_profile_full_auto,
+    toggle_profile_dangerous_bypass,
     git_done: native_sdk.EffectExit,
     store_done: native_sdk.EffectFileResult,
     terminal_event: native_sdk.EffectPtyEvent,
     sidebar_resized: f32,
+    set_appearance: native_sdk.Appearance,
     chrome_changed: native_sdk.WindowChrome,
 
     pub const view_unbound = .{
         "folder_selected",
         "folder_dialog_cancelled",
         "folder_dialog_failed",
+        "preferences_load_done",
+        "preferences_db_done",
+        "worktrees_base_failed",
+        "profiles_load_done",
+        "profile_db_done",
+        "tool_check_done",
         "git_done",
         "store_done",
         "terminal_event",
+        "set_appearance",
         "chrome_changed",
     };
 };
@@ -661,14 +1088,20 @@ fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
     model.setActiveTab(workspace_id, tab_id);
     model.status_text = "Starting login shell";
 
-    // The path is argv data, not interpolated shell source. $1 lets zsh do a
-    // safe `cd` even when a future configured project contains whitespace.
+    // The workspace and preferred shell are argv data, not interpolated shell
+    // source. A neutral POSIX wrapper performs only the safe `cd`, then the
+    // user's actual login shell owns its startup files and environment.
+    const user_shell = model.userShell();
     fx.ptySpawn(.{
         .key = pty_key,
-        .argv = &.{ "/bin/zsh", "-c", terminal_bootstrap, "canopy", workspace.path.slice() },
+        .argv = &.{ "/bin/sh", "-c", terminal_bootstrap, "canopy-shell", workspace.path.slice(), user_shell },
         .cols = 100,
         .rows = 30,
         .term = "xterm-256color",
+        .env = &.{
+            .{ .name = "SHELL", .value = user_shell },
+            .{ .name = "COLORTERM", .value = "truecolor" },
+        },
         .on_event = Effects.ptyMsg(.terminal_event),
     });
 }
@@ -808,6 +1241,477 @@ fn maybeFinishPendingTeardown(model: *Model, fx: *Effects) void {
     }
 }
 
+pub const preferences_write_key: u64 = 8_001;
+const preferences_upsert_sql = "INSERT OR REPLACE INTO preferences (key, value) VALUES (?1, ?2);";
+
+fn openPreferences(model: *Model) void {
+    if (!model.preferences_loaded or model.preferences_saving) return;
+    model.preferences_draft = model.preferences_saved;
+    model.preferences_base_dir.set(model.preferences_saved.worktrees_base_dir.slice());
+    model.preferences_search.clear();
+    model.preferences_dirty = false;
+    model.preferences_section = .general;
+    model.preferences_open = true;
+    model.status_text = "Preferences opened";
+}
+
+fn closePreferences(model: *Model) void {
+    if (model.preferences_saving or model.profiles_saving) return;
+    model.preferences_draft = model.preferences_saved;
+    model.preferences_base_dir.clear();
+    model.preferences_search.clear();
+    model.preferences_dirty = false;
+    model.preferences_open = false;
+    model.profile_switch_dialog_open = false;
+    model.profile_delete_dialog_open = false;
+    model.profile_dirty = false;
+    if (model.profile_store.find(model.selected_profile_id)) |profile| model.profile_draft.load(profile);
+    model.status_text = "Preferences unchanged";
+}
+
+fn savePreferences(model: *Model, fx: *Effects) void {
+    if (!model.preferences_open or !model.preferences_dirty or model.preferences_saving or model.preferencesBaseDirInvalid()) return;
+    const base_dir = std.mem.trim(u8, model.preferences_base_dir.text(), " ");
+    model.preferences_draft.worktrees_base_dir.len = 0;
+    if (base_dir.len > 0 and !model.preferences_draft.worktrees_base_dir.set(base_dir)) {
+        model.status_text = "Worktree base directory is too long";
+        return;
+    }
+
+    const reopen_value = if (model.preferences_draft.reopen_last_workspace) "true" else "false";
+    const appearance_value = @tagName(model.preferences_draft.appearance_mode);
+    const statements = [_]native_sdk.EffectDbStatement{
+        .{ .sql = preferences_upsert_sql, .params = &.{ .{ .text = preferences_mod.key_reopen_last_workspace }, .{ .text = reopen_value } } },
+        .{ .sql = preferences_upsert_sql, .params = &.{ .{ .text = preferences_mod.key_native_appearance }, .{ .text = appearance_value } } },
+        .{ .sql = preferences_upsert_sql, .params = &.{ .{ .text = preferences_mod.key_worktrees_base_dir }, .{ .text = model.preferences_draft.worktrees_base_dir.slice() } } },
+    };
+    model.preferences_saving = true;
+    model.status_text = "Saving preferences";
+    fx.dbExec(.{
+        .key = preferences_write_key,
+        .statements = &statements,
+        .on_result = Effects.dbMsg(.preferences_db_done),
+    });
+}
+
+fn commitPreferences(model: *Model) void {
+    model.preferences_saved = model.preferences_draft;
+    const base_dir = if (model.preferences_saved.worktrees_base_dir.len > 0)
+        model.preferences_saved.worktrees_base_dir.slice()
+    else
+        model.default_worktrees_base.slice();
+    _ = model.project_store.setWorktreesBase(base_dir);
+    model.worktrees_base_serial +%= 1;
+    model.preferences_saving = false;
+    model.preferences_dirty = false;
+    model.status_text = "Preferences saved";
+}
+
+pub const profiles_load_key: u64 = 8_002;
+pub const profile_write_key: u64 = 8_003;
+const claude_check_key: u64 = 8_100;
+const codex_check_key: u64 = 8_101;
+
+fn loadProfileDraft(model: *Model, runtime_id: u64) void {
+    const profile = model.profile_store.find(runtime_id) orelse return;
+    model.selected_profile_id = runtime_id;
+    model.profile_draft.load(profile);
+    model.profile_dirty = false;
+}
+
+fn openProfileSection(model: *Model, agent_type: profiles_mod.AgentType) void {
+    if (!model.profiles_loaded or model.profiles_saving) return;
+    model.preferences_section = switch (agent_type) {
+        .claude => .claude,
+        .codex => .codex,
+    };
+    const selected = model.profile_store.find(model.selected_profile_id);
+    if (selected == null or selected.?.agent_type != agent_type) {
+        if (model.profile_store.default(agent_type)) |profile| loadProfileDraft(model, profile.runtime_id);
+    }
+}
+
+fn reloadProfiles(model: *Model, fx: *Effects, select_database_id: []const u8) void {
+    model.profile_store.clear();
+    model.profiles_loaded = false;
+    model.profiles_load_valid = true;
+    model.profile_select_after_load.len = 0;
+    _ = model.profile_select_after_load.set(select_database_id);
+    fx.dbQuery(.{
+        .key = profiles_load_key,
+        .sql = profiles_mod.load_sql,
+        .on_result = Effects.dbMsg(.profiles_load_done),
+    });
+}
+
+fn finishProfilesLoad(model: *Model) void {
+    model.profiles_loaded = model.profiles_load_valid;
+    if (!model.profiles_loaded) {
+        model.status_text = "Agent profiles could not be loaded";
+        return;
+    }
+    const selected = if (model.profile_select_after_load.len > 0)
+        model.profile_store.findByDatabaseId(model.profile_select_after_load.slice())
+    else
+        null;
+    if (selected) |profile| {
+        loadProfileDraft(model, profile.runtime_id);
+    } else {
+        const agent_type: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
+        if (model.profile_store.default(agent_type)) |profile| loadProfileDraft(model, profile.runtime_id);
+    }
+    model.profile_select_after_load.len = 0;
+}
+
+fn uniqueNewProfileName(model: *const Model, agent_type: profiles_mod.AgentType, out: []u8) ?[]const u8 {
+    if (!model.profile_store.nameExists(agent_type, "New profile", 0)) return "New profile";
+    var suffix: usize = 2;
+    while (suffix < 1000) : (suffix += 1) {
+        const candidate = std.fmt.bufPrint(out, "New profile {d}", .{suffix}) catch return null;
+        if (!model.profile_store.nameExists(agent_type, candidate, 0)) return candidate;
+    }
+    return null;
+}
+
+fn createProfileDraft(model: *Model) void {
+    if (!model.profiles_loaded or model.profiles_saving or !model.preferencesProfileSelected()) return;
+    const agent_type: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
+    var name_buffer: [profiles_mod.max_profile_name_bytes]u8 = undefined;
+    const name = uniqueNewProfileName(model, agent_type, &name_buffer) orelse {
+        model.status_text = "Could not allocate a profile name";
+        return;
+    };
+    var id_buffer: [profiles_mod.max_profile_id_bytes]u8 = undefined;
+    const database_id = model.profile_store.newDatabaseId(agent_type, &id_buffer) orelse {
+        model.status_text = "Could not allocate a profile id";
+        return;
+    };
+    model.selected_profile_id = 0;
+    model.profile_draft.create(agent_type, name, model.profile_store.nextSortIndex(agent_type), database_id);
+    model.profile_dirty = true;
+    model.status_text = "New profile draft";
+}
+
+fn selectProfile(model: *Model, runtime_id: u64) void {
+    if (runtime_id == model.selected_profile_id or model.profiles_saving) return;
+    if (model.profile_dirty) {
+        model.profile_pending_select_id = runtime_id;
+        model.profile_switch_dialog_open = true;
+        return;
+    }
+    loadProfileDraft(model, runtime_id);
+}
+
+fn profileChoiceValid(value: []const u8, allowed: []const []const u8) bool {
+    if (value.len == 0) return true;
+    for (allowed) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
+    return false;
+}
+
+fn profileDraftValid(model: *Model) bool {
+    const draft = &model.profile_draft;
+    const valid = switch (draft.agent_type) {
+        .claude => profileChoiceValid(draft.permission_mode.text(), &.{ "plan", "auto", "acceptEdits", "bypassPermissions" }) and
+            profileChoiceValid(draft.effort_level.text(), &.{ "low", "medium", "high", "xhigh", "max" }) and
+            profileChoiceValid(draft.provider.text(), &.{ "bedrock", "vertex", "foundry" }),
+        .codex => profileChoiceValid(draft.approval_mode.text(), &.{ "untrusted", "on-request", "never" }) and
+            profileChoiceValid(draft.sandbox.text(), &.{ "read-only", "workspace-write", "danger-full-access" }),
+    };
+    if (!valid) model.status_text = "One or more profile choices are invalid";
+    return valid;
+}
+
+fn saveProfile(model: *Model, fx: *Effects) void {
+    if (!model.profiles_loaded or model.profiles_saving or !model.profile_dirty) return;
+    const name = std.mem.trim(u8, model.profile_draft.name.text(), " ");
+    if (name.len == 0) {
+        model.status_text = "Profile name is required";
+        return;
+    }
+    if (model.profile_store.nameExists(model.profile_draft.agent_type, name, model.profile_draft.runtime_id)) {
+        model.status_text = "A profile with this name already exists";
+        return;
+    }
+    if (!profileDraftValid(model)) return;
+    const prefs = model.profile_draft.toPrefs();
+    var json_buffer: [profiles_mod.max_long_pref_bytes * 3]u8 = undefined;
+    const prefs_json = profiles_mod.encodePrefs(&prefs, &json_buffer) orelse {
+        model.status_text = "Profile settings are too large";
+        return;
+    };
+    const statements = if (model.profile_draft.is_new)
+        [_]native_sdk.EffectDbStatement{.{
+            .sql = "INSERT INTO agent_profiles (id, agent_type, name, is_default, sort_index, prefs_json, api_key_enc) VALUES (?1, ?2, ?3, 0, ?4, ?5, NULL);",
+            .params = &.{
+                .{ .text = model.profile_draft.database_id.text() },
+                .{ .text = @tagName(model.profile_draft.agent_type) },
+                .{ .text = name },
+                .{ .integer = model.profile_draft.sort_index },
+                .{ .text = prefs_json },
+            },
+        }}
+    else
+        [_]native_sdk.EffectDbStatement{.{
+            .sql = "UPDATE agent_profiles SET name = ?1, prefs_json = ?2, sort_index = ?3, updated_at = datetime('now') WHERE id = ?4;",
+            .params = &.{
+                .{ .text = name },
+                .{ .text = prefs_json },
+                .{ .integer = model.profile_draft.sort_index },
+                .{ .text = model.profile_draft.database_id.text() },
+            },
+        }};
+    model.profiles_saving = true;
+    model.profile_db_operation = .save;
+    model.status_text = "Saving agent profile";
+    fx.dbExec(.{
+        .key = profile_write_key,
+        .statements = &statements,
+        .on_result = Effects.dbMsg(.profile_db_done),
+    });
+}
+
+fn deleteProfile(model: *Model, fx: *Effects) void {
+    const profile = model.profile_store.find(model.profile_pending_delete_id) orelse return;
+    if (model.profile_store.count(profile.agent_type) <= 1 or model.profiles_saving) return;
+    const statements = [_]native_sdk.EffectDbStatement{.{
+        .sql = "DELETE FROM agent_profiles WHERE id = ?1;",
+        .params = &.{.{ .text = profile.id.slice() }},
+    }};
+    model.profile_delete_dialog_open = false;
+    model.profiles_saving = true;
+    model.profile_db_operation = .delete;
+    model.profile_select_after_load.len = 0;
+    model.status_text = "Deleting agent profile";
+    fx.dbExec(.{
+        .key = profile_write_key,
+        .statements = &statements,
+        .on_result = Effects.dbMsg(.profile_db_done),
+    });
+}
+
+fn startToolChecks(model: *Model, fx: *Effects) void {
+    model.tool_checks_remaining = 2;
+    model.claude_available = false;
+    model.codex_available = false;
+    model.claude_executable.len = 0;
+    model.codex_executable.len = 0;
+    const shell = model.userShell();
+    // Absolute /usr/bin/which resolves external executables from the PATH
+    // produced by the user's login shell, ignoring aliases/functions. The
+    // collected path is reused verbatim for PTY launch so discovery and start
+    // cannot drift to different global installations.
+    fx.spawn(.{ .key = claude_check_key, .argv = &.{ shell, "-lc", "/usr/bin/which claude" }, .output = .collect, .on_exit = Effects.exitMsg(.tool_check_done) });
+    fx.spawn(.{ .key = codex_check_key, .argv = &.{ shell, "-lc", "/usr/bin/which codex" }, .output = .collect, .on_exit = Effects.exitMsg(.tool_check_done) });
+}
+
+pub fn resolvedToolExecutable(output: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or !std.fs.path.isAbsolute(line) or std.mem.indexOfScalar(u8, line, 0) != null) continue;
+        result = line;
+    }
+    return result;
+}
+
+const ToolArgv = struct {
+    items: [32][]const u8 = undefined,
+    len: usize = 0,
+
+    fn append(argv: *ToolArgv, value: []const u8) bool {
+        if (argv.len == argv.items.len) return false;
+        argv.items[argv.len] = value;
+        argv.len += 1;
+        return true;
+    }
+
+    fn slice(argv: *const ToolArgv) []const []const u8 {
+        return argv.items[0..argv.len];
+    }
+};
+
+const ToolEnv = struct {
+    items: [native_sdk.max_effect_pty_env_entries]native_sdk.PtyEnvEntry = undefined,
+    len: usize = 0,
+
+    fn put(env: *ToolEnv, name: []const u8, value: []const u8) bool {
+        if (name.len == 0 or env.len == env.items.len) return false;
+        env.items[env.len] = .{ .name = name, .value = value };
+        env.len += 1;
+        return true;
+    }
+
+    fn putOptional(env: *ToolEnv, name: []const u8, value: []const u8) bool {
+        return value.len == 0 or env.put(name, value);
+    }
+
+    fn slice(env: *const ToolEnv) []const native_sdk.PtyEnvEntry {
+        return env.items[0..env.len];
+    }
+};
+
+const blocked_tool_env = [_][]const u8{
+    "PATH",                "HOME",                         "USER",                "SHELL",                 "TERM",
+    "LD_PRELOAD",          "LD_LIBRARY_PATH",              "LD_AUDIT",            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH", "NODE_OPTIONS",                 "NODE_EXTRA_CA_CERTS", "ELECTRON_RUN_AS_NODE",  "PYTHONPATH",
+    "PYTHONHOME",          "RUBYLIB",                      "PERL5LIB",            "CLASSPATH",             "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",       "GIT_SSH_COMMAND",              "GIT_ASKPASS",         "SSH_AUTH_SOCK",         "EDITOR",
+    "VISUAL",              "HTTP_PROXY",                   "HTTPS_PROXY",         "ALL_PROXY",             "FTP_PROXY",
+    "NO_PROXY",            "SSL_CERT_FILE",                "SSL_CERT_DIR",        "REQUESTS_CA_BUNDLE",    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",      "NODE_TLS_REJECT_UNAUTHORIZED", "CC",                  "CXX",                   "LDFLAGS",
+    "CFLAGS",              "CANOPY_HOOK_PORT",             "CANOPY_HOOK_PATH",    "CANOPY_HOOK_TOKEN",
+};
+
+fn toolEnvAllowed(name: []const u8) bool {
+    for (blocked_tool_env) |blocked| if (std.ascii.eqlIgnoreCase(name, blocked)) return false;
+    return true;
+}
+
+fn appendCustomEnv(env: *ToolEnv, arena: std.mem.Allocator, source: []const u8) void {
+    if (source.len == 0) return;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{}) catch return;
+    const object = switch (parsed) {
+        .object => |value| value,
+        else => return,
+    };
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!toolEnvAllowed(entry.key_ptr.*)) continue;
+        const value = switch (entry.value_ptr.*) {
+            .string => |text| text,
+            else => continue,
+        };
+        _ = env.put(entry.key_ptr.*, value);
+    }
+}
+
+fn appendPair(argv: *ToolArgv, flag: []const u8, value: []const u8) bool {
+    if (value.len == 0) return true;
+    return argv.append(flag) and argv.append(value);
+}
+
+fn toolAvailable(model: *const Model, tool: TerminalTool) bool {
+    return switch (tool) {
+        .shell => true,
+        .claude => model.claude_available and model.claude_executable.len > 0,
+        .codex => model.codex_available and model.codex_executable.len > 0,
+    };
+}
+
+fn toolTitle(model: *const Model, workspace_id: u64, tool: TerminalTool, profile: *const profiles_mod.Profile, out: []u8) ?[]const u8 {
+    var base_buffer: [profiles_mod.max_profile_name_bytes + 32]u8 = undefined;
+    const base = if (profile.name.eql("Default"))
+        profile.agent_type.displayName()
+    else
+        std.fmt.bufPrint(&base_buffer, "{s} ({s})", .{ profile.agent_type.displayName(), profile.name.slice() }) catch return null;
+    var same: usize = 0;
+    for (model.tab_store.items.items) |tab| {
+        if (tab.workspace_id == workspace_id and tab.tool == tool) {
+            const title = tab.title.slice();
+            const numbered = title.len > base.len + 2 and std.mem.startsWith(u8, title, base) and std.mem.eql(u8, title[base.len .. base.len + 2], " #");
+            if (std.mem.eql(u8, title, base) or numbered) same += 1;
+        }
+    }
+    if (same == 0) return std.fmt.bufPrint(out, "{s}", .{base}) catch null;
+    return std.fmt.bufPrint(out, "{s} #{d}", .{ base, same + 1 }) catch null;
+}
+
+fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mod.Profile) void {
+    const workspace = model.project_store.findWorktree(model.active_workspace_id) orelse return;
+    if (!workspace.active) return;
+    const tool: TerminalTool = switch (profile.agent_type) {
+        .claude => .claude,
+        .codex => .codex,
+    };
+    if (!toolAvailable(model, tool)) {
+        model.status_text = if (tool == .claude) "Claude Code is not available in the login shell" else "Codex is not available in the login shell";
+        return;
+    }
+
+    var argv: ToolArgv = .{};
+    var env: ToolEnv = .{};
+    var env_arena = std.heap.ArenaAllocator.init(model.tab_store.allocator);
+    defer env_arena.deinit();
+    const shell = model.userShell();
+    const executable = model.toolExecutable(tool);
+    if (executable.len == 0 or !env.put("SHELL", shell) or !env.put("COLORTERM", "truecolor")) return;
+    if (std.mem.eql(u8, std.fs.path.basename(shell), "fish")) {
+        const required = [_][]const u8{ shell, "-lc", fish_tool_bootstrap, workspace.path.slice(), executable };
+        for (required) |arg| if (!argv.append(arg)) return;
+    } else {
+        const required = [_][]const u8{ shell, "-lc", posix_tool_bootstrap, "canopy-tool", workspace.path.slice(), executable };
+        for (required) |arg| if (!argv.append(arg)) return;
+    }
+    const prefs = &profile.prefs;
+    switch (profile.agent_type) {
+        .claude => {
+            if (!appendPair(&argv, "--settings", prefs.settings_json.slice())) return;
+            if (!appendPair(&argv, "--model", prefs.model.slice())) return;
+            if (!appendPair(&argv, "--permission-mode", prefs.permission_mode.slice())) return;
+            if (!appendPair(&argv, "--effort", prefs.effort_level.slice())) return;
+            if (!appendPair(&argv, "--append-system-prompt", prefs.append_system_prompt.slice())) return;
+            if (!env.putOptional("ANTHROPIC_BASE_URL", prefs.base_url.slice())) return;
+            if (prefs.provider.eql("bedrock") and !env.put("CLAUDE_CODE_USE_BEDROCK", "1")) return;
+            if (prefs.provider.eql("vertex") and !env.put("CLAUDE_CODE_USE_VERTEX", "1")) return;
+            if (prefs.provider.eql("foundry") and !env.put("CLAUDE_CODE_USE_FOUNDRY", "1")) return;
+        },
+        .codex => {
+            if (!argv.append("--enable") or !argv.append("hooks")) return;
+            if (!appendPair(&argv, "--model", prefs.model.slice())) return;
+            if (prefs.dangerously_bypass_approvals_and_sandbox) {
+                if (!argv.append("--dangerously-bypass-approvals-and-sandbox")) return;
+            } else {
+                if (!appendPair(&argv, "--ask-for-approval", prefs.approval_mode.slice())) return;
+                if (!appendPair(&argv, "--sandbox", prefs.sandbox.slice())) return;
+                if (prefs.full_auto and !argv.append("--full-auto")) return;
+            }
+            if (!appendPair(&argv, "--profile", prefs.profile.slice())) return;
+            if (!env.putOptional("OPENAI_BASE_URL", prefs.base_url.slice())) return;
+        },
+    }
+    appendCustomEnv(&env, env_arena.allocator(), prefs.custom_env.slice());
+
+    const tab_id = model.next_tab_id;
+    const pty_key = model.tab_store.allocatePtyKey(&model.next_pty_key);
+    model.next_tab_id +%= 1;
+    var title_buffer: [workspaces.max_name_bytes]u8 = undefined;
+    const title = toolTitle(model, workspace.id, tool, profile, &title_buffer) orelse profile.agent_type.displayName();
+    var tab = TerminalTab{ .id = tab_id, .workspace_id = workspace.id, .pty = pty_key, .tool = tool };
+    _ = tab.title.set(title);
+    _ = tab.path.set(workspace.path.slice());
+    _ = tab.branch.set(workspace.branch.slice());
+    _ = tab.profile_id.set(profile.id.slice());
+    model.tab_store.items.append(model.tab_store.allocator, tab) catch {
+        model.tab_store.releasePtyKey(pty_key);
+        model.status_text = "The host could not allocate another tool tab";
+        return;
+    };
+    model.setActiveTab(workspace.id, tab_id);
+    model.status_text = if (tool == .claude) "Starting Claude Code" else "Starting Codex";
+    fx.ptySpawn(.{
+        .key = pty_key,
+        .argv = argv.slice(),
+        .cols = 100,
+        .rows = 30,
+        .term = "xterm-256color",
+        .env = env.slice(),
+        .on_event = Effects.ptyMsg(.terminal_event),
+    });
+}
+
+fn launchDefaultTool(model: *Model, fx: *Effects, agent_type: profiles_mod.AgentType) void {
+    if (!model.profiles_loaded) return;
+    const profile = model.profile_store.default(agent_type) orelse return;
+    spawnProfileTool(model, fx, profile);
+}
+
+fn launchProfileTool(model: *Model, fx: *Effects, runtime_id: u64) void {
+    if (!model.profiles_loaded) return;
+    const profile = model.profile_store.find(runtime_id) orelse return;
+    spawnProfileTool(model, fx, profile);
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .open_folder => if (!model.restore_ready) {
@@ -922,6 +1826,182 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.pending_detach_project_id = project_id;
             closeTabsForProject(model, fx, project_id);
             maybeFinishPendingTeardown(model, fx);
+        },
+        .open_preferences => openPreferences(model),
+        .open_claude_preferences => {
+            openPreferences(model);
+            openProfileSection(model, .claude);
+        },
+        .close_preferences => closePreferences(model),
+        .show_preferences_general => model.preferences_section = .general,
+        .show_preferences_appearance => model.preferences_section = .appearance,
+        .show_preferences_worktrees => model.preferences_section = .worktrees,
+        .show_preferences_claude => openProfileSection(model, .claude),
+        .show_preferences_codex => openProfileSection(model, .codex),
+        .edit_preferences_search => |edit| model.preferences_search.apply(edit),
+        .toggle_preferences_reopen => {
+            model.preferences_draft.reopen_last_workspace = !model.preferences_draft.reopen_last_workspace;
+            model.preferences_dirty = true;
+        },
+        .use_system_appearance => {
+            model.preferences_draft.appearance_mode = .system;
+            model.preferences_dirty = true;
+        },
+        .use_light_appearance => {
+            model.preferences_draft.appearance_mode = .light;
+            model.preferences_dirty = true;
+        },
+        .use_dark_appearance => {
+            model.preferences_draft.appearance_mode = .dark;
+            model.preferences_dirty = true;
+        },
+        .edit_preferences_base_dir => |edit| {
+            model.preferences_base_dir.apply(edit);
+            model.preferences_dirty = true;
+        },
+        .save_preferences => savePreferences(model, fx),
+        .preferences_load_done => |result| {
+            if (result.key != preferences_load_key) return;
+            switch (result.kind) {
+                .page => {
+                    if (result.outcome != .ok or !preferences_mod.decodePage(&model.preferences_saved, result.bytes)) model.preferences_load_valid = false;
+                },
+                .done => {
+                    if (result.outcome != .ok) model.preferences_load_valid = false;
+                    finishPreferencesLoad(model, fx);
+                },
+                .exec => model.preferences_load_valid = false,
+            }
+        },
+        .preferences_db_done => |result| {
+            if (result.key != preferences_write_key or result.kind != .exec) return;
+            if (result.outcome == .ok) {
+                commitPreferences(model);
+            } else {
+                model.preferences_saving = false;
+                model.status_text = if (result.outcome == .busy) "Preferences database is busy; try again" else "Preferences could not be saved";
+            }
+        },
+        .worktrees_base_failed => model.status_text = "Worktree base directory could not be created",
+        .profiles_load_done => |result| {
+            if (result.key != profiles_load_key) return;
+            switch (result.kind) {
+                .page => {
+                    if (result.outcome != .ok or !model.profile_store.appendEncodedPage(result.bytes)) model.profiles_load_valid = false;
+                },
+                .done => {
+                    if (result.outcome != .ok) model.profiles_load_valid = false;
+                    finishProfilesLoad(model);
+                },
+                .exec => model.profiles_load_valid = false,
+            }
+        },
+        .profile_db_done => |result| {
+            if (result.key != profile_write_key or result.kind != .exec) return;
+            const operation = model.profile_db_operation;
+            model.profile_db_operation = .none;
+            model.profiles_saving = false;
+            if (result.outcome != .ok) {
+                model.status_text = if (result.outcome == .busy) "Profiles database is busy; try again" else "Agent profile could not be saved";
+                return;
+            }
+            const select_id = if (operation == .save) model.profile_draft.database_id.text() else "";
+            model.profile_dirty = false;
+            reloadProfiles(model, fx, select_id);
+            model.status_text = if (operation == .delete) "Agent profile deleted" else "Agent profile saved";
+        },
+        .tool_check_done => |exit| {
+            const resolved = if (exit.reason == .exited and exit.code == 0) resolvedToolExecutable(exit.output) else null;
+            if (exit.key == claude_check_key) {
+                model.claude_available = if (resolved) |path| model.setToolExecutable(.claude, path) else false;
+            } else if (exit.key == codex_check_key) {
+                model.codex_available = if (resolved) |path| model.setToolExecutable(.codex, path) else false;
+            } else return;
+            if (model.tool_checks_remaining > 0) model.tool_checks_remaining -= 1;
+        },
+        .toggle_claude_profiles => model.claude_expanded = !model.claude_expanded,
+        .toggle_codex_profiles => model.codex_expanded = !model.codex_expanded,
+        .launch_claude => launchDefaultTool(model, fx, .claude),
+        .launch_codex => launchDefaultTool(model, fx, .codex),
+        .launch_profile => |id| launchProfileTool(model, fx, id),
+        .new_profile => createProfileDraft(model),
+        .select_profile => |id| selectProfile(model, id),
+        .confirm_profile_switch => {
+            const id = model.profile_pending_select_id;
+            model.profile_pending_select_id = 0;
+            model.profile_switch_dialog_open = false;
+            model.profile_dirty = false;
+            loadProfileDraft(model, id);
+        },
+        .cancel_profile_switch => {
+            model.profile_pending_select_id = 0;
+            model.profile_switch_dialog_open = false;
+        },
+        .request_delete_profile => |id| if (!model.profiles_saving) {
+            model.profile_pending_delete_id = id;
+            model.profile_delete_dialog_open = true;
+        },
+        .confirm_delete_profile => deleteProfile(model, fx),
+        .cancel_delete_profile => {
+            model.profile_pending_delete_id = 0;
+            model.profile_delete_dialog_open = false;
+        },
+        .save_profile => saveProfile(model, fx),
+        .edit_profile_name => |edit| {
+            model.profile_draft.name.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_model => |edit| {
+            model.profile_draft.model.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_permission_mode => |edit| {
+            model.profile_draft.permission_mode.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_effort_level => |edit| {
+            model.profile_draft.effort_level.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_provider => |edit| {
+            model.profile_draft.provider.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_approval_mode => |edit| {
+            model.profile_draft.approval_mode.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_sandbox => |edit| {
+            model.profile_draft.sandbox.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_base_url => |edit| {
+            model.profile_draft.base_url.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_append_prompt => |edit| {
+            model.profile_draft.append_system_prompt.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_custom_env => |edit| {
+            model.profile_draft.custom_env.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_settings_json => |edit| {
+            model.profile_draft.settings_json.apply(edit);
+            model.profile_dirty = true;
+        },
+        .edit_profile_codex_profile => |edit| {
+            model.profile_draft.profile.apply(edit);
+            model.profile_dirty = true;
+        },
+        .toggle_profile_full_auto => {
+            model.profile_draft.full_auto = !model.profile_draft.full_auto;
+            model.profile_dirty = true;
+        },
+        .toggle_profile_dangerous_bypass => {
+            model.profile_draft.dangerously_bypass_approvals_and_sandbox = !model.profile_draft.dangerously_bypass_approvals_and_sandbox;
+            model.profile_dirty = true;
         },
         .git_done => |exit| {
             if (model.git_op.kind == .none or exit.key != model.git_op.key) return;
@@ -1101,12 +2181,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .sidebar_resized => |fraction| model.sidebar_fraction = fraction,
+        .set_appearance => |appearance| model.appearance = appearance,
         .chrome_changed => |chrome| model.chrome_leading = @max(76, chrome.insets.left + 64),
     }
 }
 
-pub fn boot(model: *Model, fx: *Effects) void {
-    if (model.store_path.len > 0) {
+pub const preferences_load_key: u64 = 8_000;
+
+fn beginProjectRestore(model: *Model, fx: *Effects) void {
+    if (!model.preferences_saved.reopen_last_workspace) {
+        model.restore_ready = true;
+        model.status_text = "Ready";
+    } else if (model.store_path.len > 0) {
         fx.readFile(.{
             .key = store_read_key,
             .path = model.store_path.slice(),
@@ -1117,12 +2203,94 @@ pub fn boot(model: *Model, fx: *Effects) void {
     }
 }
 
+fn finishPreferencesLoad(model: *Model, fx: *Effects) void {
+    if (!model.preferences_load_valid) model.preferences_saved = .{};
+    model.preferences_draft = model.preferences_saved;
+    model.preferences_loaded = true;
+    const base_dir = if (model.preferences_saved.worktrees_base_dir.len > 0)
+        model.preferences_saved.worktrees_base_dir.slice()
+    else
+        model.default_worktrees_base.slice();
+    _ = model.project_store.setWorktreesBase(base_dir);
+    model.worktrees_base_serial +%= 1;
+    beginProjectRestore(model, fx);
+}
+
+pub fn boot(model: *Model, fx: *Effects) void {
+    model.status_text = "Loading preferences";
+    fx.dbQuery(.{
+        .key = preferences_load_key,
+        .sql = preferences_mod.load_sql,
+        .on_result = Effects.dbMsg(.preferences_load_done),
+    });
+    reloadProfiles(model, fx, "");
+    startToolChecks(model, fx);
+}
+
 pub fn onChrome(chrome: native_sdk.WindowChrome) ?Msg {
     return .{ .chrome_changed = chrome };
 }
 
+pub fn onAppearance(appearance: native_sdk.Appearance) ?Msg {
+    return .{ .set_appearance = appearance };
+}
+
+pub fn canopyTokens(model: *const Model) canvas.DesignTokens {
+    const selected = if (model.preferences_open) &model.preferences_draft else &model.preferences_saved;
+    return theme.tokens(selected.effectiveAppearance(model.appearance));
+}
+
 pub const AppUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
+const app_markup_sources = [_]canvas.ui_markup.SourceFile{
+    .{ .path = "components/primitives.native", .source = @embedFile("components/primitives.native") },
+    .{ .path = "components/titlebar.native", .source = @embedFile("components/titlebar.native") },
+    .{ .path = "components/project-sidebar.native", .source = @embedFile("components/project-sidebar.native") },
+    .{ .path = "components/tools-sidebar.native", .source = @embedFile("components/tools-sidebar.native") },
+    .{ .path = "components/terminal-workspace.native", .source = @embedFile("components/terminal-workspace.native") },
+    .{ .path = "components/empty-state.native", .source = @embedFile("components/empty-state.native") },
+    .{ .path = "components/dialogs.native", .source = @embedFile("components/dialogs.native") },
+    .{ .path = "components/preferences.native", .source = @embedFile("components/preferences.native") },
+    .{ .path = "components/preferences-header.native", .source = @embedFile("components/preferences-header.native") },
+    .{ .path = "components/preferences-sidebar.native", .source = @embedFile("components/preferences-sidebar.native") },
+    .{ .path = "components/preferences-general.native", .source = @embedFile("components/preferences-general.native") },
+    .{ .path = "components/preferences-appearance.native", .source = @embedFile("components/preferences-appearance.native") },
+    .{ .path = "components/preferences-worktrees.native", .source = @embedFile("components/preferences-worktrees.native") },
+    .{ .path = "components/profile-preferences.native", .source = @embedFile("components/profile-preferences.native") },
+};
+const app_compiled_sources = [_]canvas.ui_markup.SourceFile{
+    .{ .path = "app.native", .source = app_markup },
+    .{ .path = "components/primitives.native", .source = @embedFile("components/primitives.native") },
+    .{ .path = "components/titlebar.native", .source = @embedFile("components/titlebar.native") },
+    .{ .path = "components/project-sidebar.native", .source = @embedFile("components/project-sidebar.native") },
+    .{ .path = "components/tools-sidebar.native", .source = @embedFile("components/tools-sidebar.native") },
+    .{ .path = "components/terminal-workspace.native", .source = @embedFile("components/terminal-workspace.native") },
+    .{ .path = "components/empty-state.native", .source = @embedFile("components/empty-state.native") },
+    .{ .path = "components/dialogs.native", .source = @embedFile("components/dialogs.native") },
+    .{ .path = "components/preferences.native", .source = @embedFile("components/preferences.native") },
+    .{ .path = "components/preferences-header.native", .source = @embedFile("components/preferences-header.native") },
+    .{ .path = "components/preferences-sidebar.native", .source = @embedFile("components/preferences-sidebar.native") },
+    .{ .path = "components/preferences-general.native", .source = @embedFile("components/preferences-general.native") },
+    .{ .path = "components/preferences-appearance.native", .source = @embedFile("components/preferences-appearance.native") },
+    .{ .path = "components/preferences-worktrees.native", .source = @embedFile("components/preferences-worktrees.native") },
+    .{ .path = "components/profile-preferences.native", .source = @embedFile("components/profile-preferences.native") },
+};
+const CompiledCanopyView = canvas.CompiledMarkupImports(Model, Msg, "app.native", &app_compiled_sources);
+// The SDK schema generator requires STRICT tables. Electron Canopy's shipped
+// table is intentionally ordinary SQLite, so keep this tiny migration explicit
+// to preserve its structural compatibility for a future importer.
+const preferences_migrations = [_]native_sdk.relational_store.Migration{
+    .{
+        .version = 1,
+        .name = "electron-compatible-preferences",
+        .sql = preferences_mod.ensure_schema_sql,
+    },
+    .{
+        .version = 2,
+        .name = "electron-compatible-agent-profiles",
+        .sql = profiles_mod.migration_sql,
+    },
+};
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
@@ -1153,8 +2321,8 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
-pub fn initialModel(tab_store: *TabStore, project_store: *workspaces.Store) Model {
-    return .{ .tab_store = tab_store, .project_store = project_store };
+pub fn initialModel(tab_store: *TabStore, project_store: *workspaces.Store, profile_store: *profiles_mod.Store) Model {
+    return .{ .tab_store = tab_store, .project_store = project_store, .profile_store = profile_store };
 }
 
 fn appOptions(io: std.Io) CanopyApp.Options {
@@ -1164,7 +2332,13 @@ fn appOptions(io: std.Io) CanopyApp.Options {
         .canvas_label = canvas_label,
         .update_fx = update,
         .init_fx = boot,
-        .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = io },
+        .tokens_fn = canopyTokens,
+        .on_appearance = onAppearance,
+        .view = CompiledCanopyView.build,
+        .markup = if (builtin.mode == .Debug)
+            .{ .source = app_markup, .sources = &app_markup_sources, .watch_path = "src/app.native", .io = io }
+        else
+            null,
         .on_chrome = onChrome,
     };
 }
@@ -1173,13 +2347,27 @@ const CanopyHost = struct {
     ui_app: *CanopyApp,
     io: std.Io,
     handled_picker_serial: u64 = 0,
+    handled_worktrees_base_serial: u64 = 0,
 
-    fn create(allocator: std.mem.Allocator, io: std.Io, tab_store: *TabStore, project_store: *workspaces.Store, store_path: []const u8) !*CanopyHost {
+    fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        tab_store: *TabStore,
+        project_store: *workspaces.Store,
+        profile_store: *profiles_mod.Store,
+        store_path: []const u8,
+        preferences_db_path: []const u8,
+        default_worktrees_base: []const u8,
+        user_shell: []const u8,
+    ) !*CanopyHost {
         const host = try allocator.create(CanopyHost);
         errdefer allocator.destroy(host);
         const ui_app = try CanopyApp.create(allocator, appOptions(io));
-        ui_app.model = initialModel(tab_store, project_store);
+        ui_app.model = initialModel(tab_store, project_store, profile_store);
         ui_app.model.setStorePath(store_path);
+        _ = ui_app.model.preferences_db_path.set(preferences_db_path);
+        _ = ui_app.model.default_worktrees_base.set(default_worktrees_base);
+        ui_app.model.setUserShell(user_shell);
         host.* = .{ .ui_app = ui_app, .io = io };
         return host;
     }
@@ -1207,7 +2395,19 @@ const CanopyHost = struct {
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
         try host.ui_app.app().event(runtime, event_value);
+        try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
+    }
+
+    fn ensureWorktreesBase(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
+        const serial = host.ui_app.model.worktrees_base_serial;
+        if (serial == host.handled_worktrees_base_serial) return;
+        host.handled_worktrees_base_serial = serial;
+        const path = host.ui_app.model.project_store.worktrees_base.slice();
+        if (path.len == 0) return;
+        std.Io.Dir.cwd().createDirPath(host.io, path) catch {
+            try host.ui_app.dispatch(runtime, 1, .worktrees_base_failed);
+        };
     }
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
@@ -1258,24 +2458,37 @@ pub fn main(init: std.process.Init) !void {
     defer tab_store.destroy();
     const project_store = try workspaces.Store.create(std.heap.page_allocator);
     defer project_store.destroy();
+    const profile_store = try profiles_mod.Store.create(std.heap.page_allocator);
+    defer profile_store.destroy();
     const env = native_sdk.debug.envFromMap(init.environ_map);
+    const user_shell = init.environ_map.get("SHELL") orelse fallback_user_shell;
     const platform = native_sdk.app_dirs.currentPlatform();
     var worktree_base_buffer: [workspaces.max_path_bytes]u8 = undefined;
-    if (env.home) |home| {
-        if (std.fmt.bufPrint(&worktree_base_buffer, "{s}/canopy/worktrees", .{home})) |base| {
-            if (project_store.setWorktreesBase(base)) {
-                std.Io.Dir.cwd().createDirPath(init.io, base) catch {};
-            }
-        } else |_| {}
-    }
+    const home = env.home orelse return error.MissingHome;
+    const default_worktrees_base = try std.fmt.bufPrint(&worktree_base_buffer, "{s}/canopy/worktrees", .{home});
+    if (!project_store.setWorktreesBase(default_worktrees_base)) return error.InvalidWorktreesBase;
+    std.Io.Dir.cwd().createDirPath(init.io, default_worktrees_base) catch {};
     var data_dir_buffer: [workspaces.max_path_bytes]u8 = undefined;
     var store_path_buffer: [workspaces.max_path_bytes]u8 = undefined;
+    var preferences_db_path_buffer: [workspaces.max_path_bytes]u8 = undefined;
     var store_path: []const u8 = "";
+    var preferences_db_path: []const u8 = "";
     if (native_sdk.app_dirs.resolveOne(.{ .name = "tech.itsol.canopy.native-poc" }, platform, env, .data, &data_dir_buffer)) |data_dir| {
         std.Io.Dir.cwd().createDirPath(init.io, data_dir) catch {};
         store_path = native_sdk.app_dirs.join(platform, &store_path_buffer, &.{ data_dir, "projects.store" }) catch "";
+        preferences_db_path = native_sdk.app_dirs.join(platform, &preferences_db_path_buffer, &.{ data_dir, "app.db" }) catch "";
     } else |_| {}
-    const host = try CanopyHost.create(std.heap.page_allocator, init.io, tab_store, project_store, store_path);
+    const host = try CanopyHost.create(
+        std.heap.page_allocator,
+        init.io,
+        tab_store,
+        project_store,
+        profile_store,
+        store_path,
+        preferences_db_path,
+        default_worktrees_base,
+        user_shell,
+    );
     defer host.destroy(std.heap.page_allocator);
 
     try runner.runWithOptions(host.app(), .{
@@ -1285,6 +2498,7 @@ pub fn main(init: std.process.Init) !void {
         .icon_path = "assets/icon.png",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .js_window_api = false,
+        .relational_migrations = &preferences_migrations,
         .security = .{
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
@@ -1294,4 +2508,6 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("tests.zig");
+    _ = @import("profiles.zig");
+    _ = @import("theme.zig");
 }

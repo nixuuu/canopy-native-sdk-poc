@@ -1,0 +1,51 @@
+<!-- Electron Canopy-style Preferences shell and section routing. -->
+<import src="preferences-header.native"/>
+<import src="preferences-sidebar.native"/>
+<import src="preferences-general.native"/>
+<import src="preferences-appearance.native"/>
+<import src="preferences-worktrees.native"/>
+<import src="profile-preferences.native"/>
+<template name="preferences-dialog">
+  <panel background="scrim" label="Preferences backdrop">
+    <column grow="1" main="center" cross="center">
+      <dialog width="920" height="668" background="background" label="Preferences" on-dismiss="close_preferences">
+        <column grow="1">
+          <use template="preferences-header" />
+          <separator />
+
+          <row grow="1">
+            <use template="preferences-sidebar" />
+            <separator width="1" />
+
+            <column grow="1">
+              <row height="64" gap="12" cross="center">
+                <spacer width="28" />
+                <column grow="1" gap="4">
+                  <text size="heading">{preferencesSectionTitle}</text>
+                  <text size="sm" foreground="text_muted">{preferencesSectionDescription}</text>
+                </column>
+                <if test="{preferences_dirty}"><text size="sm" foreground="warning">Unsaved changes</text></if>
+                <if test="{preferencesShowSave}">
+                  <button height="28" variant="secondary" on-press="save_preferences" disabled="{preferencesSaveDisabled}" label="Save preferences">{preferencesSaveLabel}</button>
+                </if>
+                <spacer width="28" />
+              </row>
+              <separator />
+
+              <if test="{preferencesProfileSelected}">
+                <use template="profile-preferences" />
+              </if>
+              <else>
+                <scroll grow="1" label="Preference controls">
+                  <if test="{preferencesGeneralSelected}"><use template="preferences-general" /></if>
+                  <if test="{preferencesAppearanceSelected}"><use template="preferences-appearance" /></if>
+                  <if test="{preferencesWorktreesSelected}"><use template="preferences-worktrees" /></if>
+                </scroll>
+              </else>
+            </column>
+          </row>
+        </column>
+      </dialog>
+    </column>
+  </panel>
+</template>

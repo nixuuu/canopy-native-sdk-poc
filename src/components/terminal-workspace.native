@@ -1,0 +1,55 @@
+<!-- Worktree-local terminal tab strip and the single visible renderer. -->
+<import src="primitives.native"/>
+<template name="terminal-workspace">
+  <column min-width="520" background="background">
+    <if test="{hasTabs}">
+      <row height="32" background="surface" cross="center">
+        <button width="24" height="24" size="icon" variant="ghost" icon="chevron-left" on-press="previous_tab" label="Previous terminal"></button>
+        <scroll axis="horizontal" overscroll="none" grow="1" label="Terminal tabs">
+          <row height="32" background="surface">
+            <for each="tabs" key="id" as="tab">
+            <list-item width="180" height="32" padding="6" gap="5" cross="center" role="tab" selected="{tab.selected}" on-press="activate_tab:{tab.id}" label="{tab.title}">
+              <if test="{tab.phase == 'running'}">
+                <icon name="circle-dot" width="10" height="10" foreground="success" />
+              </if>
+              <else>
+                <icon name="terminal" width="10" height="10" foreground="text_muted" />
+              </else>
+              <text size="sm" grow="1" wrap="false" overflow="ellipsis">{tab.title}</text>
+              <button width="18" height="18" size="icon" variant="ghost" icon="x" on-press="close_tab:{tab.id}" label="Close terminal tab"></button>
+            </list-item>
+            <separator width="1" height="32" />
+            </for>
+          </row>
+        </scroll>
+        <badge>{activeWorkspaceTerminalCount}</badge>
+        <button width="24" height="24" size="icon" variant="ghost" icon="chevron-right" on-press="next_tab" label="Next terminal"></button>
+      </row>
+      <separator />
+
+      <for each="tabs" key="id" as="tab">
+        <if test="{tab.selected}">
+          <column grow="1" background="background">
+            <row height="26" padding="6" gap="6" cross="center" background="surface">
+              <badge variant="outline">{tab.branch}</badge>
+              <text size="sm" foreground="text_muted" grow="1" overflow="ellipsis">{tab.path}</text>
+              <if test="{tab.phase == 'starting'}"><text size="sm">Starting...</text></if>
+              <if test="{tab.phase == 'closing'}"><text size="sm">Closing...</text></if>
+              <if test="{tab.phase == 'exited'}"><text size="sm">Exited {tab.exit_code}</text></if>
+              <if test="{tab.phase == 'failed'}"><text size="sm" foreground="destructive">Failed</text></if>
+            </row>
+            <terminal pty="{tab.pty}" autofocus="true" grow="1" focus-ring="background" label="{tab.title}" />
+          </column>
+        </if>
+      </for>
+    </if>
+    <else>
+      <use template="centered-state">
+        <icon name="terminal" width="34" height="34" foreground="text_muted" />
+        <text size="heading">No terminals in this worktree</text>
+        <text foreground="text_muted">Tabs are retained independently for every worktree.</text>
+        <button variant="primary" icon="plus" on-press="open_active_terminal">Open terminal</button>
+      </use>
+    </else>
+  </column>
+</template>

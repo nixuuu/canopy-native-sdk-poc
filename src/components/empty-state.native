@@ -1,0 +1,12 @@
+<!-- First-run state shown until at least one project is attached. -->
+<import src="primitives.native"/>
+<template name="project-empty-state">
+  <stack grow="1">
+    <use template="centered-state" gap="8" padding="24">
+      <icon name="folder-open" width="32" height="32" foreground="text_muted" />
+      <text size="heading">Attach your first project</text>
+      <text foreground="text_muted">Choose a folder or Git repository to start working.</text>
+      <button variant="primary" size="lg" icon="folder-open" on-press="open_folder" autofocus="true" disabled="{attachDisabled}">Open Folder...</button>
+    </use>
+  </stack>
+</template>

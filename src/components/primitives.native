@@ -1,0 +1,12 @@
+<!-- Small layout primitives shared by domain components. -->
+<template name="centered-state" args="gap=10 padding=32">
+  <column grow="1" main="center" cross="center" gap="{gap}" padding="{padding}">
+    <slot/>
+  </column>
+</template>
+
+<template name="dialog-actions">
+  <row gap="8" main="end">
+    <slot/>
+  </row>
+</template>

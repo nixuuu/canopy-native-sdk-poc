@@ -1,0 +1,14 @@
+<!-- 48px Preferences header: title, breadcrumb, search, and close. -->
+<template name="preferences-header">
+  <row height="48" padding="16" gap="16" cross="center" background="background">
+    <row width="176" gap="8" cross="center">
+      <text size="lg">Settings</text>
+      <text size="lg" foreground="disabled">/</text>
+      <text size="lg" foreground="text_muted" grow="1" wrap="false" overflow="ellipsis">{preferencesSectionTitle}</text>
+    </row>
+    <row grow="1" main="center">
+      <search-field grow="1" max-width="384" height="28" text="{preferencesSearchText}" placeholder="Search settings..." on-input="edit_preferences_search" label="Search settings" />
+    </row>
+    <button width="28" height="28" size="icon" variant="ghost" icon="x" on-press="close_preferences" label="Close settings"></button>
+  </row>
+</template>

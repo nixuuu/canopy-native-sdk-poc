@@ -1,3 +1,18 @@
+diff --git a/node_modules/@native-sdk/cli/src/root.zig b/node_modules/@native-sdk/cli/src/root.zig
+index 2da935a..84fb786 100644
+--- a/node_modules/@native-sdk/cli/src/root.zig
++++ b/node_modules/@native-sdk/cli/src/root.zig
+@@ -149,6 +149,10 @@ pub const max_effect_ptys = runtime.max_effect_ptys;
+ pub const max_effect_pty_chunk_bytes = runtime.max_effect_pty_chunk_bytes;
+ pub const max_effect_pty_write_bytes = runtime.max_effect_pty_write_bytes;
+ pub const max_effect_pty_term_bytes = runtime.max_effect_pty_term_bytes;
++pub const PtyEnvEntry = runtime.PtyEnvEntry;
++pub const PtyEnvVar = runtime.PtyEnvVar;
++pub const max_effect_pty_env_entries = runtime.max_effect_pty_env_entries;
++pub const max_effect_pty_env_bytes = runtime.max_effect_pty_env_bytes;
+ pub const EffectHostResult = runtime.EffectHostResult;
+ pub const HostCallBinding = runtime.HostCallBinding;
+ pub const HostCallCompletion = runtime.HostCallCompletion;
 diff --git a/node_modules/@native-sdk/cli/src/runtime/core.zig b/node_modules/@native-sdk/cli/src/runtime/core.zig
 index e780399..45a7ce4 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/core.zig
@@ -12,7 +27,7 @@ index e780399..45a7ce4 100644
  
      const CanvasImageMethods = runtime_canvas_images.RuntimeCanvasImages(Runtime);
 diff --git a/node_modules/@native-sdk/cli/src/runtime/effects.zig b/node_modules/@native-sdk/cli/src/runtime/effects.zig
-index ce420b0..5ba99bd 100644
+index ce420b0..e9176d8 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/effects.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/effects.zig
 @@ -1102,12 +1102,16 @@ pub const max_effect_channel_pending: usize = 32;
@@ -34,7 +49,200 @@ index ce420b0..5ba99bd 100644
  /// The cross-thread output staging ring per pty. When it fills, the io
  /// thread stops reading the parent end until the loop drains — kernel
  /// back-pressure to the child, a terminal's native flow control. Bytes
-@@ -2453,8 +2457,6 @@ fn ptyStageOutput(shared: *PtyShared, generation: u64, bytes: []const u8) void {
+@@ -1133,6 +1137,27 @@ pub const max_effect_pty_outbound_bytes: usize = 64 * 1024;
+ pub const max_effect_pty_write_records: usize = 256;
+ /// Longest TERM value `ptySpawn` accepts.
+ pub const max_effect_pty_term_bytes: usize = 32;
++/// Maximum number of caller-provided environment entries a pty spawn may
++/// overlay onto the bound host environment. The host environment itself is
++/// still subject to the transport's own bounds; this cap limits the
++/// app-owned storage retained by each fake/live pty slot.
++pub const max_effect_pty_env_entries: usize = 32;
++/// Maximum combined `name=value` bytes in one pty environment overlay. The
++/// separator is included in the bound, matching the flattened transport
++/// representation. Values are copied into the pty slot and wiped when the
++/// real spawn has consumed them or the slot retires.
++pub const max_effect_pty_env_bytes: usize = 4096;
++
++/// One caller-provided pty environment overlay entry. Names are non-empty,
++/// cannot contain `=`, NUL, or `TERM` (TERM is controlled by `PtySpawnOptions`
++/// `.term`); values may be empty but cannot contain NUL. The bytes are copied
++/// into slot storage when `ptySpawn` accepts the request.
++pub const PtyEnvEntry = struct {
++    name: []const u8,
++    value: []const u8,
++};
++/// Compatibility spelling for callers that describe an entry as a variable.
++pub const PtyEnvVar = PtyEnvEntry;
+ /// Bytes of `ptyWrite` input a FAKE pty retains for test assertions
+ /// (`ptyWrittenBytes`) — the scriptable pty's inspection window, not a
+ /// delivery bound: writes beyond it drop oldest-first, exactly what a
+@@ -2255,41 +2280,136 @@ fn fallbackEnviron() std.process.Environ {
+     }
+ }
+ 
+-/// Flatten the bound environ into the pty transport's env list — the
+-/// spawn effect's inherit-the-host policy, made explicit because execve
+-/// takes a flat envp. TERM is injected by the transport whether or not
+-/// the host carried one. Returns null when the environ exceeds the
+-/// transport's bounds: the child MUST see the whole environment the API
+-/// promised, so an over-bound environ fails the spawn loudly rather
+-/// than handing the child a silently truncated one (a required variable
+-/// past the cutoff would otherwise vanish). On Windows the bound
+-/// environ is the live-process sentinel (`GlobalBlock`), so the
+-/// transport snapshots the actual environment into `bytes` — same
+-/// policy, same loud over-bound refusal, one extra storage hop because
+-/// the OS block is WTF-16.
++/// Compare environment names using the host's environment semantics. POSIX
++/// names are byte-sensitive; Windows names are ASCII case-insensitive (the
++/// transport applies the same rule while it builds its environment block).
++fn ptyEnvNameEqual(a: []const u8, b: []const u8) bool {
++    if (comptime builtin.os.tag == .windows) {
++        if (a.len != b.len) return false;
++        for (a, b) |left, right| {
++            if (std.ascii.toUpper(left) != std.ascii.toUpper(right)) return false;
++        }
++        return true;
++    }
++    return std.mem.eql(u8, a, b);
++}
++
++/// Return the flattened `name=value` byte length, including the separator,
++/// or null when the transport's total environment bound cannot represent the
++/// entry without arithmetic overflow.
++fn ptyEnvEntryBytes(name: []const u8, value: []const u8) ?usize {
++    if (name.len >= pty_transport.max_env_bytes) return null;
++    const remaining = pty_transport.max_env_bytes - name.len - 1;
++    if (value.len > remaining) return null;
++    return name.len + 1 + value.len;
++}
++
++/// Validate the caller-owned part of a pty environment before claiming a
++/// slot. This is a regenerating request bound: fake, live, and replay all
++/// refuse the same malformed overlay without depending on the host's
++/// environment or transport availability.
++fn validPtyEnvOverlay(env: []const PtyEnvEntry) bool {
++    if (env.len > max_effect_pty_env_entries) return false;
++    var total_bytes: usize = 0;
++    for (env) |entry| {
++        if (entry.name.len == 0 or
++            std.mem.indexOfAny(u8, entry.name, &.{ '=', 0 }) != null or
++            std.mem.indexOfScalar(u8, entry.value, 0) != null or
++            ptyEnvNameEqual(entry.name, "TERM"))
++        {
++            return false;
++        }
++        if (comptime builtin.os.tag == .windows and
++            (!std.unicode.wtf8ValidateSlice(entry.name) or !std.unicode.wtf8ValidateSlice(entry.value)))
++        {
++            return false;
++        }
++        if (entry.name.len >= max_effect_pty_env_bytes) return false;
++        const remaining = max_effect_pty_env_bytes - entry.name.len - 1;
++        if (entry.value.len > remaining) return false;
++        const entry_bytes = entry.name.len + 1 + entry.value.len;
++        if (total_bytes > max_effect_pty_env_bytes - entry_bytes) return false;
++        total_bytes += entry_bytes;
++    }
++    return true;
++}
++
++/// Flatten the bound environ into the pty transport's env list and merge the
++/// caller's bounded overlay. The overlay replaces an inherited value with
++/// the same name and appends otherwise; TERM is excluded from both sides and
++/// injected by the transport from `PtySpawnOptions.term`. Returns null when
++/// the complete result exceeds the transport's bounds: the child MUST see
++/// the whole environment the API promised, so an over-bound environ fails
++/// the spawn loudly rather than handing the child a silently truncated one.
++/// On Windows the bound environ is the live-process sentinel (`GlobalBlock`),
++/// so the transport snapshots the actual environment into `bytes` — same
++/// policy, same loud over-bound refusal, one extra storage hop because the
++/// OS block is WTF-16.
+ fn flattenPtyEnviron(
+     environ: std.process.Environ,
+     buffer: []pty_transport.EnvVar,
+     bytes: []u8,
++    overlay: []const PtyEnvEntry,
+ ) ?[]const pty_transport.EnvVar {
+-    if (comptime builtin.os.tag == .windows) {
+-        if (!environ.block.use_global) return buffer[0..0];
+-        return pty_transport.captureGlobalEnviron(buffer, bytes);
+-    }
+-    if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return buffer[0..0];
+     var count: usize = 0;
+     var total_bytes: usize = 0;
+-    for (environ.block.slice) |entry_opt| {
+-        const entry = entry_opt orelse continue;
+-        const text = std.mem.span(entry);
+-        const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
+-        // The transport injects its own TERM; a host TERM would race it.
+-        if (std.mem.eql(u8, text[0..eq], "TERM")) continue;
+-        if (count == buffer.len) return null;
+-        if (total_bytes + text.len > pty_transport.max_env_bytes) return null;
+-        buffer[count] = .{ .name = text[0..eq], .value = text[eq + 1 ..] };
+-        count += 1;
+-        total_bytes += text.len;
++    if (comptime builtin.os.tag == .windows) {
++        if (environ.block.use_global) {
++            const captured = pty_transport.captureGlobalEnviron(buffer, bytes) orelse return null;
++            count = captured.len;
++            for (captured) |entry| {
++                const entry_bytes = ptyEnvEntryBytes(entry.name, entry.value) orelse return null;
++                if (total_bytes > pty_transport.max_env_bytes - entry_bytes) return null;
++                total_bytes += entry_bytes;
++            }
++        }
++    } else {
++        if (comptime std.process.Environ.Block == std.process.Environ.PosixBlock) {
++            for (environ.block.slice) |entry_opt| {
++                const entry = entry_opt orelse continue;
++                const text = std.mem.span(entry);
++                const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
++                // The transport injects its own TERM; a host TERM would race it.
++                if (std.mem.eql(u8, text[0..eq], "TERM")) continue;
++                if (count == buffer.len) return null;
++                const entry_bytes = ptyEnvEntryBytes(text[0..eq], text[eq + 1 ..]) orelse return null;
++                if (total_bytes > pty_transport.max_env_bytes - entry_bytes) return null;
++                buffer[count] = .{ .name = text[0..eq], .value = text[eq + 1 ..] };
++                count += 1;
++                total_bytes += entry_bytes;
++            }
++        }
++    }
++
++    // Apply each caller entry in order. Repeated names intentionally follow
++    // the ordinary overlay rule: the last value wins, while replacing the
++    // existing slot keeps the flat envp free of duplicate names.
++    for (overlay) |entry| {
++        var replaced: ?usize = null;
++        for (buffer[0..count], 0..) |existing, index| {
++            if (ptyEnvNameEqual(existing.name, entry.name)) {
++                replaced = index;
++                break;
++            }
++        }
++        const entry_bytes = ptyEnvEntryBytes(entry.name, entry.value) orelse return null;
++        if (replaced) |index| {
++            const old_bytes = ptyEnvEntryBytes(buffer[index].name, buffer[index].value) orelse return null;
++            if (entry_bytes >= old_bytes) {
++                const delta = entry_bytes - old_bytes;
++                if (total_bytes > pty_transport.max_env_bytes - delta) return null;
++                total_bytes += delta;
++            } else {
++                total_bytes -= old_bytes - entry_bytes;
++            }
++            buffer[index] = .{ .name = entry.name, .value = entry.value };
++        } else {
++            if (count == buffer.len) return null;
++            if (total_bytes > pty_transport.max_env_bytes - entry_bytes) return null;
++            buffer[count] = .{ .name = entry.name, .value = entry.value };
++            count += 1;
++            total_bytes += entry_bytes;
++        }
+     }
+     return buffer[0..count];
+ }
+@@ -2453,8 +2573,6 @@ fn ptyStageOutput(shared: *PtyShared, generation: u64, bytes: []const u8) void {
                      _ = owner.pending.fetchAdd(1, .seq_cst);
                      stamped = true;
                  }
@@ -43,7 +251,7 @@ index ce420b0..5ba99bd 100644
              }
          }
      }
-@@ -2544,6 +2546,256 @@ fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation
+@@ -2544,6 +2662,256 @@ fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation
      }
  }
  
@@ -300,7 +508,28 @@ index ce420b0..5ba99bd 100644
  /// `std.Io.Threaded` (the real executor's io) does not exist on
  /// freestanding targets — the docs' live-preview wasm host compiles
  /// this runtime to wasm32-freestanding. There the executor io compiles
-@@ -3496,6 +3748,8 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3453,6 +3821,12 @@ pub fn Effects(comptime Msg: type) type {
+             /// environ (`bindEnviron`), nothing else — a pty is a spawn
+             /// with a different transport, one env story.
+             term: []const u8 = pty_transport.default_term,
++            /// Caller-provided environment overlay. Entries replace a
++            /// bound-host value with the same name or append a new value;
++            /// names and values are copied into the pty slot before the
++            /// request is accepted. TERM is reserved for `term` and must
++            /// not appear here.
++            env: []const PtyEnvEntry = &.{},
+             /// Every pty event — each coalesced output batch and the
+             /// exactly-one `.exit` terminal — arrives through this
+             /// constructor. Required: a terminal nobody watches is not
+@@ -3469,6 +3843,7 @@ pub fn Effects(comptime Msg: type) type {
+             cols: u16,
+             rows: u16,
+             term: []const u8,
++            env: []const PtyEnvEntry = &.{},
+         };
+ 
+         /// How one pty table slot advances: `.running` from the
+@@ -3496,6 +3871,8 @@ pub fn Effects(comptime Msg: type) type {
              transport: if (pty_transport.supported) ?pty_transport.Pty else void =
                  if (pty_transport.supported) null else {},
              io_thread: ?WorkerThread = null,
@@ -309,7 +538,62 @@ index ce420b0..5ba99bd 100644
              /// The io thread's nudge pipe: [read, write]. Written by
              /// the loop (outbound bytes staged, drain freed staging
              /// room, shutdown); poll()'d by the io thread.
-@@ -5026,7 +5280,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -3518,6 +3895,16 @@ pub fn Effects(comptime Msg: type) type {
+             argv_count: usize = 0,
+             term_storage: [max_effect_pty_term_bytes]u8 = undefined,
+             term_len: usize = 0,
++            /// Caller-provided environment overlay. Names and values are
++            /// copied here so a caller may reuse its frame/request buffers
++            /// as soon as `ptySpawn` returns. Real starts wipe this storage
++            /// after the transport has consumed it; fake/replay starts keep
++            /// it until retirement so `pendingPtyAt` can inspect the exact
++            /// request.
++            env_storage: [max_effect_pty_env_bytes]u8 = undefined,
++            env_entries: [max_effect_pty_env_entries]PtyEnvEntry = undefined,
++            env_count: usize = 0,
++            env_bytes_len: usize = 0,
+             /// Session replay only: the pending-order reservation this
+             /// parked spawn holds (see `ParkOrderState` — the channel
+             /// park dance, pty-shaped: a fed start-failure terminal
+@@ -3534,6 +3921,37 @@ pub fn Effects(comptime Msg: type) type {
+             fn requestTerm(slot: *const PtySlot) []const u8 {
+                 return slot.term_storage[0..slot.term_len];
+             }
++
++            fn requestEnv(slot: *const PtySlot) []const PtyEnvEntry {
++                return slot.env_entries[0..slot.env_count];
++            }
++
++            fn copyEnv(slot: *PtySlot, env: []const PtyEnvEntry) void {
++                var offset: usize = 0;
++                for (env, 0..) |entry, index| {
++                    const name_start = offset;
++                    @memcpy(slot.env_storage[name_start .. name_start + entry.name.len], entry.name);
++                    offset += entry.name.len;
++                    const value_start = offset;
++                    @memcpy(slot.env_storage[value_start .. value_start + entry.value.len], entry.value);
++                    offset += entry.value.len;
++                    slot.env_entries[index] = .{
++                        .name = slot.env_storage[name_start .. name_start + entry.name.len],
++                        .value = slot.env_storage[value_start .. value_start + entry.value.len],
++                    };
++                }
++                slot.env_count = env.len;
++                slot.env_bytes_len = offset;
++            }
++
++            fn clearEnv(slot: *PtySlot) void {
++                // The caller's overlay may contain credentials or tokens;
++                // ordinary allocator reuse must not retain those bytes in
++                // a later pty slot or expose them through a heap dump.
++                std.crypto.secureZero(u8, slot.env_storage[0..]);
++                slot.env_count = 0;
++                slot.env_bytes_len = 0;
++            }
+         };
+ 
+         /// How one channel table slot advances: `.open` accepts posts
+@@ -5026,7 +5444,12 @@ pub fn Effects(comptime Msg: type) type {
          /// occupancies beside the channel table. Loop-thread only —
          /// the thread-shared half of each slot lives behind its
          /// `PtySlot.shared` header.
@@ -323,7 +607,7 @@ index ce420b0..5ba99bd 100644
          /// Monotonic stamp shared by every pty's staged output backlog
          /// and exit marker — the channels' `channel_seq`, pty-shaped:
          /// cross-pty delivery order and the drain boundary's causality
-@@ -5273,7 +5532,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5273,7 +5696,7 @@ pub fn Effects(comptime Msg: type) type {
              // teaching warning: everything it can still reach (the
              // shared header, its staging ring, the transport fds) is
              // process-lived or deliberately leaked with it.
@@ -332,7 +616,7 @@ index ce420b0..5ba99bd 100644
                  // Wind down a running REAL pty: kill and wait (bounded)
                  // for the io thread to stage its exit, then retire or
                  // abandon it. A fake or unsupported occupancy just
-@@ -5298,7 +5557,11 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5298,7 +5721,11 @@ pub fn Effects(comptime Msg: type) type {
                          } else if (pty_slot.transport) |transport| {
                              transport.kill(false);
                          }
@@ -345,10 +629,17 @@ index ce420b0..5ba99bd 100644
                          var io_done = pty_slot.shared == null;
                          if (pty_slot.shared) |shared| {
                              const start_ns = runtime_clock.monotonicNanoseconds();
-@@ -5376,6 +5639,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -5375,7 +5802,18 @@ pub fn Effects(comptime Msg: type) type {
+                     pty_slot.state = .idle;
                      pty_slot.on_event = null;
                  }
-             }
+-            }
++                // No transport thread reads the overlay after the
++                // synchronous spawn call; clear it for every slot, including
++                // an abandoned or already-idle slot, before the slot array
++                // is freed.
++                pty_slot.clearEnv();
++            }
 +            if (comptime pty_transport.reactor_supported) {
 +                if (self.pty_reactor) |reactor| reactor.destroy();
 +                self.pty_reactor = null;
@@ -358,7 +649,7 @@ index ce420b0..5ba99bd 100644
              self.pty_pending_count.store(0, .release);
              // Settle any surrendered reap whose child has since died —
              // teardown is the last cheap moment before the process
-@@ -6029,7 +6298,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -6029,7 +6467,7 @@ pub fn Effects(comptime Msg: type) type {
                  // `bindServices`, which the standard startup order
                  // never does; contained here regardless.)
                  if (comptime pty_transport.supported) {
@@ -367,7 +658,7 @@ index ce420b0..5ba99bd 100644
                          if (!(pty_slot.state == .running and !pty_slot.fake)) continue;
                          const shared = pty_slot.shared orelse continue;
                          shared.mutex.lock();
-@@ -6039,7 +6308,11 @@ pub fn Effects(comptime Msg: type) type {
+@@ -6039,7 +6477,11 @@ pub fn Effects(comptime Msg: type) type {
                              if (pty_slot.transport) |transport| transport.kill(false);
                          }
                          shared.mutex.unlock();
@@ -380,7 +671,7 @@ index ce420b0..5ba99bd 100644
                          const start_ns = runtime_clock.monotonicNanoseconds();
                          var io_done = false;
                          while (true) {
-@@ -6133,7 +6406,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -6133,7 +6575,7 @@ pub fn Effects(comptime Msg: type) type {
              }
              // Ptys arm the same producer-wake seam: a running REAL
              // occupancy's io thread wakes through its shared header.
@@ -389,7 +680,7 @@ index ce420b0..5ba99bd 100644
                  if (slot.state == .running and !slot.fake and slot.shared != null) return true;
              }
              return false;
-@@ -8004,12 +8277,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8004,12 +8446,12 @@ pub fn Effects(comptime Msg: type) type {
          /// second producer beside a live io thread.
          pub fn feedPtyOutput(self: *Self, key: u64, bytes: []const u8) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, PtyChunkTooLarge, ReplayDamagedRecord }!void {
              const slot_index = blk: {
@@ -404,7 +695,7 @@ index ce420b0..5ba99bd 100644
              if (!slot.fake) return error.PtyLiveFeed;
              if (slot.park_state == .terminated) {
                  if (comptime builtin.os.tag != .freestanding) {
-@@ -8072,12 +8345,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8072,12 +8514,12 @@ pub fn Effects(comptime Msg: type) type {
          /// ride the completion queue and retire the slot at delivery.
          pub fn feedPtyExit(self: *Self, key: u64, code: i32, signal: i32, reason: EffectExitReason, dropped_writes: u32) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, ReplayDamagedRecord }!void {
              const slot_index = blk: {
@@ -419,7 +710,7 @@ index ce420b0..5ba99bd 100644
              if (!slot.fake) return error.PtyLiveFeed;
              // Normalize the tuple to the EffectPtyEvent contract the live
              // io loop guarantees, so a fake (test or replay) can never
-@@ -8204,7 +8477,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8204,7 +8646,7 @@ pub fn Effects(comptime Msg: type) type {
          /// Number of recorded (still-active) fake pty spawns.
          pub fn pendingPtyCount(self: *Self) usize {
              var count: usize = 0;
@@ -428,7 +719,7 @@ index ce420b0..5ba99bd 100644
                  if (slot.fake and slot.state == .running) count += 1;
              }
              return count;
-@@ -8215,7 +8488,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8215,7 +8657,7 @@ pub fn Effects(comptime Msg: type) type {
          /// valid until the occupancy retires.
          pub fn pendingPtyAt(self: *Self, index: usize) ?PtyRequest {
              var seen: usize = 0;
@@ -437,9 +728,19 @@ index ce420b0..5ba99bd 100644
                  if (!(slot.fake and slot.state == .running)) continue;
                  if (seen == index) {
                      return .{
-@@ -8292,15 +8565,10 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8224,6 +8666,7 @@ pub fn Effects(comptime Msg: type) type {
+                         .cols = slot.cols,
+                         .rows = slot.rows,
+                         .term = slot.requestTerm(),
++                        .env = slot.requestEnv(),
+                     };
+                 }
+                 seen += 1;
+@@ -8291,16 +8734,12 @@ pub fn Effects(comptime Msg: type) type {
+             // truncate it at the C boundary, so a spawn that "succeeded"
              // would hand the child a different TERM than requested.
              if (std.mem.indexOfScalar(u8, options.term, 0) != null) return self.rejectPty(options.key, options.on_event, true);
++            if (!validPtyEnvOverlay(options.env)) return self.rejectPty(options.key, options.on_event, true);
              if (self.keyOccupiedUntilDelivery(options.key)) return self.rejectPty(options.key, options.on_event, true);
 -            const slot_index = self.findIdlePtySlot() orelse return self.rejectPty(options.key, options.on_event, true);
 -            // Table capacity obeys the replay-hold invariant, the
@@ -457,7 +758,7 @@ index ce420b0..5ba99bd 100644
              // A build without a pty transport (a libc-free Linux
              // build; a target outside the support matrix) refuses up
              // front. Unlike
-@@ -8317,7 +8585,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8317,7 +8756,7 @@ pub fn Effects(comptime Msg: type) type {
                  if (self.executor != .fake) return self.rejectPty(options.key, options.on_event, false);
              }
  
@@ -466,7 +767,15 @@ index ce420b0..5ba99bd 100644
              const generation = self.nextChannelGeneration();
              slot.* = .{
                  .state = .running,
-@@ -8496,7 +8764,13 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8338,6 +8777,7 @@ pub fn Effects(comptime Msg: type) type {
+             }
+             @memcpy(slot.term_storage[0..options.term.len], options.term);
+             slot.term_len = options.term.len;
++            slot.copyEnv(options.env);
+ 
+             if (slot.fake) {
+                 // Session replay: PARK — the fake-slot discipline. The
+@@ -8496,7 +8936,13 @@ pub fn Effects(comptime Msg: type) type {
                  break :accepted true;
              };
              shared.mutex.unlock();
@@ -481,7 +790,7 @@ index ce420b0..5ba99bd 100644
              return accepted;
          }
  
-@@ -8574,7 +8848,11 @@ pub fn Effects(comptime Msg: type) type {
+@@ -8574,7 +9020,11 @@ pub fn Effects(comptime Msg: type) type {
                  if (slot.transport) |transport| transport.kill(false);
              }
              shared.mutex.unlock();
@@ -494,7 +803,7 @@ index ce420b0..5ba99bd 100644
          }
  
          /// Ask the desktop host to show a system notification. This is
-@@ -11444,7 +11722,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -11444,7 +11894,7 @@ pub fn Effects(comptime Msg: type) type {
                  shared.wake.pending.store(false, .seq_cst);
                  shared.wake.mutex.unlock();
              }
@@ -503,7 +812,7 @@ index ce420b0..5ba99bd 100644
                  const shared = slot.shared orelse continue;
                  shared.wake.mutex.lock();
                  shared.wake.pending.store(false, .seq_cst);
-@@ -11779,7 +12057,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -11779,7 +12229,7 @@ pub fn Effects(comptime Msg: type) type {
                              // still lands in the delivered count.
                              var event = entry.event;
                              if (entry.retire_slot) |slot_index| {
@@ -512,7 +821,7 @@ index ce420b0..5ba99bd 100644
                                  if (parked.state != .idle and parked.generation == entry.retire_generation) {
                                      event.dropped_writes +|= parked.dropped_writes;
                                      self.retirePtySlot(parked);
-@@ -12377,7 +12655,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12377,7 +12827,7 @@ pub fn Effects(comptime Msg: type) type {
                              self.drain_heap_line = heap;
                              entry.heap_line = null;
                          }
@@ -521,7 +830,7 @@ index ce420b0..5ba99bd 100644
                          if (pty_slot.state == .idle or entry.channel_generation != pty_slot.generation) continue;
                          const on_event = pty_slot.on_event;
                          // The delivered drop count reads AT DELIVERY, the
-@@ -12556,7 +12834,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12556,7 +13006,7 @@ pub fn Effects(comptime Msg: type) type {
              var best_index: ?usize = null;
              var best_seq: u64 = std.math.maxInt(u64);
              var best_exit = false;
@@ -530,7 +839,7 @@ index ce420b0..5ba99bd 100644
                  if (slot.state == .idle) continue;
                  const shared = slot.shared orelse continue;
                  shared.mutex.lock();
-@@ -12603,7 +12881,7 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12603,7 +13053,7 @@ pub fn Effects(comptime Msg: type) type {
                  }
              }
              const index = best_index orelse return null;
@@ -539,7 +848,7 @@ index ce420b0..5ba99bd 100644
              const shared = slot.shared.?;
              const on_event = slot.on_event;
              var event: EffectPtyEvent = .{ .key = slot.key };
-@@ -12641,7 +12919,6 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12641,7 +13091,6 @@ pub fn Effects(comptime Msg: type) type {
                  staging.head = (staging.head + take) % max_effect_pty_staging_bytes;
                  staging.len -= take;
                  const emptied = staging.len == 0;
@@ -547,7 +856,7 @@ index ce420b0..5ba99bd 100644
                  if (emptied) {
                      shared.data_seq_valid = false;
                  } else if (shared.owner) |owner| {
-@@ -12654,7 +12931,6 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12654,7 +13103,6 @@ pub fn Effects(comptime Msg: type) type {
                      // stamp would let one pass deliver without bound and
                      // starve every other platform event.
                      shared.data_seq = owner.seq.fetchAdd(1, .seq_cst);
@@ -555,7 +864,7 @@ index ce420b0..5ba99bd 100644
                  }
                  if (shared.reader_parked) {
                      shared.reader_parked = false;
-@@ -12662,9 +12938,12 @@ pub fn Effects(comptime Msg: type) type {
+@@ -12662,9 +13110,12 @@ pub fn Effects(comptime Msg: type) type {
                  }
                  shared.mutex.unlock();
                  if (emptied) _ = self.pty_pending_count.fetchSub(1, .seq_cst);
@@ -570,7 +879,7 @@ index ce420b0..5ba99bd 100644
                  }
                  event.bytes = self.pty_drain_scratch[0..take];
                  self.journalNote(.{
-@@ -13857,22 +14136,23 @@ pub fn Effects(comptime Msg: type) type {
+@@ -13857,22 +14308,23 @@ pub fn Effects(comptime Msg: type) type {
          }
  
          fn findPtySlot(self: *Self, key: u64) ?*PtySlot {
@@ -599,7 +908,7 @@ index ce420b0..5ba99bd 100644
                  if (slot.state == .idle) count += 1;
              }
              return count;
-@@ -13937,6 +14217,10 @@ pub fn Effects(comptime Msg: type) type {
+@@ -13937,6 +14389,10 @@ pub fn Effects(comptime Msg: type) type {
          /// wait on child I/O). The `PtyShared` header stays allocated
          /// forever, the channel headers' bounded-leak invariant.
          fn retirePtySlot(self: *Self, slot: *PtySlot) void {
@@ -610,7 +919,26 @@ index ce420b0..5ba99bd 100644
              if (slot.shared) |shared| {
                  shared.mutex.lock();
                  shared.open = false;
-@@ -14057,11 +14341,14 @@ pub fn Effects(comptime Msg: type) type {
+@@ -14012,6 +14468,7 @@ pub fn Effects(comptime Msg: type) type {
+             slot.kill_requested = false;
+             slot.write_capture_len = 0;
+             slot.dropped_writes = 0;
++            slot.clearEnv();
+             slot.park_seq = 0;
+             slot.park_state = .none;
+         }
+@@ -14036,6 +14493,10 @@ pub fn Effects(comptime Msg: type) type {
+         /// NFS/autofs PATH entry stalls the loop like any synchronous
+         /// filesystem touch of that mount would.
+         fn startRealPty(self: *Self, slot: *PtySlot, options: PtySpawnOptions) void {
++            // The overlay is needed only while the synchronous transport
++            // builds its argv/envp and forks. Do not leave caller-supplied
++            // secrets in the slot after success or any start failure.
++            defer slot.clearEnv();
+             if (comptime !pty_transport.supported) {
+                 // ptySpawn already refused unsupported builds.
+                 unreachable;
+@@ -14057,17 +14518,25 @@ pub fn Effects(comptime Msg: type) type {
                  return self.failPtyStart(slot, options);
              };
              outbound.* = .{};
@@ -630,7 +958,19 @@ index ce420b0..5ba99bd 100644
              var env_buffer: [pty_transport.max_env_entries]pty_transport.EnvVar = undefined;
              // The decoded-name/value byte pool behind the Windows
              // environment snapshot; zero-length (and untouched) where
-@@ -14152,6 +14439,45 @@ pub fn Effects(comptime Msg: type) type {
+             // the posix block's own bytes back the entries.
+             var env_bytes: [if (builtin.os.tag == .windows) pty_transport.max_env_bytes else 0]u8 = undefined;
+-            const env = flattenPtyEnviron(self.environ orelse fallbackEnviron(), &env_buffer, &env_bytes) orelse {
++            const env = flattenPtyEnviron(
++                self.environ orelse fallbackEnviron(),
++                &env_buffer,
++                &env_bytes,
++                slot.requestEnv(),
++            ) orelse {
+                 self.channel_storage_allocator.destroy(outbound);
+                 self.channel_storage_allocator.destroy(staging);
+                 pty_transport.closeFd(pipe[0]);
+@@ -14152,6 +14621,45 @@ pub fn Effects(comptime Msg: type) type {
                  }
                  if (self.hasPending()) self.wakeHost();
              }
@@ -676,11 +1016,79 @@ index ce420b0..5ba99bd 100644
              const thread = std.Thread.spawn(.{}, ptyIoLoop, .{ shared, transport, pipe[0], generation }) catch {
                  shared.mutex.lock();
                  shared.open = false;
+@@ -14181,6 +14689,7 @@ pub fn Effects(comptime Msg: type) type {
+         /// Release a claimed pty slot and stage the executor-truth
+         /// start-failure terminal.
+         fn failPtyStart(self: *Self, slot: *PtySlot, options: PtySpawnOptions) void {
++            slot.clearEnv();
+             slot.state = .idle;
+             slot.on_event = null;
+             self.stagePendingPty(.{
 diff --git a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
-index a92c59f..2884462 100644
+index a92c59f..f8571a6 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
-@@ -136,15 +136,13 @@ test "pty admission: every refused spawn delivers exactly one rejected exit" {
+@@ -70,13 +70,21 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
+     defer fx.deinit();
+     fx.executor = .fake;
+ 
++    var overlay_name: [15]u8 = "PTY_TEST_MARKER".*;
++    var overlay_value: [7]u8 = "overlay".*;
++
+     fx.ptySpawn(.{
+         .key = 9,
+         .argv = &.{ "sh", "-l" },
+         .cols = 120,
+         .rows = 40,
++        .env = &.{.{ .name = overlay_name[0..], .value = overlay_value[0..] }},
+         .on_event = DirectFx.ptyMsg(.pty),
+     });
++    // The caller can recycle its request buffers immediately after the
++    // effect call; the fake request must retain the original bytes.
++    overlay_name[0] = 'X';
++    overlay_value[0] = 'X';
+     try testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
+     const request = fx.pendingPtyAt(0) orelse return error.TestExpectedRequest;
+     try testing.expectEqual(@as(u64, 9), request.key);
+@@ -86,6 +94,11 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
+     try testing.expectEqual(@as(u16, 120), request.cols);
+     try testing.expectEqual(@as(u16, 40), request.rows);
+     try testing.expectEqualStrings(pty_transport.default_term, request.term);
++    // Environment entries are their own copied request storage, never
++    // appended to argv (which remains exactly the caller's two entries).
++    try testing.expectEqual(@as(usize, 1), request.env.len);
++    try testing.expectEqualStrings("PTY_TEST_MARKER", request.env[0].name);
++    try testing.expectEqualStrings("overlay", request.env[0].value);
+ 
+     try fx.feedPtyOutput(9, "$ ");
+     try fx.feedPtyOutput(9, "hello\r\n");
+@@ -131,20 +144,39 @@ test "pty admission: every refused spawn delivers exactly one rejected exit" {
+     fx.ptySpawn(.{ .key = 5, .argv = &.{"sh"}, .term = long_term, .on_event = DirectFx.ptyMsg(.pty) });
+     _ = try expectExit(&fx, 5, .rejected);
+ 
++    // Environment names are map keys, not shell fragments: reject empty
++    // names, '=' and NUL in names/values, and TERM (owned by `.term`).
++    fx.ptySpawn(.{ .key = 100, .argv = &.{"sh"}, .env = &.{.{ .name = "", .value = "x" }}, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 100, .rejected);
++    fx.ptySpawn(.{ .key = 101, .argv = &.{"sh"}, .env = &.{.{ .name = "BAD=NAME", .value = "x" }}, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 101, .rejected);
++    fx.ptySpawn(.{ .key = 102, .argv = &.{"sh"}, .env = &.{.{ .name = "BAD\x00NAME", .value = "x" }}, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 102, .rejected);
++    fx.ptySpawn(.{ .key = 103, .argv = &.{"sh"}, .env = &.{.{ .name = "BAD_VALUE", .value = "x\x00y" }}, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 103, .rejected);
++    fx.ptySpawn(.{ .key = 104, .argv = &.{"sh"}, .env = &.{.{ .name = "TERM", .value = "dumb" }}, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 104, .rejected);
++
++    var too_many_env: [effects_mod.max_effect_pty_env_entries + 1]effects_mod.PtyEnvEntry = undefined;
++    for (&too_many_env) |*entry| entry.* = .{ .name = "X", .value = "y" };
++    fx.ptySpawn(.{ .key = 105, .argv = &.{"sh"}, .env = &too_many_env, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 105, .rejected);
++    const oversized_env_value = "z" ** effects_mod.max_effect_pty_env_bytes;
++    fx.ptySpawn(.{ .key = 106, .argv = &.{"sh"}, .env = &.{.{ .name = "OVERSIZED", .value = oversized_env_value }}, .on_event = DirectFx.ptyMsg(.pty) });
++    _ = try expectExit(&fx, 106, .rejected);
++
+     // A duplicate active key.
+     fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
      fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
      _ = try expectExit(&fx, 6, .rejected);
  
@@ -700,6 +1108,47 @@ index a92c59f..2884462 100644
  }
  
  test "fake pty write capture, resize mirror, and kill mirror" {
+@@ -676,6 +708,40 @@ test "live pty end to end: output, coalescing, and the exit code" {
+     try testing.expectEqual(effects_mod.EffectExitReason.exited, result.exit.reason);
+ }
+ 
++test "live pty env overlay replaces host values and is not argv" {
++    if (comptime !live_posix) return;
++    const host_marker = try testing.allocator.dupeZ(u8, "CANOPY_PTY_OVERLAY=host");
++    defer testing.allocator.free(host_marker);
++    const host_base = try testing.allocator.dupeZ(u8, "CANOPY_PTY_BASE=host");
++    defer testing.allocator.free(host_base);
++    // Bind a small deterministic host environment so the replacement is
++    // observable without mutating the process-global environ. The overlay
++    // changes one value and appends another; `PATH` is unnecessary because
++    // the test uses an absolute shell path.
++    const host_entries = [_]?[*:0]const u8{ host_marker.ptr, host_base.ptr, null };
++
++    var fx = DirectFx.init(testing.allocator);
++    defer fx.deinit();
++    fx.bindEnviron(.{ .block = .{ .slice = host_entries[0..2 :null] } });
++    fx.ptySpawn(.{
++        .key = 55,
++        .argv = &.{ "/bin/sh", "-c", "printf '%s|%s|%s' \"$CANOPY_PTY_OVERLAY\" \"$CANOPY_PTY_BASE\" \"$CANOPY_PTY_NEW\"" },
++        .env = &.{
++            .{ .name = "CANOPY_PTY_OVERLAY", .value = "overlay" },
++            .{ .name = "CANOPY_PTY_NEW", .value = "new" },
++        },
++        .on_event = DirectFx.ptyMsg(.pty),
++    });
++    var result = try drainUntilExit(&fx, 5_000);
++    defer result.output.deinit(testing.allocator);
++    // The first value proves replacement over the bound host; the second
++    // proves the inherited value remains, and the third proves a new
++    // overlay entry reaches the child. Since all are sent through `.env`,
++    // none can be mistaken for an argv token.
++    try testing.expect(std.mem.indexOf(u8, result.output.items, "overlay|host|new") != null);
++    try testing.expectEqual(effects_mod.EffectExitReason.exited, result.exit.reason);
++}
++
+ test "live pty back-pressure is lossless past the staging ring" {
+     if (comptime !live_posix) return;
+     var fx = DirectFx.init(testing.allocator);
 diff --git a/node_modules/@native-sdk/cli/src/runtime/pty.zig b/node_modules/@native-sdk/cli/src/runtime/pty.zig
 index 4ed1f37..b4165cc 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/pty.zig
@@ -845,23 +1294,45 @@ index 4ed1f37..b4165cc 100644
  /// Block until the transport is readable (`want_read`), writable
  /// (`want_write`), hung up, or the nudge pipe fires. A caller wanting
  /// NEITHER direction (a parked reader with nothing to write) waits on
+diff --git a/node_modules/@native-sdk/cli/src/runtime/root.zig b/node_modules/@native-sdk/cli/src/runtime/root.zig
+index d6a79e9..3a37b6d 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/root.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/root.zig
+@@ -160,6 +160,10 @@ pub const max_effect_ptys = runtime_effects.max_effect_ptys;
+ pub const max_effect_pty_chunk_bytes = runtime_effects.max_effect_pty_chunk_bytes;
+ pub const max_effect_pty_write_bytes = runtime_effects.max_effect_pty_write_bytes;
+ pub const max_effect_pty_term_bytes = runtime_effects.max_effect_pty_term_bytes;
++pub const PtyEnvEntry = runtime_effects.PtyEnvEntry;
++pub const PtyEnvVar = runtime_effects.PtyEnvVar;
++pub const max_effect_pty_env_entries = runtime_effects.max_effect_pty_env_entries;
++pub const max_effect_pty_env_bytes = runtime_effects.max_effect_pty_env_bytes;
+ pub const EffectHostResult = runtime_effects.EffectHostResult;
+ pub const HostCallBinding = runtime_effects.HostCallBinding;
+ pub const HostCallCompletion = runtime_effects.HostCallCompletion;
 diff --git a/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig b/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
-index 808265e..875093f 100644
+index 808265e..def1743 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/terminal_session.zig
-@@ -41,8 +41,9 @@ const term_vt = @import("terminal_vt");
+@@ -41,8 +41,16 @@ const term_vt = @import("terminal_vt");
  
  pub const enabled = term_vt.enabled;
  
 -/// One session per pty slot: the effects engine's own table bound.
 -pub const max_sessions: usize = effects.max_effect_ptys;
++const DeviceAttributesCallback = if (enabled)
++    @typeInfo(@FieldType(term_vt.vt.TerminalStream.Handler.Effects, "device_attributes")).optional.child
++else
++    void;
++const DeviceAttributesFunction = if (enabled) @typeInfo(DeviceAttributesCallback).pointer.child else void;
++const DeviceAttributes = if (enabled) @typeInfo(DeviceAttributesFunction).@"fn".return_type.? else void;
++
 +/// Emulators are allocated on demand; rendering capacity is independent from
 +/// the number of live PTY transports.
 +pub const max_sessions: ?usize = null;
  
  /// The journaled pty verbs the store drives, type-erased so this module
  /// never names the Msg-generic engine: the app loop wraps its engine.
-@@ -167,7 +168,8 @@ const EnabledStore = struct {
+@@ -167,7 +175,8 @@ const EnabledStore = struct {
      /// for a stable address; built on first session create so apps with
      /// no `<terminal>` pay nothing.
      threaded: ?*std.Io.Threaded = null,
@@ -871,7 +1342,7 @@ index 808265e..875093f 100644
      gateway: ?PtyGateway = null,
      /// The tokens the CURRENT build resolves snapshots with, stamped by
      /// `beginBuild` (the palette's theme mapping needs them). Valid for
-@@ -184,10 +186,14 @@ const EnabledStore = struct {
+@@ -184,10 +193,14 @@ const EnabledStore = struct {
      }
  
      pub fn deinit(self: *EnabledStore) void {
@@ -887,7 +1358,7 @@ index 808265e..875093f 100644
          if (self.threaded) |threaded| {
              threaded.deinit();
              self.allocator.destroy(threaded);
-@@ -201,6 +207,7 @@ const EnabledStore = struct {
+@@ -201,6 +214,7 @@ const EnabledStore = struct {
  
      pub fn beginBuild(self: *EnabledStore, tokens: canvas.DesignTokens) void {
          self.tokens = tokens;
@@ -895,7 +1366,7 @@ index 808265e..875093f 100644
      }
  
      /// The builder seam (`Ui.terminal_lookup`): finalize resolves each
-@@ -214,6 +221,14 @@ const EnabledStore = struct {
+@@ -214,6 +228,14 @@ const EnabledStore = struct {
      fn resolveOpaque(context: *anyopaque, pty: u64) ?*const canvas.TerminalGrid {
          const self: *EnabledStore = @ptrCast(@alignCast(context));
          const session = self.ensureSession(pty) orelse return null;
@@ -910,7 +1381,7 @@ index 808265e..875093f 100644
          if (session.snapshot_dirty) {
              session.rebuildSnapshot(self.tokens) catch return &session.grid;
          }
-@@ -231,7 +246,7 @@ const EnabledStore = struct {
+@@ -231,7 +253,7 @@ const EnabledStore = struct {
  
      fn find(self: *EnabledStore, pty: u64) ?*Session {
          if (pty == 0) return null;
@@ -919,7 +1390,7 @@ index 808265e..875093f 100644
              if (entry.key == pty) return entry.session;
          }
          return null;
-@@ -240,19 +255,17 @@ const EnabledStore = struct {
+@@ -240,19 +262,17 @@ const EnabledStore = struct {
      fn ensureSession(self: *EnabledStore, pty: u64) ?*Session {
          if (pty == 0) return null;
          if (self.find(pty)) |session| return session;
@@ -946,7 +1417,7 @@ index 808265e..875093f 100644
              if (entry.key == pty and entry.session != null) return true;
          }
          return false;
-@@ -449,9 +462,17 @@ const EnabledStore = struct {
+@@ -449,9 +469,17 @@ const EnabledStore = struct {
      /// caller's re-emit trigger.
      pub fn refreshDirty(self: *EnabledStore) bool {
          var any = false;
@@ -965,7 +1436,7 @@ index 808265e..875093f 100644
              any = true;
              session.rebuildSnapshot(self.tokens) catch {};
          }
-@@ -465,7 +486,7 @@ const EnabledStore = struct {
+@@ -465,7 +493,7 @@ const EnabledStore = struct {
      /// whether any bytes moved.
      pub fn flushPending(self: *EnabledStore) bool {
          var moved = false;
@@ -974,6 +1445,170 @@ index 808265e..875093f 100644
              const session = entry.session orelse continue;
              if (session.ended) continue;
              if (session.outbound_len == 0 and session.response_len == 0) continue;
+@@ -602,7 +630,7 @@ const Session = if (enabled) struct {
+             .bell = null,
+             .clipboard_write = null,
+             .color_scheme = null,
+-            .device_attributes = null,
++            .device_attributes = deviceAttributes,
+             .enquiry = null,
+             .size = null,
+             .title_changed = null,
+@@ -703,6 +731,13 @@ const Session = if (enabled) struct {
+         session.response_len += bytes.len;
+     }
+ 
++    /// Advertise the libghostty-vt defaults (VT220 + ANSI color). Leaving
++    /// this callback null makes DA1 queries disappear even though write_pty
++    /// is wired, which stalls shells such as fish during startup.
++    fn deviceAttributes(_: *vt.TerminalStream.Handler) DeviceAttributes {
++        return .{};
++    }
++
+     fn clearResponses(session: *Session) void {
+         session.response_len = 0;
+     }
+@@ -1240,9 +1275,8 @@ const Session = if (enabled) struct {
+ 
+     /// Rebuild the published `canvas.TerminalGrid` from the emulator's
+     /// render state, colors RESOLVED per the painter's contract: the
+-    /// theme-derived ANSI-16 story (untouched palette entries derive
+-    /// from the active tokens; an OSC-restyled slot wins verbatim),
+-    /// exact 256-color and truecolor pass-through, inverse/faint/
++    /// emulator-owned ANSI/256-color palette (including OSC overrides),
++    /// exact truecolor pass-through, inverse/faint/
+     /// invisible folded in, and a spacer cell's background pre-resolved
+     /// to extend its wide primary's.
+     fn rebuildSnapshot(session: *Session, tokens: canvas.DesignTokens) !void {
+@@ -1260,7 +1294,7 @@ const Session = if (enabled) struct {
+ 
+         try session.render.update(gpa, &session.term);
+         const rs = &session.render;
+-        const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
++        const palette = Palette.init(&rs.colors, &session.term.colors.palette);
+ 
+         const row_count = @min(rs.row_data.len, canvas.max_terminal_rows);
+         var col_count: usize = 0;
+@@ -1464,58 +1498,24 @@ fn rgbToColor(rgb: anytype) canvas.Color {
+     return canvas.Color.rgb8(rgb.r, rgb.g, rgb.b);
+ }
+ 
+-/// The theme mapping, stated plainly: where the emulator's palette entry
+-/// still holds its DEFAULT value, the ANSI-16 slot derives from the
+-/// active theme tokens so a themed app and its terminal read as one
+-/// surface. The moment a program restyles an entry (OSC 4), the
+-/// programmed color wins verbatim — and the cube (16..231), the
+-/// grayscale ramp (232..255), and truecolor always pass through exactly.
+-/// (The example tier's palette, promoted with the session store.)
++/// Preserve the emulator's complete palette verbatim. libghostty-vt owns the
++/// readable ANSI-16 defaults, xterm cube/grayscale entries, and OSC 4 runtime
++/// overrides; the renderer must not replace or dim the first 16 slots. RGB
++/// styles bypass this table below and therefore remain exact truecolor.
+ const Palette = if (enabled) struct {
+     background: canvas.Color,
+     foreground: canvas.Color,
+-    ansi: [16]canvas.Color,
+-    /// The emulator's live palette WITH its override mask, so an
+-    /// explicit OSC 4 set is honored even when it equals the default
+-    /// RGB — the mask, not RGB equality, decides "untouched".
+     dynamic: *const vt.color.DynamicPalette,
+ 
+-    fn init(tokens: canvas.DesignTokens, terminal_colors: *const vt.RenderState.Colors, dynamic: *const vt.color.DynamicPalette) Palette {
+-        const colors = tokens.colors;
+-        const dark = colors.background.r + colors.background.g + colors.background.b < 1.5;
+-        const dim: f32 = if (dark) 0.85 else 1.0;
+-        const bright: f32 = if (dark) 1.0 else 0.8;
++    fn init(terminal_colors: *const vt.RenderState.Colors, dynamic: *const vt.color.DynamicPalette) Palette {
+         return .{
+             .background = rgbToColor(terminal_colors.background),
+             .foreground = rgbToColor(terminal_colors.foreground),
+             .dynamic = dynamic,
+-            .ansi = .{
+-                // 0-7: black, red, green, yellow, blue, magenta, cyan, white.
+-                blend(colors.text, colors.background, if (dark) 0.35 else 0.95),
+-                scale(colors.destructive, dim),
+-                scale(colors.success, dim),
+-                scale(colors.warning, dim),
+-                scale(canvas.Color.rgb8(37, 99, 235), dim),
+-                scale(canvas.Color.rgb8(147, 51, 234), dim),
+-                scale(canvas.Color.rgb8(8, 145, 178), dim),
+-                blend(colors.text, colors.background, if (dark) 0.75 else 0.35),
+-                // 8-15: the bright ramp.
+-                blend(colors.text, colors.background, if (dark) 0.5 else 0.75),
+-                scale(colors.destructive, bright),
+-                scale(colors.success, bright),
+-                scale(colors.warning, bright),
+-                scale(canvas.Color.rgb8(59, 130, 246), bright),
+-                scale(canvas.Color.rgb8(168, 85, 247), bright),
+-                scale(canvas.Color.rgb8(34, 211, 238), bright),
+-                colors.text,
+-            },
+         };
+     }
+ 
+     fn indexed(palette: *const Palette, index: u8) canvas.Color {
+-        if (index < 16 and !palette.dynamic.mask.isSet(index)) {
+-            return palette.ansi[index];
+-        }
+         const live = palette.dynamic.current[index];
+         return canvas.Color.rgb8(live.r, live.g, live.b);
+     }
+@@ -1558,12 +1558,4 @@ const Palette = if (enabled) struct {
+         );
+     }
+ 
+-    fn scale(color: canvas.Color, factor: f32) canvas.Color {
+-        return canvas.Color.rgba(
+-            @min(1, color.r * factor),
+-            @min(1, color.g * factor),
+-            @min(1, color.b * factor),
+-            1,
+-        );
+-    }
+ } else struct {};
+diff --git a/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig b/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig
+index 951dbaa..98bf911 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/terminal_session_tests.zig
+@@ -87,12 +87,21 @@ test "binding a pty key publishes a live grid that carries fed output as real ce
+     try testing.expect(refreshed.rows.len > 0);
+     try testing.expectEqual(@as(u21, 'h'), refreshed.rows[0].cells[0].cp);
+     try testing.expectEqualStrings("h", refreshed.rows[0].cells[0].cluster);
+-    // A default (untouched) ANSI-31 red resolves through the theme's
+-    // destructive token, the palette-honesty story.
+-    const tokens: canvas.DesignTokens = .{};
++    // ANSI-31 is libghostty-vt's exact default red (#cc6666), not a
++    // theme-token replacement or a dimmed approximation.
+     const red_cell = refreshed.rows[0].cells[6];
+     try testing.expectEqual(@as(u21, 'w'), red_cell.cp);
+-    try testing.expectApproxEqAbs(tokens.colors.destructive.r, red_cell.fg.r, 0.2);
++    try testing.expectApproxEqAbs(@as(f32, 0xcc) / 255.0, red_cell.fg.r, 0.001);
++    try testing.expectApproxEqAbs(@as(f32, 0x66) / 255.0, red_cell.fg.g, 0.001);
++    try testing.expectApproxEqAbs(@as(f32, 0x66) / 255.0, red_cell.fg.b, 0.001);
++
++    feedOutput(&store, 7, "\x1b[38;2;1;2;3mX\x1b[0m");
++    const truecolor = resolveGrid(&store, 7) orelse return error.TestExpectedGrid;
++    const rgb_cell = truecolor.rows[1].cells[2];
++    try testing.expectEqual(@as(u21, 'X'), rgb_cell.cp);
++    try testing.expectApproxEqAbs(@as(f32, 1) / 255.0, rgb_cell.fg.r, 0.001);
++    try testing.expectApproxEqAbs(@as(f32, 2) / 255.0, rgb_cell.fg.g, 0.001);
++    try testing.expectApproxEqAbs(@as(f32, 3) / 255.0, rgb_cell.fg.b, 0.001);
+ }
+ 
+ test "pointer gestures select terminal cells words and lines for clipboard copy" {
+@@ -428,6 +437,12 @@ test "emulator query answers write back to the pty through the ring" {
+     feedOutput(&store, 4, "\x1b[6n");
+     try testing.expect(std.mem.indexOf(u8, gw.written.items, "\x1b[") != null);
+     try testing.expect(std.mem.indexOf(u8, gw.written.items, "R") != null);
++
++    // Primary Device Attributes must answer as well. Fish probes this during
++    // startup and otherwise waits two seconds before disabling capabilities.
++    gw.written.clearRetainingCapacity();
++    feedOutput(&store, 4, "\x1b[c");
++    try testing.expectEqualStrings("\x1b[?62;22c", gw.written.items);
+ }
+ 
+ test "the wide-cell spacer extends its primary's background in the published snapshot" {
 diff --git a/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig b/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
 index becd14f..063c209 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
