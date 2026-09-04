@@ -120,6 +120,11 @@ The native container is detached while any modal is open. Tabs from
 another worktree remain alive but are filtered from the current tab strip, so
 switching worktrees restores that worktree's last active tab.
 
+`profile_editor.zig` owns the profile draft, validation, pending confirmations
+and write lifecycle. It prepares borrowed save data and resolves selection after
+reload by database identity. `main.zig` keeps the SQLite effects and UI section
+routing; the Electron-compatible schema and profile JSON dialect are unchanged.
+
 `ghostty_bridge.h` is the shared ABI contract, imported by Zig through
 `ghostty_abi.zig`; named events route by tab identity, not recycled PTY keys.
 `ghostty_input.h` holds the tested mouse/overlay gating policy used by AppKit.

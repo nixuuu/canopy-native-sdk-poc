@@ -43,6 +43,6 @@
   <if test="{remove_dialog_open}"><use template="remove-worktree-dialog" /></if>
   <if test="{detach_dialog_open}"><use template="detach-project-dialog" /></if>
   <if test="{preferences_open}"><use template="preferences-dialog" /></if>
-  <if test="{profile_switch_dialog_open}"><use template="profile-switch-dialog" /></if>
-  <if test="{profile_delete_dialog_open}"><use template="profile-delete-dialog" /></if>
+  <if test="{profileSwitchDialogOpen}"><use template="profile-switch-dialog" /></if>
+  <if test="{profileDeleteDialogOpen}"><use template="profile-delete-dialog" /></if>
 </stack>

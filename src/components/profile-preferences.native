@@ -4,7 +4,7 @@
     <column width="180" gap="8">
       <row height="28" padding="4" cross="center">
         <text size="sm" foreground="disabled" grow="1"><span scale="0.91" weight="medium">PROFILES</span></text>
-        <button width="24" height="24" size="icon" variant="ghost" icon="plus" on-press="new_profile" label="New profile" disabled="{profiles_saving}"></button>
+        <button width="24" height="24" size="icon" variant="ghost" icon="plus" on-press="new_profile" label="New profile" disabled="{profile_edit.saving}"></button>
       </row>
       <scroll grow="1" label="Agent profiles">
         <column gap="1">
@@ -25,7 +25,7 @@
     <column grow="1">
       <row height="52" gap="12" cross="end">
         <column grow="1" gap="4"><text size="sm" foreground="disabled"><span scale="0.91" weight="medium">PROFILE NAME</span></text><text-field size="lg" height="33" text="{profileNameText}" placeholder="Profile name" on-input="edit_profile_name" label="Profile name" /></column>
-        <if test="{profile_dirty}"><text size="sm" foreground="warning">Unsaved changes</text></if>
+        <if test="{profile_edit.dirty}"><text size="sm" foreground="warning">Unsaved changes</text></if>
         <button height="28" variant="secondary" on-press="save_profile" disabled="{profileSaveDisabled}">{profileSaveLabel}</button>
       </row>
       <separator />

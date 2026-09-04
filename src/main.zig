@@ -40,7 +40,6 @@ pub const TerminalTab = terminal_tabs.Tab;
 pub const TerminalTabRow = terminal_tabs.Row;
 pub const TabStore = terminal_tabs.Store;
 pub const PreferencesSection = enum { general, appearance, worktrees, claude, codex };
-const ProfileDbOperation = enum { none, save, delete };
 
 pub const PathPayload = struct {
     bytes: [workspaces.max_path_bytes]u8 = @splat(0),
@@ -115,18 +114,7 @@ pub const Model = struct {
     preferences_db_path: workspaces.PathText = .{},
     default_worktrees_base: workspaces.PathText = .{},
     worktrees_base_serial: u64 = 0,
-    profiles_loaded: bool = false,
-    profiles_load_valid: bool = true,
-    profiles_saving: bool = false,
-    profile_db_operation: ProfileDbOperation = .none,
-    selected_profile_id: u64 = 0,
-    profile_draft: profile_editor.Draft = .{},
-    profile_dirty: bool = false,
-    profile_switch_dialog_open: bool = false,
-    profile_pending_select_id: u64 = 0,
-    profile_delete_dialog_open: bool = false,
-    profile_pending_delete_id: u64 = 0,
-    profile_select_after_load: profiles_mod.IdText = .{},
+    profile_edit: profile_editor.State = .{},
     claude_expanded: bool = false,
     codex_expanded: bool = false,
     claude_available: bool = false,
@@ -186,18 +174,7 @@ pub const Model = struct {
         "preferences_db_path",
         "default_worktrees_base",
         "worktrees_base_serial",
-        "profiles_loaded",
-        "profiles_load_valid",
-        "profiles_saving",
-        "profile_db_operation",
-        "selected_profile_id",
-        "profile_draft",
-        "profile_dirty",
-        "profile_switch_dialog_open",
-        "profile_pending_select_id",
-        "profile_delete_dialog_open",
-        "profile_pending_delete_id",
-        "profile_select_after_load",
+        "profile_edit",
         "claude_expanded",
         "codex_expanded",
         "claude_available",
@@ -508,7 +485,7 @@ pub const Model = struct {
     }
 
     pub fn preferencesDisabled(model: *const Model) bool {
-        return !model.preferences_loaded or model.preferences_saving or model.profiles_saving;
+        return !model.preferences_loaded or model.preferences_saving or model.profile_edit.saving();
     }
 
     pub fn preferencesSaveLabel(model: *const Model) []const u8 {
@@ -520,7 +497,7 @@ pub const Model = struct {
     }
 
     pub fn toolsReady(model: *const Model) bool {
-        return model.profiles_loaded and model.tool_checks_remaining == 0;
+        return model.profile_edit.loaded and model.tool_checks_remaining == 0;
     }
 
     pub fn toolsLoading(model: *const Model) bool {
@@ -557,7 +534,7 @@ pub const Model = struct {
 
     pub fn profileRows(model: *const Model, arena: std.mem.Allocator) []const profiles_mod.ProfileRow {
         const agent_type: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
-        return model.profile_store.rows(arena, agent_type, model.selected_profile_id);
+        return model.profile_store.rows(arena, agent_type, model.profile_edit.selected_id);
     }
 
     pub fn claudeRunningCount(model: *const Model) usize {
@@ -569,73 +546,80 @@ pub const Model = struct {
     }
 
     pub fn profileNameText(model: *const Model) []const u8 {
-        return model.profile_draft.name.text();
+        return model.profile_edit.draft.name.text();
     }
 
     pub fn profileModelText(model: *const Model) []const u8 {
-        return model.profile_draft.model.text();
+        return model.profile_edit.draft.model.text();
     }
 
     pub fn profileBaseUrlText(model: *const Model) []const u8 {
-        return model.profile_draft.base_url.text();
+        return model.profile_edit.draft.base_url.text();
     }
 
     pub fn profileAppendPromptText(model: *const Model) []const u8 {
-        return model.profile_draft.append_system_prompt.text();
+        return model.profile_edit.draft.append_system_prompt.text();
     }
 
     pub fn profileCustomEnvText(model: *const Model) []const u8 {
-        return model.profile_draft.custom_env.text();
+        return model.profile_edit.draft.custom_env.text();
     }
 
     pub fn profileSettingsJsonText(model: *const Model) []const u8 {
-        return model.profile_draft.settings_json.text();
+        return model.profile_edit.draft.settings_json.text();
     }
 
     pub fn profileCodexConfigProfileText(model: *const Model) []const u8 {
-        return model.profile_draft.profile.text();
+        return model.profile_edit.draft.profile.text();
     }
 
     pub fn profilePermissionValue(model: *const Model) []const u8 {
-        return model.profile_draft.permission_mode.text();
+        return model.profile_edit.draft.permission_mode.text();
     }
 
     pub fn profileEffortValue(model: *const Model) []const u8 {
-        return model.profile_draft.effort_level.text();
+        return model.profile_edit.draft.effort_level.text();
     }
 
     pub fn profileProviderValue(model: *const Model) []const u8 {
-        return model.profile_draft.provider.text();
+        return model.profile_edit.draft.provider.text();
     }
 
     pub fn profileApprovalValue(model: *const Model) []const u8 {
-        return model.profile_draft.approval_mode.text();
+        return model.profile_edit.draft.approval_mode.text();
     }
 
     pub fn profileSandboxValue(model: *const Model) []const u8 {
-        return model.profile_draft.sandbox.text();
+        return model.profile_edit.draft.sandbox.text();
     }
 
     pub fn profileFullAuto(model: *const Model) bool {
-        return model.profile_draft.full_auto;
+        return model.profile_edit.draft.full_auto;
     }
 
     pub fn profileDangerousBypass(model: *const Model) bool {
-        return model.profile_draft.dangerously_bypass_approvals_and_sandbox;
+        return model.profile_edit.draft.dangerously_bypass_approvals_and_sandbox;
     }
 
     pub fn profileSaveDisabled(model: *const Model) bool {
-        const name = std.mem.trim(u8, model.profile_draft.name.text(), " ");
-        return model.profiles_saving or !model.profile_dirty or name.len == 0;
+        const name = std.mem.trim(u8, model.profile_edit.draft.name.text(), " ");
+        return model.profile_edit.saving() or !model.profile_edit.dirty or name.len == 0;
     }
 
     pub fn profileSaveLabel(model: *const Model) []const u8 {
-        return if (model.profiles_saving) "Saving..." else "Save profile";
+        return if (model.profile_edit.saving()) "Saving..." else "Save profile";
     }
 
     pub fn profileDeleteName(model: *const Model) []const u8 {
-        const profile = model.profile_store.find(model.profile_pending_delete_id) orelse return "profile";
+        const profile = model.profile_store.find(model.profile_edit.pending_delete orelse return "profile") orelse return "profile";
         return profile.name.slice();
+    }
+
+    pub fn profileSwitchDialogOpen(model: *const Model) bool {
+        return model.profile_edit.pending_switch != null;
+    }
+    pub fn profileDeleteDialogOpen(model: *const Model) bool {
+        return model.profile_edit.pending_delete != null;
     }
 
     fn runningCount(model: *const Model, tool: TerminalTool) usize {
@@ -661,7 +645,7 @@ pub const Model = struct {
     }
 
     pub fn terminalActionsBlocked(model: *const Model) bool {
-        return model.preferences_open or model.create_dialog_open or model.remove_dialog_open or model.detach_dialog_open or model.profile_switch_dialog_open or model.profile_delete_dialog_open;
+        return model.preferences_open or model.create_dialog_open or model.remove_dialog_open or model.detach_dialog_open or model.profileSwitchDialogOpen() or model.profileDeleteDialogOpen();
     }
 
     pub fn canCloseActiveTab(model: *const Model) bool {
@@ -1130,16 +1114,13 @@ fn openPreferences(model: *Model) void {
 }
 
 fn closePreferences(model: *Model) void {
-    if (model.preferences_saving or model.profiles_saving) return;
+    if (model.preferences_saving or model.profile_edit.saving()) return;
     model.preferences_draft = model.preferences_saved;
     model.preferences_base_dir.clear();
     model.preferences_search.clear();
     model.preferences_dirty = false;
     model.preferences_open = false;
-    model.profile_switch_dialog_open = false;
-    model.profile_delete_dialog_open = false;
-    model.profile_dirty = false;
-    if (model.profile_store.find(model.selected_profile_id)) |profile| model.profile_draft.load(profile);
+    model.profile_edit.close(model.profile_store);
     model.status_text = "Preferences unchanged";
 }
 
@@ -1186,179 +1167,57 @@ pub const profile_write_key: u64 = 8_003;
 const claude_check_key: u64 = 8_100;
 const codex_check_key: u64 = 8_101;
 
-fn loadProfileDraft(model: *Model, runtime_id: u64) void {
-    const profile = model.profile_store.find(runtime_id) orelse return;
-    model.selected_profile_id = runtime_id;
-    model.profile_draft.load(profile);
-    model.profile_dirty = false;
-}
-
 fn openProfileSection(model: *Model, agent_type: profiles_mod.AgentType) void {
-    if (!model.profiles_loaded or model.profiles_saving) return;
-    model.preferences_section = switch (agent_type) {
-        .claude => .claude,
-        .codex => .codex,
-    };
-    const selected = model.profile_store.find(model.selected_profile_id);
-    if (selected == null or selected.?.agent_type != agent_type) {
-        if (model.profile_store.default(agent_type)) |profile| loadProfileDraft(model, profile.runtime_id);
-    }
+    if (!model.profile_edit.openAgent(model.profile_store, agent_type)) return;
+    model.preferences_section = if (agent_type == .codex) .codex else .claude;
 }
 
 fn reloadProfiles(model: *Model, fx: *Effects, select_database_id: []const u8) void {
-    model.profile_store.clear();
-    model.profiles_loaded = false;
-    model.profiles_load_valid = true;
-    model.profile_select_after_load.len = 0;
-    _ = model.profile_select_after_load.set(select_database_id);
-    fx.dbQuery(.{
-        .key = profiles_load_key,
-        .sql = profiles_mod.load_sql,
-        .on_result = Effects.dbMsg(.profiles_load_done),
-    });
+    model.profile_edit.beginReload(model.profile_store, select_database_id);
+    fx.dbQuery(.{ .key = profiles_load_key, .sql = profiles_mod.load_sql, .on_result = Effects.dbMsg(.profiles_load_done) });
 }
 
 fn finishProfilesLoad(model: *Model) void {
-    model.profiles_loaded = model.profiles_load_valid;
-    if (!model.profiles_loaded) {
-        model.status_text = "Agent profiles could not be loaded";
-        return;
-    }
-    const selected = if (model.profile_select_after_load.len > 0)
-        model.profile_store.findByDatabaseId(model.profile_select_after_load.slice())
-    else
-        null;
-    if (selected) |profile| {
-        loadProfileDraft(model, profile.runtime_id);
-    } else {
-        const agent_type: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
-        if (model.profile_store.default(agent_type)) |profile| loadProfileDraft(model, profile.runtime_id);
-    }
-    model.profile_select_after_load.len = 0;
-}
-
-fn uniqueNewProfileName(model: *const Model, agent_type: profiles_mod.AgentType, out: []u8) ?[]const u8 {
-    if (!model.profile_store.nameExists(agent_type, "New profile", 0)) return "New profile";
-    var suffix: usize = 2;
-    while (suffix < 1000) : (suffix += 1) {
-        const candidate = std.fmt.bufPrint(out, "New profile {d}", .{suffix}) catch return null;
-        if (!model.profile_store.nameExists(agent_type, candidate, 0)) return candidate;
-    }
-    return null;
+    const agent: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
+    if (!model.profile_edit.finishLoad(model.profile_store, agent)) model.status_text = "Agent profiles could not be loaded";
 }
 
 fn createProfileDraft(model: *Model) void {
-    if (!model.profiles_loaded or model.profiles_saving or !model.preferencesProfileSelected()) return;
-    const agent_type: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
-    var name_buffer: [profiles_mod.max_profile_name_bytes]u8 = undefined;
-    const name = uniqueNewProfileName(model, agent_type, &name_buffer) orelse {
-        model.status_text = "Could not allocate a profile name";
-        return;
-    };
-    var id_buffer: [profiles_mod.max_profile_id_bytes]u8 = undefined;
-    const database_id = model.profile_store.newDatabaseId(agent_type, &id_buffer) orelse {
-        model.status_text = "Could not allocate a profile id";
-        return;
-    };
-    model.selected_profile_id = 0;
-    model.profile_draft.create(agent_type, name, model.profile_store.nextSortIndex(agent_type), database_id);
-    model.profile_dirty = true;
-    model.status_text = "New profile draft";
-}
-
-fn selectProfile(model: *Model, runtime_id: u64) void {
-    if (runtime_id == model.selected_profile_id or model.profiles_saving) return;
-    if (model.profile_dirty) {
-        model.profile_pending_select_id = runtime_id;
-        model.profile_switch_dialog_open = true;
-        return;
-    }
-    loadProfileDraft(model, runtime_id);
-}
-
-fn profileChoiceValid(value: []const u8, allowed: []const []const u8) bool {
-    if (value.len == 0) return true;
-    for (allowed) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
-    return false;
-}
-
-fn profileDraftValid(model: *Model) bool {
-    const draft = &model.profile_draft;
-    const valid = switch (draft.agent_type) {
-        .claude => profileChoiceValid(draft.permission_mode.text(), &.{ "plan", "auto", "acceptEdits", "bypassPermissions" }) and
-            profileChoiceValid(draft.effort_level.text(), &.{ "low", "medium", "high", "xhigh", "max" }) and
-            profileChoiceValid(draft.provider.text(), &.{ "bedrock", "vertex", "foundry" }),
-        .codex => profileChoiceValid(draft.approval_mode.text(), &.{ "untrusted", "on-request", "never" }) and
-            profileChoiceValid(draft.sandbox.text(), &.{ "read-only", "workspace-write", "danger-full-access" }),
-    };
-    if (!valid) model.status_text = "One or more profile choices are invalid";
-    return valid;
+    if (!model.preferencesProfileSelected()) return;
+    const agent: profiles_mod.AgentType = if (model.preferences_section == .codex) .codex else .claude;
+    if (model.profile_edit.create(model.profile_store, agent)) |message| model.status_text = message;
 }
 
 fn saveProfile(model: *Model, fx: *Effects) void {
-    if (!model.profiles_loaded or model.profiles_saving or !model.profile_dirty) return;
-    const name = std.mem.trim(u8, model.profile_draft.name.text(), " ");
-    if (name.len == 0) {
-        model.status_text = "Profile name is required";
-        return;
-    }
-    if (model.profile_store.nameExists(model.profile_draft.agent_type, name, model.profile_draft.runtime_id)) {
-        model.status_text = "A profile with this name already exists";
-        return;
-    }
-    if (!profileDraftValid(model)) return;
-    const prefs = model.profile_draft.toPrefs();
     var json_buffer: [profiles_mod.max_long_pref_bytes * 3]u8 = undefined;
-    const prefs_json = profiles_mod.encodePrefs(&prefs, &json_buffer) orelse {
-        model.status_text = "Profile settings are too large";
-        return;
+    const save = switch (model.profile_edit.prepareSave(model.profile_store, &json_buffer)) {
+        .skip => return,
+        .invalid => |message| {
+            model.status_text = message;
+            return;
+        },
+        .ready => |prepared| prepared,
     };
-    const statements = if (model.profile_draft.is_new)
+    const statements = if (save.is_new)
         [_]native_sdk.EffectDbStatement{.{
             .sql = "INSERT INTO agent_profiles (id, agent_type, name, is_default, sort_index, prefs_json, api_key_enc) VALUES (?1, ?2, ?3, 0, ?4, ?5, NULL);",
-            .params = &.{
-                .{ .text = model.profile_draft.database_id.text() },
-                .{ .text = @tagName(model.profile_draft.agent_type) },
-                .{ .text = name },
-                .{ .integer = model.profile_draft.sort_index },
-                .{ .text = prefs_json },
-            },
+            .params = &.{ .{ .text = save.id }, .{ .text = @tagName(save.agent) }, .{ .text = save.name }, .{ .integer = save.sort_index }, .{ .text = save.prefs_json } },
         }}
     else
         [_]native_sdk.EffectDbStatement{.{
             .sql = "UPDATE agent_profiles SET name = ?1, prefs_json = ?2, sort_index = ?3, updated_at = datetime('now') WHERE id = ?4;",
-            .params = &.{
-                .{ .text = name },
-                .{ .text = prefs_json },
-                .{ .integer = model.profile_draft.sort_index },
-                .{ .text = model.profile_draft.database_id.text() },
-            },
+            .params = &.{ .{ .text = save.name }, .{ .text = save.prefs_json }, .{ .integer = save.sort_index }, .{ .text = save.id } },
         }};
-    model.profiles_saving = true;
-    model.profile_db_operation = .save;
     model.status_text = "Saving agent profile";
-    fx.dbExec(.{
-        .key = profile_write_key,
-        .statements = &statements,
-        .on_result = Effects.dbMsg(.profile_db_done),
-    });
+    fx.dbExec(.{ .key = profile_write_key, .statements = &statements, .on_result = Effects.dbMsg(.profile_db_done) });
 }
 
 fn deleteProfile(model: *Model, fx: *Effects) void {
-    const profile = model.profile_store.find(model.profile_pending_delete_id) orelse return;
-    if (model.profile_store.count(profile.agent_type) <= 1 or model.profiles_saving) return;
-    const statements = [_]native_sdk.EffectDbStatement{.{
-        .sql = "DELETE FROM agent_profiles WHERE id = ?1;",
-        .params = &.{.{ .text = profile.id.slice() }},
-    }};
-    model.profile_delete_dialog_open = false;
-    model.profiles_saving = true;
-    model.profile_db_operation = .delete;
-    model.profile_select_after_load.len = 0;
+    const id = model.profile_edit.prepareDelete(model.profile_store) orelse return;
     model.status_text = "Deleting agent profile";
     fx.dbExec(.{
         .key = profile_write_key,
-        .statements = &statements,
+        .statements = &.{.{ .sql = "DELETE FROM agent_profiles WHERE id = ?1;", .params = &.{.{ .text = id }} }},
         .on_result = Effects.dbMsg(.profile_db_done),
     });
 }
@@ -1441,13 +1300,13 @@ fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mod.Pr
 }
 
 fn launchDefaultTool(model: *Model, fx: *Effects, agent_type: profiles_mod.AgentType) void {
-    if (!model.profiles_loaded) return;
+    if (!model.profile_edit.loaded) return;
     const profile = model.profile_store.default(agent_type) orelse return;
     spawnProfileTool(model, fx, profile);
 }
 
 fn launchProfileTool(model: *Model, fx: *Effects, runtime_id: u64) void {
-    if (!model.profiles_loaded) return;
+    if (!model.profile_edit.loaded) return;
     const profile = model.profile_store.find(runtime_id) orelse return;
     spawnProfileTool(model, fx, profile);
 }
@@ -1480,29 +1339,21 @@ fn handleProfilesLoadResult(model: *Model, result: native_sdk.EffectDbResult) vo
     if (result.key != profiles_load_key) return;
     switch (result.kind) {
         .page => if (result.outcome != .ok or !model.profile_store.appendEncodedPage(result.bytes)) {
-            model.profiles_load_valid = false;
+            model.profile_edit.load_valid = false;
         },
         .done => {
-            if (result.outcome != .ok) model.profiles_load_valid = false;
+            if (result.outcome != .ok) model.profile_edit.load_valid = false;
             finishProfilesLoad(model);
         },
-        .exec => model.profiles_load_valid = false,
+        .exec => model.profile_edit.load_valid = false,
     }
 }
 
 fn handleProfileWriteResult(model: *Model, fx: *Effects, result: native_sdk.EffectDbResult) void {
     if (result.key != profile_write_key or result.kind != .exec) return;
-    const operation = model.profile_db_operation;
-    model.profile_db_operation = .none;
-    model.profiles_saving = false;
-    if (result.outcome != .ok) {
-        model.status_text = if (result.outcome == .busy) "Profiles database is busy; try again" else "Agent profile could not be saved";
-        return;
-    }
-    const select_id = if (operation == .save) model.profile_draft.database_id.text() else "";
-    model.profile_dirty = false;
-    reloadProfiles(model, fx, select_id);
-    model.status_text = if (operation == .delete) "Agent profile deleted" else "Agent profile saved";
+    const completed = model.profile_edit.finishWrite(result.outcome == .ok, result.outcome == .busy);
+    if (completed.reload) reloadProfiles(model, fx, completed.select_id.slice());
+    model.status_text = completed.message;
 }
 
 fn handleToolCheckResult(model: *Model, exit: native_sdk.EffectExit) void {
@@ -1516,8 +1367,7 @@ fn handleToolCheckResult(model: *Model, exit: native_sdk.EffectExit) void {
 }
 
 fn editProfileDraft(model: *Model, field: profile_editor.TextField, edit: canvas.TextInputEvent) void {
-    model.profile_draft.applyTextEdit(field, edit);
-    model.profile_dirty = true;
+    model.profile_edit.edit(field, edit);
 }
 
 fn handleStoreResult(model: *Model, fx: *Effects, result: native_sdk.EffectFileResult) void {
@@ -1852,27 +1702,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             launchProfileTool(model, fx, id);
         },
         .new_profile => createProfileDraft(model),
-        .select_profile => |id| selectProfile(model, id),
-        .confirm_profile_switch => {
-            const id = model.profile_pending_select_id;
-            model.profile_pending_select_id = 0;
-            model.profile_switch_dialog_open = false;
-            model.profile_dirty = false;
-            loadProfileDraft(model, id);
-        },
-        .cancel_profile_switch => {
-            model.profile_pending_select_id = 0;
-            model.profile_switch_dialog_open = false;
-        },
-        .request_delete_profile => |id| if (!model.profiles_saving) {
-            model.profile_pending_delete_id = id;
-            model.profile_delete_dialog_open = true;
-        },
+        .select_profile => |id| model.profile_edit.select(model.profile_store, id),
+        .confirm_profile_switch => model.profile_edit.confirmSwitch(model.profile_store),
+        .cancel_profile_switch => model.profile_edit.cancelSwitch(),
+        .request_delete_profile => |id| model.profile_edit.requestDelete(id),
         .confirm_delete_profile => deleteProfile(model, fx),
-        .cancel_delete_profile => {
-            model.profile_pending_delete_id = 0;
-            model.profile_delete_dialog_open = false;
-        },
+        .cancel_delete_profile => model.profile_edit.cancelDelete(),
         .save_profile => saveProfile(model, fx),
         .edit_profile_name => |edit| editProfileDraft(model, .name, edit),
         .edit_profile_model => |edit| editProfileDraft(model, .model, edit),
@@ -1886,14 +1721,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .edit_profile_custom_env => |edit| editProfileDraft(model, .custom_env, edit),
         .edit_profile_settings_json => |edit| editProfileDraft(model, .settings_json, edit),
         .edit_profile_codex_profile => |edit| editProfileDraft(model, .profile, edit),
-        .toggle_profile_full_auto => {
-            model.profile_draft.full_auto = !model.profile_draft.full_auto;
-            model.profile_dirty = true;
-        },
-        .toggle_profile_dangerous_bypass => {
-            model.profile_draft.dangerously_bypass_approvals_and_sandbox = !model.profile_draft.dangerously_bypass_approvals_and_sandbox;
-            model.profile_dirty = true;
-        },
+        .toggle_profile_full_auto => model.profile_edit.toggleFullAuto(),
+        .toggle_profile_dangerous_bypass => model.profile_edit.toggleDangerousBypass(),
         .git_done => |exit| handleGitResult(model, fx, git_cli.result(exit)),
         .store_done => |result| handleStoreResult(model, fx, result),
         .terminal_event => |event| handleTerminalEvent(model, fx, event),

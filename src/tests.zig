@@ -4,6 +4,59 @@ const profiles = @import("profiles.zig");
 const workspaces = @import("workspaces.zig");
 const sdk = @import("native_sdk");
 
+test "profile switch confirmation preserves edits on cancel and discards only on confirm" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    _ = try addProfile(stores, 1, .claude, "First");
+    _ = try addProfile(stores, 2, .claude, "Second");
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    model.profile_edit.loaded = true;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&model, .show_preferences_claude, &fx);
+    model.profile_edit.draft.name.set("Unsaved");
+    model.profile_edit.dirty = true;
+    app.update(&model, .{ .select_profile = 2 }, &fx);
+    try std.testing.expect(model.profileSwitchDialogOpen());
+    try std.testing.expectEqual(@as(u64, 1), model.profile_edit.selected_id);
+    app.update(&model, .cancel_profile_switch, &fx);
+    try std.testing.expect(model.profile_edit.dirty and !model.profileSwitchDialogOpen());
+    try std.testing.expectEqualStrings("Unsaved", model.profile_edit.draft.name.text());
+    app.update(&model, .{ .select_profile = 2 }, &fx);
+    app.update(&model, .confirm_profile_switch, &fx);
+    try std.testing.expect(!model.profile_edit.dirty and !model.profileSwitchDialogOpen());
+    try std.testing.expectEqual(@as(u64, 2), model.profile_edit.selected_id);
+    try std.testing.expectEqualStrings("Second", model.profile_edit.draft.name.text());
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingDbCount());
+}
+
+test "failed profile save preserves draft and can be retried without switching during write" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    _ = try addProfile(stores, 1, .claude, "First");
+    _ = try addProfile(stores, 2, .claude, "Second");
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    model.profile_edit.loaded = true;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&model, .show_preferences_claude, &fx);
+    model.profile_edit.draft.name.set("Edited");
+    model.profile_edit.dirty = true;
+    app.update(&model, .save_profile, &fx);
+    app.update(&model, .{ .select_profile = 2 }, &fx);
+    try std.testing.expectEqual(@as(u64, 1), model.profile_edit.selected_id);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
+    try fx.feedDbResult(app.profile_write_key, .exec, .busy, "");
+    while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
+    try std.testing.expect(!model.profile_edit.saving() and model.profile_edit.dirty);
+    try std.testing.expectEqualStrings("Edited", model.profile_edit.draft.name.text());
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingDbCount());
+    app.update(&model, .save_profile, &fx);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
+}
+
 test "sidebar saves only on commit, coalesces outstanding writes and ignores collapse geometry" {
     const stores = try Stores.init();
     defer stores.deinit();
@@ -333,7 +386,7 @@ test "shell and tool allocation failure leave no tab or pending process" {
             model.use_ghostty = ghostty;
             model.active_workspace_id = stores.projects.attachPlaceholder("/tmp/start-failure").?.workspace_id;
             _ = try addProfile(stores, 1, .codex, "Default");
-            model.profiles_loaded = true;
+            model.profile_edit.loaded = true;
             model.codex_available = true;
             try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
             try stores.tabs.free_pty_keys.ensureTotalCapacity(failing.allocator(), 1);
@@ -361,7 +414,7 @@ test "failed Ghostty handoff stays closable and retries with a fresh tab identit
         model.use_ghostty = true;
         model.active_workspace_id = stores.projects.attachPlaceholder("/tmp/handoff-failure").?.workspace_id;
         _ = try addProfile(stores, 1, .codex, "Default");
-        model.profiles_loaded = true;
+        model.profile_edit.loaded = true;
         model.codex_available = true;
         try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
         try stores.tabs.items.ensureTotalCapacity(failing.allocator(), 1);
@@ -809,7 +862,7 @@ test "Claude profiles launch worktree-owned PTYs with matching argv and environm
     try std.testing.expect(profile.prefs.permission_mode.set("plan"));
     try std.testing.expect(profile.prefs.base_url.set("https://proxy.example"));
     try std.testing.expect(profile.prefs.custom_env.set("{\"CANOPY_TEST_COLOR\":\"violet\",\"PATH\":\"blocked\"}"));
-    model.profiles_loaded = true;
+    model.profile_edit.loaded = true;
     model.tool_checks_remaining = 0;
     model.claude_available = true;
     try std.testing.expect(model.setToolExecutable(.claude, "/usr/local/bin/claude"));
@@ -851,7 +904,7 @@ test "Codex dangerous bypass takes precedence over approval sandbox and full aut
     profile.prefs.dangerously_bypass_approvals_and_sandbox = true;
     try std.testing.expect(profile.prefs.profile.set("work"));
     try std.testing.expect(profile.prefs.base_url.set("https://openai.example"));
-    model.profiles_loaded = true;
+    model.profile_edit.loaded = true;
     model.tool_checks_remaining = 0;
     model.codex_available = true;
     model.setUserShell("/opt/homebrew/bin/fish");
@@ -891,7 +944,7 @@ test "closing and reopening Codex retires the old PTY before recycling its key" 
     const attached = stores.projects.attachPlaceholder("/tmp/canopy-codex-lifecycle").?;
     model.active_workspace_id = attached.workspace_id;
     _ = try addProfile(stores, 9, .codex, "Default");
-    model.profiles_loaded = true;
+    model.profile_edit.loaded = true;
     model.tool_checks_remaining = 0;
     model.codex_available = true;
     try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
@@ -931,7 +984,7 @@ test "full Ghostty owns tool PTY and keeps launch alive until host teardown" {
     const attached = stores.projects.attachPlaceholder("/tmp/canopy-ghostty").?;
     model.active_workspace_id = attached.workspace_id;
     _ = try addProfile(stores, 9, .codex, "Default");
-    model.profiles_loaded = true;
+    model.profile_edit.loaded = true;
     model.tool_checks_remaining = 0;
     model.codex_available = true;
     try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
@@ -1012,12 +1065,19 @@ test "close tab shortcut cannot close terminals behind any application modal" {
     defer fx.deinit();
     fx.executor = .fake;
     app.update(&model, .open_active_terminal, &fx);
-    inline for (.{ "preferences_open", "create_dialog_open", "remove_dialog_open", "detach_dialog_open", "profile_switch_dialog_open", "profile_delete_dialog_open" }) |field| {
+    inline for (.{ "preferences_open", "create_dialog_open", "remove_dialog_open", "detach_dialog_open" }) |field| {
         @field(model, field) = true;
         try std.testing.expect(!model.canCloseActiveTab());
         app.update(&model, .close_active_tab, &fx);
         try std.testing.expectEqual(app.TerminalPhase.starting, stores.tabs.items.items[0].phase);
         @field(model, field) = false;
+    }
+    inline for (.{ "pending_switch", "pending_delete" }) |field| {
+        @field(model.profile_edit, field) = 1;
+        try std.testing.expect(!model.canCloseActiveTab());
+        app.update(&model, .close_active_tab, &fx);
+        try std.testing.expectEqual(app.TerminalPhase.starting, stores.tabs.items.items[0].phase);
+        @field(model.profile_edit, field) = null;
     }
     try std.testing.expect(model.canCloseActiveTab());
 }
@@ -1029,23 +1089,23 @@ test "profile editor saves compatible prefs JSON before reloading rows" {
     defer model.active_tab_by_workspace.deinit(std.testing.allocator);
     _ = try addProfile(stores, 1, .codex, "Default");
     model.preferences_loaded = true;
-    model.profiles_loaded = true;
+    model.profile_edit.loaded = true;
     var fx = app.Effects.init(std.testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
 
     app.update(&model, .open_preferences, &fx);
     app.update(&model, .show_preferences_codex, &fx);
-    model.profile_draft.model.set("gpt-5.6");
-    model.profile_draft.sandbox.set("workspace-write");
-    model.profile_draft.full_auto = true;
-    model.profile_dirty = true;
+    model.profile_edit.draft.model.set("gpt-5.6");
+    model.profile_edit.draft.sandbox.set("workspace-write");
+    model.profile_edit.draft.full_auto = true;
+    model.profile_edit.dirty = true;
     app.update(&model, .save_profile, &fx);
-    try std.testing.expect(model.profiles_saving);
+    try std.testing.expect(model.profile_edit.saving());
     try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
 
     try fx.feedDbResult(app.profile_write_key, .exec, .ok, "");
     while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
-    try std.testing.expect(!model.profiles_saving);
+    try std.testing.expect(!model.profile_edit.saving());
     try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
 }
