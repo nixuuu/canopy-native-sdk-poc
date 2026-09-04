@@ -501,6 +501,105 @@ index ef7c027..bb271a6 100644
  test "adjacent double-cross cells never collide command ids" {
      // ╬ emits up to eight commands; the per-column id stride must be at
      // least eight so neighbors never share an object id.
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/tokens.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/tokens.zig
+index 9bd8032..455763f 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/tokens.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/tokens.zig
+@@ -1220,6 +1220,7 @@ pub const ControlTokens = struct {
+     avatar: ControlVisualTokens = .{},
+     badge: ControlVisualTokens = .{},
+     separator: ControlVisualTokens = .{},
++    split_divider: ControlVisualTokens = .{},
+     skeleton: ControlVisualTokens = .{},
+     spinner: ControlVisualTokens = .{},
+ 
+@@ -1593,6 +1594,7 @@ pub const ControlTokenOverrides = struct {
+     avatar: ControlVisualTokenOverrides = .{},
+     badge: ControlVisualTokenOverrides = .{},
+     separator: ControlVisualTokenOverrides = .{},
++    split_divider: ControlVisualTokenOverrides = .{},
+     skeleton: ControlVisualTokenOverrides = .{},
+     spinner: ControlVisualTokenOverrides = .{},
+ 
+@@ -1642,6 +1644,7 @@ pub const ControlTokenOverrides = struct {
+         next.avatar = self.avatar.apply(next.avatar);
+         next.badge = self.badge.apply(next.badge);
+         next.separator = self.separator.apply(next.separator);
++        next.split_divider = self.split_divider.apply(next.split_divider);
+         next.skeleton = self.skeleton.apply(next.skeleton);
+         next.spinner = self.spinner.apply(next.spinner);
+         return next;
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig
+index 5a2701d..7e89b7b 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig
+@@ -3128,26 +3128,35 @@ fn emitSplitDividerWidget(builder: *Builder, widget: Widget, tokens: DesignToken
+     const visual = componentControlVisualTokens(widget, tokens);
+     const normalized = widget.frame.normalized();
+     if (normalized.isEmpty()) return;
+-    const active = widget.state.hovered or widget.state.pressed;
+-    const thickness = if (active)
+-        @max(2, controlStrokeWidth(widget, visual, tokens.stroke.hairline))
+-    else
+-        controlStrokeWidth(widget, visual, tokens.stroke.hairline);
+-    const line_rect = geometry.RectF.init(
+-        normalized.x + (normalized.width - thickness) * 0.5,
+-        normalized.y,
+-        thickness,
+-        normalized.height,
+-    );
+-    const line_color = if (active)
+-        widgetAccentColor(widget, tokens.colors.accent)
+-    else
+-        widgetBorderColor(widget, visual.border orelse tokens.colors.border);
+-    try builder.fillRect(.{
+-        .id = widgetPartId(widget.id, 1),
+-        .rect = pixelSnapGeometryRect(tokens, line_rect),
+-        .fill = colorFill(line_color),
++    if (visual.background) |background| try builder.fillRect(.{
++        .id = widgetPartId(widget.id, 3),
++        .rect = pixelSnapGeometryRect(tokens, normalized),
++        .fill = colorFill(background),
+     });
++    // An explicit zero opts into a solid grip without the centered hairline.
++    // Keep the default rendering and keyboard focus indication unchanged.
++    if (visual.stroke_width == null or visual.stroke_width.? > 0) {
++        const active = widget.state.hovered or widget.state.pressed;
++        const thickness = if (active)
++            @max(2, controlStrokeWidth(widget, visual, tokens.stroke.hairline))
++        else
++            controlStrokeWidth(widget, visual, tokens.stroke.hairline);
++        const line_rect = geometry.RectF.init(
++            normalized.x + (normalized.width - thickness) * 0.5,
++            normalized.y,
++            thickness,
++            normalized.height,
++        );
++        const line_color = if (active)
++            widgetAccentColor(widget, tokens.colors.accent)
++        else
++            widgetBorderColor(widget, visual.border orelse tokens.colors.border);
++        try builder.fillRect(.{
++            .id = widgetPartId(widget.id, 1),
++            .rect = pixelSnapGeometryRect(tokens, line_rect),
++            .fill = colorFill(line_color),
++        });
++    }
+     if (widget.state.focused) {
+         try builder.strokeRect(snapHairlineStrokeRect(tokens, .{
+             .id = widgetPartId(widget.id, 2),
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render_style.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render_style.zig
+index ff01f76..ea76514 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render_style.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render_style.zig
+@@ -638,6 +638,7 @@ pub fn componentControlVisualTokens(widget: Widget, tokens: DesignTokens) Contro
+         .avatar => tokens.controls.avatar,
+         .badge => tokens.controls.badge,
+         .separator => tokens.controls.separator,
++        .split_divider => tokens.controls.split_divider,
+         .skeleton => tokens.controls.skeleton,
+         .spinner => tokens.controls.spinner,
+         else => .{},
 diff --git a/node_modules/@native-sdk/cli/src/root.zig b/node_modules/@native-sdk/cli/src/root.zig
 index 2da935a..84fb786 100644
 --- a/node_modules/@native-sdk/cli/src/root.zig

@@ -5,6 +5,31 @@ const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const Color = canvas.Color;
 
+pub fn applyGripHighlight(out: *canvas.DesignTokens, progress: f32) void {
+    const base = out.controls.split_divider.background orelse return;
+    const amount = @max(0, @min(1, progress)) * 0.65;
+    const accent = out.colors.accent;
+    out.controls.split_divider.background = Color.rgba(
+        base.r + (accent.r - base.r) * amount,
+        base.g + (accent.g - base.g) * amount,
+        base.b + (accent.b - base.b) * amount,
+        base.a,
+    );
+}
+
+test "grip highlight interpolates only the flat grip background" {
+    const testing = @import("std").testing;
+    const base = tokens(.{ .color_scheme = .dark });
+    var halfway = base;
+    applyGripHighlight(&halfway, 0.5);
+    var highlighted = base;
+    applyGripHighlight(&highlighted, 1);
+    try testing.expect(halfway.controls.split_divider.background.?.b > base.controls.split_divider.background.?.b);
+    try testing.expect(halfway.controls.split_divider.background.?.b < highlighted.controls.split_divider.background.?.b);
+    try testing.expectEqual(base.colors, highlighted.colors);
+    try testing.expectEqual(@as(f32, 0), highlighted.controls.split_divider.stroke_width.?);
+}
+
 pub fn tokens(appearance: native_sdk.Appearance) canvas.DesignTokens {
     var out = canvas.DesignTokens.theme(.{
         .color_scheme = switch (appearance.color_scheme) {
@@ -173,6 +198,7 @@ const light_controls = canvas.ControlTokens{
         .radius = 3,
     },
     .separator = .{ .background = Color.rgba8(0, 0, 0, 15) },
+    .split_divider = .{ .background = Color.rgb8(228, 228, 228), .stroke_width = 0 },
     .dialog = .{ .background = Color.rgba8(250, 250, 250, 250), .border = Color.rgba8(0, 0, 0, 31), .radius = 8 },
 };
 
@@ -220,6 +246,7 @@ const dark_controls = canvas.ControlTokens{
         .radius = 3,
     },
     .separator = .{ .background = Color.rgba8(255, 255, 255, 15) },
+    .split_divider = .{ .background = Color.rgb8(36, 36, 36), .stroke_width = 0 },
     .dialog = .{ .background = Color.rgba8(30, 30, 30, 250), .border = Color.rgba8(255, 255, 255, 31), .radius = 8 },
 };
 

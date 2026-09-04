@@ -24,6 +24,7 @@ const geometry = native_sdk.geometry;
 
 const canvas_label = "main-canvas";
 const window_width: f32 = 1180;
+pub const sidebar_divider_width: f32 = 3;
 const window_height: f32 = 760;
 const max_rendered_tab_buttons: usize = 12;
 const fallback_user_shell = "/bin/zsh";
@@ -299,7 +300,11 @@ pub const Model = struct {
     }
 
     pub fn sidebarFraction(model: *const Model) f32 {
-        return @max(0.000001, model.sidebar_width * model.sidebar.dock.value / @max(1, model.canvas_width - 1));
+        return @max(0.000001, model.sidebar_width * model.sidebar.dock.value / @max(1, model.canvas_width - sidebar_divider_width));
+    }
+
+    pub fn sidebarDividerWidth(_: *const Model) f32 {
+        return sidebar_divider_width;
     }
 
     pub fn sidebarDockVisible(model: *const Model) bool {
@@ -2073,7 +2078,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .store_done => |result| handleStoreResult(model, fx, result),
         .terminal_event => |event| handleTerminalEvent(model, fx, event),
         .sidebar_resized => |fraction| {
-            if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating() and std.math.isFinite(fraction)) model.sidebar_width = @max(210, std.math.clamp(fraction, 0, 1) * @max(1, model.canvas_width - 1));
+            if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating() and std.math.isFinite(fraction)) model.sidebar_width = @max(210, std.math.clamp(fraction, 0, 1) * @max(1, model.canvas_width - sidebar_divider_width));
         },
         .toggle_sidebar => model.sidebar.toggle(),
         .dismiss_sidebar => model.sidebar.overlay_open = false,
@@ -2133,7 +2138,9 @@ pub fn onAppearance(appearance: native_sdk.Appearance) ?Msg {
 
 pub fn canopyTokens(model: *const Model) canvas.DesignTokens {
     const selected = if (model.preferences_open) &model.preferences_draft else &model.preferences_saved;
-    return theme.tokens(selected.effectiveAppearance(model.appearance));
+    var tokens = theme.tokens(selected.effectiveAppearance(model.appearance));
+    theme.applyGripHighlight(&tokens, model.sidebar.grip.value);
+    return tokens;
 }
 
 pub const AppUi = canvas.Ui(Msg);
@@ -2314,9 +2321,26 @@ const CanopyHost = struct {
         try host.presentPendingFolderDialog(runtime);
         if (builtin.os.tag == .macos and !host.geometry_pending.any()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
+        var grip_active = false;
+        if (!host.ui_app.model.terminalActionsBlocked() and !host.ui_app.model.sidebar.compact and !host.ui_app.model.sidebar.collapsed) {
+            if (runtime.findViewIndex(1, canvas_label)) |index| {
+                const view = &runtime.views[index];
+                const layout = runtime.canvasWidgetLayout(1, canvas_label) catch null;
+                if (layout) |tree| for (tree.nodes) |node| {
+                    if (node.widget.kind == .split_divider and
+                        (node.widget.id == view.canvas_widget_hovered_id or node.widget.id == view.canvas_widget_pressed_id))
+                    {
+                        grip_active = true;
+                        break;
+                    }
+                };
+            }
+        }
+        const grip_changed = host.ui_app.model.sidebar.grip_active != grip_active;
+        host.ui_app.model.sidebar.grip_active = grip_active;
         // Request the next display tick only while a disclosure is moving.
         // A toggle's dispatch already requests its first frame.
-        if (host.ui_app.model.sidebar.animating()) {
+        if (host.ui_app.model.sidebar.needsFrame() or grip_changed) {
             if (runtime.findViewIndex(1, canvas_label)) |index| try runtime.requestCanvasFrameForView(index);
         }
     }

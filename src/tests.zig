@@ -4,6 +4,79 @@ const profiles = @import("profiles.zig");
 const workspaces = @import("workspaces.zig");
 const sdk = @import("native_sdk");
 
+test "sidebar grip paints one flat darker block even on hover and press" {
+    for ([_]sdk.Appearance{ .{ .color_scheme = .dark }, .{ .color_scheme = .light } }) |appearance| {
+        const tokens = @import("theme.zig").tokens(appearance);
+        const color = tokens.controls.split_divider.background.?;
+        try std.testing.expect(color.r < tokens.colors.surface.r);
+        for (0..3) |state| {
+            var commands: [16]sdk.canvas.CanvasCommand = undefined;
+            var builder = sdk.canvas.Builder.init(&commands);
+            const rect = sdk.geometry.RectF.init(210, 52, 3, 650);
+            try sdk.canvas.emitWidgetTree(&builder, .{
+                .id = 123,
+                .kind = .split_divider,
+                .frame = rect,
+                .state = .{ .hovered = state == 1, .pressed = state == 2 },
+            }, tokens);
+            const list = builder.displayList();
+            try std.testing.expectEqual(@as(usize, 1), list.commands.len);
+            try std.testing.expect(list.commands[0] == .fill_rect);
+            try std.testing.expectEqual(rect, list.commands[0].fill_rect.rect);
+            try std.testing.expectEqual(color, list.commands[0].fill_rect.fill.color);
+        }
+    }
+}
+
+test "sidebar divider has a full height hit band clear of the terminal and native scroll region" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    const attached = stores.projects.attachPlaceholder("/tmp/sidebar-handle-test").?;
+    model.active_workspace_id = attached.workspace_id;
+    model.use_ghostty = true;
+    try stores.tabs.items.append(stores.tabs.allocator, .{ .id = 1, .workspace_id = attached.workspace_id, .pty = 1, .phase = .running });
+    try model.active_tab_by_workspace.put(std.testing.allocator, attached.workspace_id, 1);
+    for ([_]f32{ 960, 1180, 1733 }) |width| {
+        model.canvas_width = width;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var ui = sdk.canvas.Ui(app.Msg).init(arena.allocator());
+        const tree = try ui.finalize(app.CompiledCanopyView.build(&ui, &model));
+        const nodes = try arena.allocator().alloc(sdk.canvas.WidgetLayoutNode, 1024);
+        const layout = try sdk.canvas.layoutWidgetTree(tree.root, sdk.geometry.RectF.init(0, 0, width, 760), nodes);
+        var divider: ?sdk.canvas.WidgetLayoutNode = null;
+        for (layout.nodes) |node| {
+            if (node.widget.kind == .split_divider) divider = node;
+        }
+        const handle = divider orelse return error.MissingDivider;
+        try std.testing.expectApproxEqAbs(@as(f32, 3), handle.frame.width, 0.001);
+        // Both outer edges and the middle, at the top, middle and bottom.
+        for ([_]f32{ 0.5, 1.5, 2.5 }) |x| {
+            for ([_]f32{ 1, handle.frame.height / 2, handle.frame.height - 1 }) |y| {
+                const hit = layout.hitTest(sdk.geometry.PointF.init(handle.frame.x + x, handle.frame.y + y)) orelse return error.MissingHit;
+                try std.testing.expectEqual(handle.widget.id, hit.id);
+            }
+        }
+        var terminal_found = false;
+        var scroll_found = false;
+        for (layout.nodes) |node| {
+            if (std.mem.eql(u8, node.widget.semantics.label, "Ghostty terminal viewport")) {
+                terminal_found = true;
+                try std.testing.expect(node.frame.x >= handle.frame.maxX());
+            }
+            if (std.mem.eql(u8, node.widget.semantics.label, "Projects and worktrees")) {
+                scroll_found = true;
+                // Fraction -> points can differ by a float32 ULP; native
+                // geometry snaps these edges to the same device pixel.
+                try std.testing.expect(node.frame.maxX() <= handle.frame.x + 0.001);
+            }
+        }
+        try std.testing.expect(terminal_found and scroll_found);
+    }
+}
+
 test "titlebar centers controls on native traffic lights and title on the window" {
     const stores = try Stores.init();
     defer stores.deinit();
@@ -113,7 +186,7 @@ test "sidebar keeps logical width across window resize and restores after clampi
     defer fx.deinit();
 
     // A real divider message selects 420 points at the current viewport.
-    app.update(&model, .{ .sidebar_resized = 420 / (model.canvas_width - 1) }, &fx);
+    app.update(&model, .{ .sidebar_resized = 420 / (model.canvas_width - app.sidebar_divider_width) }, &fx);
     try std.testing.expectApproxEqAbs(@as(f32, 420), model.sidebar_width, 0.001);
     for ([_]f32{ 1180, 1600, 860, 1180, 2000 }) |width| {
         model.canvas_width = width;
@@ -135,15 +208,15 @@ test "sidebar keeps logical width across window resize and restores after clampi
         for (layout.nodes) |node| {
             if (node.widget.id != sidebar_id) continue;
             found = true;
-            try std.testing.expectApproxEqAbs(@min(@as(f32, 420), width - 1 - 520), node.frame.width, 0.01);
+            try std.testing.expectApproxEqAbs(@min(@as(f32, 420), width - app.sidebar_divider_width - 520), node.frame.width, 0.01);
         }
         try std.testing.expect(found);
         try std.testing.expectApproxEqAbs(@as(f32, 420), model.sidebar_width, 0.001);
     }
     // A later drag uses the current viewport, not the startup window size.
-    app.update(&model, .{ .sidebar_resized = 300 / (model.canvas_width - 1) }, &fx);
+    app.update(&model, .{ .sidebar_resized = 300 / (model.canvas_width - app.sidebar_divider_width) }, &fx);
     model.canvas_width = 1180;
-    try std.testing.expectApproxEqAbs(@as(f32, 300), model.sidebarFraction() * (model.canvas_width - 1), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 300), model.sidebarFraction() * (model.canvas_width - app.sidebar_divider_width), 0.001);
 }
 
 const Stores = struct {

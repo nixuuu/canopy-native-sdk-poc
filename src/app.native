@@ -15,7 +15,8 @@
     <if test="{hasProjects}">
       <stack grow="1">
         <if test="{sidebarDockVisible}">
-          <split grow="1" value="{sidebarFraction}" on-resize="sidebar_resized" gap="1">
+          <!-- Wide, flat grip styled through the split-divider token. -->
+          <split grow="1" value="{sidebarFraction}" on-resize="sidebar_resized" gap="{sidebarDividerWidth}">
             <column min-width="{sidebarDockMinimum}">
               <use template="project-sidebar" width="{sidebar_width}" />
             </column>
