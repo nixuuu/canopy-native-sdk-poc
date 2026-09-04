@@ -92,7 +92,7 @@ pub const Model = struct {
     sidebar_width: f32 = 210,
     canvas_width: f32 = window_width,
     sidebar: @import("sidebar_state.zig").State = .{},
-    chrome_leading: f32 = 76,
+    window_chrome: native_sdk.WindowChrome = .{},
     appearance: native_sdk.Appearance = .{},
     status_text: []const u8 = "Ready",
     picker_serial: u64 = 0,
@@ -160,6 +160,7 @@ pub const Model = struct {
     codex_executable: workspaces.PathText = .{},
 
     pub const view_unbound = .{
+        "window_chrome",
         "sidebar_width",
         "canvas_width",
         "sidebar",
@@ -268,8 +269,35 @@ pub const Model = struct {
         };
     }
 
-    // The SDK splitter speaks fractions; user intent stays in logical points.
-    // Layout clamps to pane minima without overwriting the preferred width.
+    // Align authored controls with the OS-reported traffic-light centerline.
+    pub fn titlebarHeight(model: *const Model) f32 {
+        // AppKit's reserved toolbar band may be taller than its visible
+        // controls. Center the compact bar on the actual button cluster.
+        return if (model.window_chrome.buttons.height > 0)
+            @max(40, 2 * (model.titlebarControlsTop() + 14))
+        else
+            @max(40, model.window_chrome.insets.top);
+    }
+
+    pub fn titlebarControlsTop(model: *const Model) f32 {
+        const buttons = model.window_chrome.buttons;
+        return if (buttons.height > 0) @max(0, buttons.y + buttons.height / 2 - 14) else @max(6, model.window_chrome.insets.top / 2 - 14);
+    }
+
+    pub fn titlebarLeading(model: *const Model) f32 {
+        return @max(6, model.window_chrome.insets.left);
+    }
+
+    pub fn titlebarTrailing(model: *const Model) f32 {
+        return @max(6, model.window_chrome.insets.right);
+    }
+
+    pub fn titlebarSideWidth(model: *const Model) f32 {
+        // Equal side columns keep the title at the WINDOW center, regardless
+        // of traffic-light placement or the current set of toolbar actions.
+        return @max(220, @max(model.titlebarLeading() + 32, model.titlebarTrailing() + 214));
+    }
+
     pub fn sidebarFraction(model: *const Model) f32 {
         return @max(0.000001, model.sidebar_width * model.sidebar.dock.value / @max(1, model.canvas_width - 1));
     }
@@ -2050,7 +2078,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_sidebar => model.sidebar.toggle(),
         .dismiss_sidebar => model.sidebar.overlay_open = false,
         .set_appearance => |appearance| model.appearance = appearance,
-        .chrome_changed => |chrome| model.chrome_leading = @max(76, chrome.insets.left + 64),
+        .chrome_changed => |chrome| model.window_chrome = chrome,
     }
 }
 

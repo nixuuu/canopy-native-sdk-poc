@@ -4,6 +4,63 @@ const profiles = @import("profiles.zig");
 const workspaces = @import("workspaces.zig");
 const sdk = @import("native_sdk");
 
+test "titlebar centers controls on native traffic lights and title on the window" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    const attached = stores.projects.attachPlaceholder("/tmp/a-long-project-name-for-titlebar-alignment").?;
+    model.active_workspace_id = attached.workspace_id;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    const samples = [_]sdk.WindowChrome{
+        .{ .insets = .{ .top = 66, .left = 98 }, .buttons = sdk.geometry.RectF.init(20, 19, 58, 14) },
+        .{ .insets = .{ .top = 52, .left = 98 }, .buttons = sdk.geometry.RectF.init(20, 19, 58, 14) },
+        .{ .insets = .{ .top = 64, .left = 100 }, .buttons = sdk.geometry.RectF.init(20, 24, 60, 16) },
+        .{ .insets = .{ .top = 52, .right = 98 }, .buttons = sdk.geometry.RectF.init(782, 16, 58, 16) },
+        .{}, // fullscreen: no phantom traffic-light gutter
+    };
+    for (samples) |chrome| {
+        app.update(&model, .{ .chrome_changed = chrome }, &fx);
+        const center_y = if (chrome.buttons.height > 0) chrome.buttons.y + chrome.buttons.height / 2 else 20;
+        for ([_]f32{ 860, 1180, 1733 }) |width| {
+            model.canvas_width = width;
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var ui = sdk.canvas.Ui(app.Msg).init(arena.allocator());
+            const tree = try ui.finalizeWithTokens(app.CompiledCanopyView.build(&ui, &model), @import("theme.zig").tokens(.{}));
+            const nodes = try arena.allocator().alloc(sdk.canvas.WidgetLayoutNode, 1024);
+            const layout = try sdk.canvas.layoutWidgetTree(tree.root, sdk.geometry.RectF.init(0, 0, width, 760), nodes);
+            var header_depth: ?u16 = null;
+            var buttons: usize = 0;
+            var title_found = false;
+            for (layout.nodes) |node| {
+                if (std.mem.eql(u8, node.widget.semantics.label, "Canopy title bar")) {
+                    header_depth = @intCast(node.depth);
+                    try std.testing.expectApproxEqAbs(@max(@as(f32, 40), center_y * 2), node.frame.height, 0.01);
+                    continue;
+                }
+                const depth = header_depth orelse continue;
+                if (node.depth <= depth) break;
+                if (node.widget.kind == .button or node.widget.kind == .icon_button) {
+                    buttons += 1;
+                    try std.testing.expectApproxEqAbs(@as(f32, 28), node.frame.height, 0.01);
+                    try std.testing.expectApproxEqAbs(center_y, node.frame.y + node.frame.height / 2, 0.01);
+                    try std.testing.expect(node.frame.x >= chrome.insets.left);
+                    try std.testing.expect(node.frame.maxX() <= width - chrome.insets.right);
+                }
+                if (node.widget.kind == .text and std.mem.eql(u8, node.widget.text, model.activeWorkspaceName())) {
+                    title_found = true;
+                    try std.testing.expectApproxEqAbs(width / 2, node.frame.x + node.frame.width / 2, 0.01);
+                    try std.testing.expectApproxEqAbs(center_y, node.frame.y + node.frame.height / 2, 0.01);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 4), buttons);
+            try std.testing.expect(title_found);
+        }
+    }
+    try std.testing.expectEqual(@as(f32, 6), model.titlebarLeading());
+}
+
 test "compact sidebar overlay leaves terminal layout unchanged and dismisses on selection" {
     const stores = try Stores.init();
     defer stores.deinit();

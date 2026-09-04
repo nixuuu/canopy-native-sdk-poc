@@ -1,14 +1,20 @@
 <!-- Window chrome and global workspace actions. -->
 <template name="app-titlebar">
-  <row height="40" padding="6" gap="6" cross="center" background="surface" window-drag="true" label="Canopy title bar">
-    <spacer width="{chrome_leading}" />
-    <if test="{hasProjects}"><button width="28" height="28" size="icon" variant="ghost" icon="panel-left" on-press="toggle_sidebar" label="{sidebarToggleLabel}"></button></if>
-    <text size="sm" foreground="text_muted">canopy</text>
+  <column height="{titlebarHeight}" background="surface" window-drag="true" label="Canopy title bar">
+    <spacer height="{titlebarControlsTop}" />
+    <row height="28" cross="center">
+      <row width="{titlebarSideWidth}" height="28" cross="center">
+        <spacer width="{titlebarLeading}" />
+        <if test="{hasProjects}"><button width="28" height="28" size="sm" variant="ghost" foreground="text" icon="panel-left" on-press="toggle_sidebar" label="{sidebarToggleLabel}"></button></if>
+      </row>
+      <text grow="1" text-alignment="center" wrap="false" overflow="ellipsis">{activeWorkspaceName}</text>
+      <row width="{titlebarSideWidth}" height="28" gap="4" cross="center" main="end">
+        <button width="80" height="28" size="sm" variant="ghost" foreground="text" icon="folder-open" on-press="open_folder" label="Attach folder" disabled="{attachDisabled}">Attach</button>
+        <if test="{hasProjects}"><button width="94" height="28" size="sm" variant="ghost" foreground="text" icon="plus" on-press="open_active_terminal" label="New terminal">Terminal</button></if>
+        <button width="28" height="28" size="sm" variant="ghost" foreground="text" icon="settings" on-press="open_preferences" label="Open preferences" disabled="{preferencesDisabled}"></button>
+        <spacer width="{titlebarTrailing}" />
+      </row>
+    </row>
     <spacer grow="1" />
-    <text size="sm">{activeWorkspaceName}</text>
-    <spacer grow="1" />
-    <button size="sm" variant="ghost" icon="folder-open" on-press="open_folder" label="Attach folder" disabled="{attachDisabled}">Attach</button>
-    <if test="{hasProjects}"><button size="sm" variant="ghost" icon="plus" on-press="open_active_terminal" label="New terminal">New</button></if>
-    <button width="24" height="24" size="icon" variant="ghost" icon="settings" on-press="open_preferences" label="Open preferences" disabled="{preferencesDisabled}"></button>
-  </row>
+  </column>
 </template>
