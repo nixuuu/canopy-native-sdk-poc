@@ -3,24 +3,29 @@ const std = @import("std");
 const sdk = @import("native_sdk");
 const geometry = sdk.geometry;
 const config = @import("ghostty_config.zig");
-const launch = @import("terminal_launch.zig");
-const Event = extern struct { tab: u64, kind: c_int, code: c_int };
-extern fn canopy_ghostty_create(files: [*]const [*:0]const u8, count: usize) ?*anyopaque;
-extern fn canopy_ghostty_set_wakeup(host: *anyopaque, notify: *const fn (*anyopaque) callconv(.c) void, context: *anyopaque) void;
-extern fn canopy_ghostty_destroy(host: *anyopaque) void;
-extern fn canopy_ghostty_tick(host: *anyopaque) void;
-extern fn canopy_ghostty_next_event(host: *anyopaque, event: *Event) bool;
-extern fn canopy_ghostty_surface(host: *anyopaque, tab: u64, cwd: [*:0]const u8, command: [*:0]const u8, env: [*]const launch.Env, count: usize) ?*anyopaque;
-extern fn canopy_ghostty_close(host: *anyopaque, tab: u64) void;
-extern fn canopy_ghostty_visibility(host: *anyopaque, tab: u64, visible: bool, focus: bool) void;
-extern fn canopy_ghostty_cover(host: *anyopaque, tab: u64, covered: f64, overlay: bool) void;
-extern fn canopy_ghostty_begin_layout(host: *anyopaque, tab: u64) void;
+const bridge = @import("ghostty_abi.zig").c;
 
 const allocator = std.heap.page_allocator;
 const container = "ghostty-surface";
-fn notify(context: *anyopaque) callconv(.c) void {
-    const runtime: *sdk.Runtime = @ptrCast(@alignCast(context));
+fn notify(context: ?*anyopaque) callconv(.c) void {
+    const runtime: *sdk.Runtime = @ptrCast(@alignCast(context orelse return));
     runtime.options.platform.services.wake() catch {};
+}
+
+/// Match the never-reused tab id before translating a native callback to Msg.
+/// Delayed callbacks for a closed tab must not target a recycled PTY key.
+pub fn dispatchEvent(runtime: anytype, ui: anytype, event: bridge.canopy_ghostty_event) !void {
+    for (ui.model.tab_store.items.items) |tab| {
+        if (tab.id != event.tab) continue;
+        switch (event.kind) {
+            bridge.CANOPY_GHOSTTY_PROCESS_EXIT => try ui.dispatch(runtime, 1, .{ .terminal_event = .{ .key = tab.pty, .kind = .exit, .code = event.code } }),
+            bridge.CANOPY_GHOSTTY_CLOSE_TAB => try ui.dispatch(runtime, 1, .{ .close_tab = tab.id }),
+            bridge.CANOPY_GHOSTTY_NEW_TERMINAL => try ui.dispatch(runtime, 1, .open_active_terminal),
+            bridge.CANOPY_GHOSTTY_DISMISS_SIDEBAR => try ui.dispatch(runtime, 1, .dismiss_sidebar),
+            else => {},
+        }
+        return;
+    }
 }
 pub const Host = struct {
     raw: ?*anyopaque = null,
@@ -33,14 +38,14 @@ pub const Host = struct {
     observed_next_tab_id: u64 = 0,
 
     pub fn deinit(self: *Host) void {
-        if (self.raw) |raw| canopy_ghostty_destroy(raw);
+        if (self.raw) |raw| bridge.canopy_ghostty_destroy(raw);
         self.surfaces.deinit(allocator);
         self.* = .{};
     }
 
     pub fn detach(self: *Host, runtime: *sdk.Runtime) void {
         if (self.mounted != 0) {
-            if (self.raw) |raw| canopy_ghostty_visibility(raw, self.mounted, false, false);
+            if (self.raw) |raw| bridge.canopy_ghostty_visibility(raw, self.mounted, false, false);
             runtime.releaseViewSurface(1, container) catch {};
             if (self.installed) _ = runtime.updateView(1, container, .{ .visible = false }) catch {};
         }
@@ -57,26 +62,16 @@ pub const Host = struct {
             for (snapshot.sources.items) |source| if (source.layer == .user) {
                 try paths.append(arena.allocator(), try arena.allocator().dupeZ(u8, source.path));
             };
-            self.raw = canopy_ghostty_create(paths.items.ptr, paths.items.len) orelse return error.GhosttyInitializationFailed;
-            canopy_ghostty_set_wakeup(self.raw.?, notify, runtime);
+            self.raw = bridge.canopy_ghostty_create(paths.items.ptr, paths.items.len) orelse return error.GhosttyInitializationFailed;
+            bridge.canopy_ghostty_set_wakeup(self.raw.?, notify, runtime);
         }
         const raw = self.raw.?;
-        canopy_ghostty_tick(raw);
+        bridge.canopy_ghostty_tick(raw);
         // Callback identity is the monotonically increasing tab id, never a
         // recycled PTY key. Dispatch only after returning from Ghostty callbacks.
-        var event: Event = undefined;
-        while (canopy_ghostty_next_event(raw, &event)) {
-            for (model.tab_store.items.items) |tab| {
-                if (tab.id != event.tab) continue;
-                switch (event.kind) {
-                    1 => try ui.dispatch(runtime, 1, .{ .terminal_event = .{ .key = tab.pty, .kind = .exit, .code = event.code } }),
-                    2 => try ui.dispatch(runtime, 1, .{ .close_tab = tab.id }),
-                    3 => try ui.dispatch(runtime, 1, .open_active_terminal),
-                    4 => try ui.dispatch(runtime, 1, .dismiss_sidebar),
-                    else => {},
-                }
-                break;
-            }
+        var event: bridge.canopy_ghostty_event = undefined;
+        while (bridge.canopy_ghostty_next_event(raw, &event)) {
+            try dispatchEvent(runtime, ui, event);
         }
         var index: usize = 0;
         while (index < model.tab_store.items.items.len) {
@@ -84,7 +79,7 @@ pub const Host = struct {
             if (tab.phase == .closing) {
                 const key = tab.pty;
                 if (self.mounted == tab.id) self.detach(runtime);
-                canopy_ghostty_close(raw, tab.id);
+                bridge.canopy_ghostty_close(raw, tab.id);
                 _ = self.surfaces.remove(tab.id);
                 try ui.dispatch(runtime, 1, .{ .terminal_event = .{ .key = key, .kind = .exit, .reason = .cancelled } });
                 continue;
@@ -92,15 +87,15 @@ pub const Host = struct {
             if (tab.pending_launch) |pending| {
                 const key = tab.pty;
                 const command = if (snapshot.hasExplicitEnvironment("NO_COLOR")) pending.original_command else pending.command;
-                const surface = canopy_ghostty_surface(raw, tab.id, pending.cwd, command, pending.env.ptr, pending.env.len);
+                const surface = bridge.canopy_ghostty_surface(raw, tab.id, pending.cwd, command, pending.env.ptr, pending.env.len);
                 pending.destroy();
                 tab.pending_launch = null;
                 if (surface) |view| {
                     self.surfaces.put(allocator, tab.id, view) catch |err| {
-                        canopy_ghostty_close(raw, tab.id);
+                        bridge.canopy_ghostty_close(raw, tab.id);
                         return err;
                     };
-                    canopy_ghostty_visibility(raw, tab.id, false, false);
+                    bridge.canopy_ghostty_visibility(raw, tab.id, false, false);
                     try ui.dispatch(runtime, 1, .{ .terminal_event = .{ .key = key, .kind = .output } });
                 } else try ui.dispatch(runtime, 1, .{ .terminal_event = .{ .key = key, .kind = .exit, .reason = .spawn_failed } });
             }
@@ -124,7 +119,7 @@ pub const Host = struct {
                 }
                 const id = obsolete orelse break;
                 if (self.mounted == id) self.detach(runtime);
-                canopy_ghostty_close(raw, id);
+                bridge.canopy_ghostty_close(raw, id);
                 _ = self.surfaces.remove(id);
             }
             self.observed_tab_count = model.tab_store.items.items.len;
@@ -154,7 +149,7 @@ pub const Host = struct {
             self.installed = true;
         }
         if (self.frame == null or !std.meta.eql(self.frame.?, frame.?)) {
-            if (self.mounted == selected) canopy_ghostty_begin_layout(raw, selected);
+            if (self.mounted == selected) bridge.canopy_ghostty_begin_layout(raw, selected);
             _ = try runtime.updateView(1, container, .{ .frame = frame.? });
             self.frame = frame;
         }
@@ -163,14 +158,47 @@ pub const Host = struct {
             _ = try runtime.updateView(1, container, .{ .visible = true });
             try runtime.adoptViewSurface(1, container, view.?);
             self.mounted = selected;
-            canopy_ghostty_visibility(raw, selected, true, true);
+            bridge.canopy_ghostty_visibility(raw, selected, true, true);
         }
-        canopy_ghostty_cover(raw, selected, covered, model.sidebarOverlayVisible());
+        bridge.canopy_ghostty_cover(raw, selected, covered, model.sidebarOverlayVisible());
         if (self.overlay_active != model.sidebarOverlayVisible()) {
             self.overlay_active = model.sidebarOverlayVisible();
             if (self.overlay_active) {
                 try runtime.focusView(1, "main-canvas");
-            } else canopy_ghostty_visibility(raw, selected, true, true);
+            } else bridge.canopy_ghostty_visibility(raw, selected, true, true);
         }
     }
 };
+
+test "native events route by tab identity and ignore retired or unknown callbacks" {
+    const Msg = union(enum) { terminal_event: sdk.EffectPtyEvent, close_tab: u64, open_active_terminal, dismiss_sidebar };
+    const Tabs = @import("terminal_tabs.zig").Store;
+    const Ui = struct {
+        model: struct { tab_store: *Tabs },
+        messages: [8]Msg = undefined,
+        count: usize = 0,
+        pub fn dispatch(self: *@This(), _: void, _: u64, msg: Msg) !void {
+            self.messages[self.count] = msg;
+            self.count += 1;
+        }
+    };
+    const tabs = try Tabs.create(std.testing.allocator);
+    defer tabs.destroy();
+    try tabs.items.append(std.testing.allocator, .{ .id = 11, .pty = 7 });
+    var ui: Ui = .{ .model = .{ .tab_store = tabs } };
+    for ([_]bridge.canopy_ghostty_event_kind{
+        bridge.CANOPY_GHOSTTY_PROCESS_EXIT, bridge.CANOPY_GHOSTTY_CLOSE_TAB,
+        bridge.CANOPY_GHOSTTY_NEW_TERMINAL, bridge.CANOPY_GHOSTTY_DISMISS_SIDEBAR,
+    }) |kind| try dispatchEvent({}, &ui, .{ .tab = 11, .kind = kind, .code = -3 });
+    try std.testing.expectEqual(@as(u64, 7), ui.messages[0].terminal_event.key);
+    try std.testing.expectEqual(@as(i32, -3), ui.messages[0].terminal_event.code);
+    try std.testing.expectEqual(@as(u64, 11), ui.messages[1].close_tab);
+    try std.testing.expect(ui.messages[2] == .open_active_terminal);
+    try std.testing.expect(ui.messages[3] == .dismiss_sidebar);
+    tabs.items.items[0].id = 12; // a new tab reused PTY 7
+    try dispatchEvent({}, &ui, .{ .tab = 11, .kind = bridge.CANOPY_GHOSTTY_CLOSE_TAB, .code = 0 });
+    try dispatchEvent({}, &ui, .{ .tab = 12, .kind = 99, .code = 0 });
+    try std.testing.expectEqual(@as(usize, 4), ui.count);
+    try dispatchEvent({}, &ui, .{ .tab = 12, .kind = bridge.CANOPY_GHOSTTY_CLOSE_TAB, .code = 0 });
+    try std.testing.expectEqual(@as(u64, 12), ui.messages[4].close_tab);
+}

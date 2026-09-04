@@ -16,13 +16,16 @@ const terminal_tabs = @import("terminal_tabs.zig");
 const theme = @import("theme.zig");
 const tool_launch = @import("tool_launch.zig");
 const workspaces = @import("workspaces.zig");
+const git_workflow = @import("git_workflow.zig");
+const git_cli = @import("git_cli.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
-const canvas_label = "main-canvas";
+const canvas_host = @import("canvas_host.zig");
+const canvas_label = canvas_host.label;
 extern fn canopy_use_compact_titlebar() void;
 const window_width: f32 = 1180;
 pub const sidebar_divider_width: f32 = 3;
@@ -56,31 +59,7 @@ pub const PathPayload = struct {
     }
 };
 
-const GitOpKind = enum {
-    none,
-    restore_check,
-    detect_repo,
-    list_worktrees,
-    validate_branch,
-    check_target,
-    check_branch,
-    create_branch,
-    create_worktree,
-    remove_status,
-    remove_submodules,
-    remove_unmerged,
-    remove_worktree,
-};
-
-const GitOperation = struct {
-    kind: GitOpKind = .none,
-    key: u64 = 0,
-    project_id: u64 = 0,
-    workspace_id: u64 = 0,
-    force: bool = false,
-    target_path: workspaces.PathText = .{},
-    branch: workspaces.BranchText = .{},
-};
+const GitOperation = git_workflow.Operation;
 
 pub const Model = struct {
     use_ghostty: bool = false,
@@ -99,20 +78,15 @@ pub const Model = struct {
     appearance: native_sdk.Appearance = .{},
     status_text: []const u8 = "Ready",
     picker_serial: u64 = 0,
-    next_git_key: u64 = 10_000,
-    git_op: GitOperation = .{},
+    git: git_workflow.Lane = .{},
     create_dialog_open: bool = false,
     create_project_id: u64 = 0,
     create_branch: canvas.TextBuffer(workspaces.max_branch_bytes) = .{},
     remove_dialog_open: bool = false,
     remove_workspace_id: u64 = 0,
-    remove_dirty: bool = false,
-    remove_has_submodules: bool = false,
-    remove_unmerged_count: usize = 0,
+    remove_safety: git_workflow.RemovalSafety = .{},
     remove_rechecking: bool = false,
-    approved_remove_dirty: bool = false,
-    approved_remove_has_submodules: bool = false,
-    approved_remove_unmerged_count: usize = 0,
+    approved_remove_safety: git_workflow.RemovalSafety = .{},
     detach_dialog_open: bool = false,
     detach_project_id: u64 = 0,
     pending_remove_workspace_id: u64 = 0,
@@ -179,18 +153,13 @@ pub const Model = struct {
         "next_pty_key",
         "appearance",
         "picker_serial",
-        "next_git_key",
-        "git_op",
+        "git",
         "create_project_id",
         "create_branch",
         "remove_workspace_id",
-        "remove_dirty",
-        "remove_has_submodules",
-        "remove_unmerged_count",
+        "remove_safety",
         "remove_rechecking",
-        "approved_remove_dirty",
-        "approved_remove_has_submodules",
-        "approved_remove_unmerged_count",
+        "approved_remove_safety",
         "detach_project_id",
         "pending_remove_workspace_id",
         "pending_remove_force",
@@ -386,7 +355,7 @@ pub const Model = struct {
     }
 
     pub fn busy(model: *const Model) bool {
-        return model.git_op.kind != .none;
+        return model.git.busy();
     }
 
     pub fn createBranchText(model: *const Model) []const u8 {
@@ -413,19 +382,19 @@ pub const Model = struct {
     }
 
     pub fn removeHasWarnings(model: *const Model) bool {
-        return model.remove_dirty or model.remove_has_submodules or model.remove_unmerged_count > 0;
+        return model.remove_safety.hasWarnings();
     }
 
     pub fn removeDirty(model: *const Model) bool {
-        return model.remove_dirty;
+        return model.remove_safety.dirty;
     }
 
     pub fn removeHasSubmodules(model: *const Model) bool {
-        return model.remove_has_submodules;
+        return model.remove_safety.has_submodules;
     }
 
     pub fn removeUnmergedCount(model: *const Model) usize {
-        return model.remove_unmerged_count;
+        return model.remove_safety.unmerged_count;
     }
 
     pub fn detachProjectName(model: *const Model) []const u8 {
@@ -814,56 +783,33 @@ pub const Msg = union(enum) {
 const CanopyApp = native_sdk.UiApp(Model, Msg);
 pub const Effects = native_sdk.Effects(Msg);
 
-fn nextGitKey(model: *Model) u64 {
-    const key = model.next_git_key;
-    model.next_git_key +%= 1;
-    if (model.next_git_key == 0) model.next_git_key = 10_000;
-    return key;
-}
-
 /// One zero-backlog lane for every Git workflow. A running command owns the
 /// lane until its exact EffectExit arrives; callers are rejected, never queued.
 /// Native SDK spawn has no execution timeout, so slow repositories are allowed
 /// to finish naturally without a polling loop creating more host work.
-fn spawnGit(model: *Model, fx: *Effects, operation: GitOperation, argv: []const []const u8) void {
-    if (model.git_op.kind != .none) {
+fn spawnGit(model: *Model, fx: *Effects, operation: GitOperation) void {
+    if (model.git.busy()) {
         model.status_text = "Another Git operation is still running";
         return;
     }
-    model.git_op = operation;
-    model.git_op.key = nextGitKey(model);
-    fx.spawn(.{
-        .key = model.git_op.key,
-        .argv = argv,
-        .output = .collect,
-        .on_exit = Effects.exitMsg(.git_done),
-    });
+    const request = operation.request(model.project_store) orelse return;
+    const key = model.git.begin(operation) orelse return;
+    git_cli.execute(fx, key, request) catch {
+        _ = model.git.finish(key);
+        model.status_text = "Branch name is too long";
+        return;
+    };
+    model.status_text = operation.progress();
 }
 
 fn detectRepository(model: *Model, fx: *Effects, project_id: u64) void {
-    const project = model.project_store.findProject(project_id) orelse return;
-    spawnGit(model, fx, .{ .kind = .detect_repo, .project_id = project_id }, &.{
-        "/usr/bin/git",
-        "-C",
-        project.selected_path.slice(),
-        "rev-parse",
-        "--show-toplevel",
-    });
-    model.status_text = "Inspecting folder";
+    spawnGit(model, fx, .{ .kind = .detect_repo, .project_id = project_id });
 }
 
 fn refreshWorktrees(model: *Model, fx: *Effects, project_id: u64) void {
     const project = model.project_store.findProject(project_id) orelse return;
     if (!project.is_git) return;
-    spawnGit(model, fx, .{ .kind = .list_worktrees, .project_id = project_id }, &.{
-        "/usr/bin/git",
-        "-C",
-        project.repo_root.slice(),
-        "worktree",
-        "list",
-        "--porcelain",
-    });
-    model.status_text = "Refreshing worktrees";
+    spawnGit(model, fx, .{ .kind = .list_worktrees, .project_id = project_id });
 }
 
 fn validateNewBranch(model: *Model, fx: *Effects, project_id: u64, branch: []const u8, target_path: []const u8) void {
@@ -872,52 +818,7 @@ fn validateNewBranch(model: *Model, fx: *Effects, project_id: u64, branch: []con
         model.status_text = "Branch name or worktree path is too long";
         return;
     }
-    spawnGit(model, fx, operation, &.{ "/usr/bin/git", "check-ref-format", "--branch", operation.branch.slice() });
-    model.status_text = "Validating branch";
-}
-
-fn checkWorktreeTarget(model: *Model, fx: *Effects, operation: GitOperation) void {
-    var next = operation;
-    next.kind = .check_target;
-    spawnGit(model, fx, next, &.{ "/bin/test", "!", "-e", next.target_path.slice() });
-    model.status_text = "Checking worktree target";
-}
-
-fn checkBranchAvailable(model: *Model, fx: *Effects, operation: GitOperation) void {
-    const project = model.project_store.findProject(operation.project_id) orelse return;
-    var next = operation;
-    next.kind = .check_branch;
-    var ref_buffer: [workspaces.max_branch_bytes + "refs/heads/".len]u8 = undefined;
-    const branch_ref = std.fmt.bufPrint(&ref_buffer, "refs/heads/{s}", .{next.branch.slice()}) catch {
-        model.status_text = "Branch name is too long";
-        return;
-    };
-    spawnGit(model, fx, next, &.{ "/usr/bin/git", "-C", project.repo_root.slice(), "show-ref", "--verify", "--quiet", branch_ref });
-    model.status_text = "Checking branch availability";
-}
-
-fn createBranch(model: *Model, fx: *Effects, operation: GitOperation) void {
-    const project = model.project_store.findProject(operation.project_id) orelse return;
-    var next = operation;
-    next.kind = .create_branch;
-    spawnGit(model, fx, next, &.{ "/usr/bin/git", "-C", project.repo_root.slice(), "branch", next.branch.slice(), "HEAD" });
-    model.status_text = "Creating branch";
-}
-
-fn createWorktree(model: *Model, fx: *Effects, operation: GitOperation) void {
-    const project = model.project_store.findProject(operation.project_id) orelse return;
-    var next = operation;
-    next.kind = .create_worktree;
-    spawnGit(model, fx, next, &.{
-        "/usr/bin/git",
-        "-C",
-        project.repo_root.slice(),
-        "worktree",
-        "add",
-        next.target_path.slice(),
-        next.branch.slice(),
-    });
-    model.status_text = "Creating worktree";
+    spawnGit(model, fx, operation);
 }
 
 const store_read_key: u64 = 9_001;
@@ -946,14 +847,13 @@ fn persistProjects(model: *Model, fx: *Effects) void {
 }
 
 fn detectNextRestoredProject(model: *Model, fx: *Effects) void {
-    if (!model.restore_scan_active or model.git_op.kind != .none) return;
+    if (!model.restore_scan_active or model.git.busy()) return;
     while (model.restore_scan_index < model.project_store.projects.items.len) {
         const index = model.restore_scan_index;
         model.restore_scan_index += 1;
         const project = &model.project_store.projects.items[index];
         if (!project.attached) continue;
-        spawnGit(model, fx, .{ .kind = .restore_check, .project_id = project.id }, &.{ "/bin/test", "-d", project.selected_path.slice() });
-        model.status_text = "Checking restored project";
+        spawnGit(model, fx, .{ .kind = .restore_check, .project_id = project.id });
         return;
     }
     model.restore_scan_active = false;
@@ -963,29 +863,11 @@ fn detectNextRestoredProject(model: *Model, fx: *Effects) void {
 fn preflightRemoveStatus(model: *Model, fx: *Effects, workspace_id: u64) void {
     const worktree = model.project_store.findWorktree(workspace_id) orelse return;
     if (worktree.is_main or !worktree.active) return;
-    spawnGit(model, fx, .{ .kind = .remove_status, .workspace_id = workspace_id }, &.{
-        "/usr/bin/git",
-        "-C",
-        worktree.path.slice(),
-        "status",
-        "--porcelain",
-    });
-    model.status_text = "Checking worktree safety";
+    spawnGit(model, fx, .{ .kind = .remove_status, .workspace_id = workspace_id });
 }
 
 fn preflightRemoveSubmodules(model: *Model, fx: *Effects, workspace_id: u64) void {
-    const worktree = model.project_store.findWorktree(workspace_id) orelse return;
-    spawnGit(model, fx, .{ .kind = .remove_submodules, .workspace_id = workspace_id }, &.{
-        "/usr/bin/git",
-        "-C",
-        worktree.path.slice(),
-        "config",
-        "--file",
-        ".gitmodules",
-        "--get-regexp",
-        "path",
-    });
-    model.status_text = "Checking worktree submodules";
+    spawnGit(model, fx, .{ .kind = .remove_submodules, .workspace_id = workspace_id });
 }
 
 fn finishRemovePreflight(model: *Model, fx: *Effects) void {
@@ -995,10 +877,7 @@ fn finishRemovePreflight(model: *Model, fx: *Effects) void {
         return;
     }
     model.remove_rechecking = false;
-    const changed = model.remove_dirty != model.approved_remove_dirty or
-        model.remove_has_submodules != model.approved_remove_has_submodules or
-        model.remove_unmerged_count != model.approved_remove_unmerged_count;
-    if (changed) {
+    if (!model.remove_safety.matches(model.approved_remove_safety)) {
         model.remove_dialog_open = true;
         model.status_text = "Worktree safety state changed; review again";
         return;
@@ -1014,33 +893,11 @@ fn preflightRemoveUnmerged(model: *Model, fx: *Effects, workspace_id: u64) void 
     const worktree = model.project_store.findWorktree(workspace_id) orelse return;
     const project = model.project_store.projectForWorkspace(workspace_id) orelse return;
     if (worktree.branch.eql("(unknown)")) {
-        model.remove_unmerged_count = 1;
+        model.remove_safety.unmerged_count = 1;
         finishRemovePreflight(model, fx);
         return;
     }
-    if (worktree.branch.eql("(detached)")) {
-        spawnGit(model, fx, .{ .kind = .remove_unmerged, .project_id = project.id, .workspace_id = workspace_id }, &.{
-            "/usr/bin/git",
-            "-C",
-            worktree.path.slice(),
-            "log",
-            "HEAD",
-            "--not",
-            "--all",
-            "--oneline",
-        });
-        return;
-    }
-    spawnGit(model, fx, .{ .kind = .remove_unmerged, .project_id = project.id, .workspace_id = workspace_id }, &.{
-        "/usr/bin/git",
-        "-C",
-        project.repo_root.slice(),
-        "log",
-        worktree.branch.slice(),
-        "--not",
-        "--remotes",
-        "--oneline",
-    });
+    spawnGit(model, fx, .{ .kind = .remove_unmerged, .project_id = project.id, .workspace_id = workspace_id });
 }
 
 fn executeWorktreeRemoval(model: *Model, fx: *Effects, workspace_id: u64, force: bool) void {
@@ -1048,21 +905,7 @@ fn executeWorktreeRemoval(model: *Model, fx: *Effects, workspace_id: u64, force:
     const project = model.project_store.projectForWorkspace(workspace_id) orelse return;
     var operation = GitOperation{ .kind = .remove_worktree, .project_id = project.id, .workspace_id = workspace_id, .force = force };
     _ = operation.target_path.set(worktree.path.slice());
-    if (force) {
-        spawnGit(model, fx, operation, &.{ "/usr/bin/git", "-C", project.repo_root.slice(), "worktree", "remove", "--force", operation.target_path.slice() });
-    } else {
-        spawnGit(model, fx, operation, &.{ "/usr/bin/git", "-C", project.repo_root.slice(), "worktree", "remove", operation.target_path.slice() });
-    }
-    model.status_text = "Removing worktree";
-}
-
-fn countNonEmptyLines(bytes: []const u8) usize {
-    var count: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| if (std.mem.trim(u8, line, " \r").len > 0) {
-        count += 1;
-    };
-    return count;
+    spawnGit(model, fx, operation);
 }
 
 // Borrowed launch data: startTerminal copies metadata and the selected backend
@@ -1254,9 +1097,7 @@ fn maybeFinishPendingTeardown(model: *Model, fx: *Effects) void {
         if (model.pending_remove_recheck) {
             model.pending_remove_recheck = false;
             model.remove_rechecking = true;
-            model.remove_dirty = false;
-            model.remove_has_submodules = false;
-            model.remove_unmerged_count = 0;
+            model.remove_safety = .{};
             preflightRemoveStatus(model, fx, workspace_id);
         }
     }
@@ -1729,11 +1570,10 @@ fn handleTerminalEvent(model: *Model, fx: *Effects, event: native_sdk.EffectPtyE
     }
 }
 
-fn handleGitResult(model: *Model, fx: *Effects, exit: native_sdk.EffectExit) void {
-    if (model.git_op.kind == .none or exit.key != model.git_op.key) return;
-    const operation = model.git_op;
-    model.git_op = .{};
-    const succeeded = exit.reason == .exited and exit.code == 0 and !exit.output_truncated;
+fn handleGitResult(model: *Model, fx: *Effects, exit: git_workflow.Result) void {
+    const operation = model.git.finish(exit.key) orelse return;
+    const outcome = exit.outcome;
+    const succeeded = outcome == .success;
     switch (operation.kind) {
         .restore_check => if (succeeded) {
             detectRepository(model, fx, operation.project_id);
@@ -1805,27 +1645,11 @@ fn handleGitResult(model: *Model, fx: *Effects, exit: native_sdk.EffectExit) voi
             }
             detectNextRestoredProject(model, fx);
         },
-        .validate_branch => if (succeeded) {
-            checkWorktreeTarget(model, fx, operation);
-        } else {
-            model.status_text = "That is not a valid Git branch name";
-        },
-        .check_target => if (succeeded) {
-            checkBranchAvailable(model, fx, operation);
-        } else {
-            model.status_text = "The generated worktree target already exists";
-        },
-        .check_branch => if (exit.reason == .exited and exit.code == 1) {
-            createBranch(model, fx, operation);
-        } else if (succeeded) {
-            model.status_text = "That local branch already exists";
-        } else {
-            model.status_text = "Git could not check branch availability";
-        },
-        .create_branch => if (succeeded) {
-            createWorktree(model, fx, operation);
-        } else {
-            model.status_text = "Git could not create the branch (it may now exist)";
+        .validate_branch, .check_target, .check_branch, .create_branch => {
+            switch (operation.advanceCreation(outcome)) {
+                .next => |next| spawnGit(model, fx, next),
+                .failed => |message| model.status_text = message,
+            }
         },
         .create_worktree => if (succeeded) {
             _ = model.select_after_refresh.set(operation.target_path.slice());
@@ -1836,16 +1660,15 @@ fn handleGitResult(model: *Model, fx: *Effects, exit: native_sdk.EffectExit) voi
             refreshWorktrees(model, fx, operation.project_id);
         },
         .remove_status => {
-            model.remove_dirty = !succeeded or std.mem.trim(u8, exit.output, " \r\n").len > 0;
+            model.remove_safety.recordStatus(outcome, exit.output);
             preflightRemoveSubmodules(model, fx, operation.workspace_id);
         },
         .remove_submodules => {
-            const no_submodules = exit.reason == .exited and exit.code == 1;
-            model.remove_has_submodules = if (succeeded) std.mem.trim(u8, exit.output, " \r\n").len > 0 else !no_submodules;
+            model.remove_safety.recordSubmodules(outcome, exit.output);
             preflightRemoveUnmerged(model, fx, operation.workspace_id);
         },
         .remove_unmerged => {
-            model.remove_unmerged_count = if (succeeded) countNonEmptyLines(exit.output) else 1;
+            model.remove_safety.recordUnmerged(outcome, exit.output);
             finishRemovePreflight(model, fx);
         },
         .remove_worktree => if (succeeded) {
@@ -1920,7 +1743,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const branch = std.mem.trim(u8, model.create_branch.text(), " ");
             if (branch.len == 0) return;
             var target_buffer: [workspaces.max_path_bytes]u8 = undefined;
-            const target = model.project_store.makeWorktreePath(project, branch, model.next_git_key, &target_buffer) orelse {
+            const target = model.project_store.makeWorktreePath(project, branch, model.git.next_key, &target_buffer) orelse {
                 model.status_text = "Could not derive a safe worktree path";
                 return;
             };
@@ -1934,9 +1757,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const worktree = model.project_store.findWorktree(workspace_id) orelse return;
             if (worktree.is_main or !worktree.active) return;
             model.remove_workspace_id = workspace_id;
-            model.remove_dirty = false;
-            model.remove_has_submodules = false;
-            model.remove_unmerged_count = 0;
+            model.remove_safety = .{};
             model.remove_rechecking = false;
             model.pending_remove_workspace_id = 0;
             model.pending_remove_recheck = false;
@@ -1953,9 +1774,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const workspace_id = model.remove_workspace_id;
             if (workspace_id == 0 or model.busy()) return;
             model.remove_dialog_open = false;
-            model.approved_remove_dirty = model.remove_dirty;
-            model.approved_remove_has_submodules = model.remove_has_submodules;
-            model.approved_remove_unmerged_count = model.remove_unmerged_count;
+            model.approved_remove_safety = model.remove_safety;
             model.pending_remove_workspace_id = workspace_id;
             model.pending_remove_recheck = true;
             closeTabsForWorkspace(model, fx, workspace_id);
@@ -2075,7 +1894,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.profile_draft.dangerously_bypass_approvals_and_sandbox = !model.profile_draft.dangerously_bypass_approvals_and_sandbox;
             model.profile_dirty = true;
         },
-        .git_done => |exit| handleGitResult(model, fx, exit),
+        .git_done => |exit| handleGitResult(model, fx, git_cli.result(exit)),
         .store_done => |result| handleStoreResult(model, fx, result),
         .terminal_event => |event| handleTerminalEvent(model, fx, event),
         .sidebar_resized => |fraction| {
@@ -2276,8 +2095,8 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 }
 
 const CanopyHost = struct {
-    chrome_configured: bool = false,
-    geometry_pending: @import("geometry_updates.zig").Pending = .{},
+    chrome_install: canvas_host.InstallGate = .{},
+    sidebar_controller: @import("sidebar_controller.zig").Controller = .{},
     menu: @import("app_menu.zig").Host = .{},
     terminals: @import("ghostty_host.zig").Host = .{},
     ui_app: *CanopyApp,
@@ -2336,85 +2155,23 @@ const CanopyHost = struct {
 
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
-        if (host.stageGeometry(event_value)) {
-            if (runtime.findViewIndex(1, canvas_label)) |index| try runtime.requestCanvasFrameForView(index);
-            return;
-        }
-        if (event_value == .gpu_surface_frame and std.mem.eql(u8, event_value.gpu_surface_frame.label, canvas_label)) {
-            const pending = host.geometry_pending.take();
-            // This reducer arm changes only a scalar; preserve the typed
-            // update route without rebuilding once for each mouse sample.
-            if (pending.sidebar) |fraction| update(&host.ui_app.model, .{ .sidebar_resized = fraction }, &host.ui_app.effects);
-            // Convert the staged drag against the layout that produced it,
-            // then derive the split fraction for this frame's new width.
-            host.ui_app.model.canvas_width = event_value.gpu_surface_frame.size.width;
-            const moved = host.ui_app.model.sidebar.advance(host.ui_app.model.canvas_width, event_value.gpu_surface_frame.timestamp_ns, host.ui_app.model.appearance.reduce_motion);
-            if (pending.resize) |resize| {
-                try host.ui_app.app().event(runtime, .{ .gpu_surface_resized = resize });
-            } else if (host.ui_app.installed and (pending.sidebar != null or moved)) try host.ui_app.rebuild(runtime, 1);
-        }
-        if (event_value == .gpu_surface_resized and std.mem.eql(u8, event_value.gpu_surface_resized.label, canvas_label)) {
-            host.ui_app.model.canvas_width = event_value.gpu_surface_resized.frame.width;
-        }
+        if (try host.sidebar_controller.prepareEvent(runtime, host.ui_app, event_value, update)) return;
         try host.ui_app.app().event(runtime, event_value);
+        try host.synchronizeNativeState(runtime);
+        try host.sidebar_controller.finishEvent(runtime, host.ui_app);
+    }
+
+    fn synchronizeNativeState(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
         while (host.menu.takeClose()) try host.ui_app.dispatch(runtime, 1, .close_active_tab);
         try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
-        if (builtin.os.tag == .macos and !host.geometry_pending.any()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
+        if (builtin.os.tag == .macos and !host.sidebar_controller.hasPendingGeometry()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
         // AppKit can synchronously emit resizes when its toolbar style changes.
         // Do this only after UiApp has finished installation, with the guard
         // already set so a reentrant callback cannot initialize UI twice.
-        if (builtin.os.tag == .macos and host.ui_app.installed and !host.chrome_configured) {
-            host.chrome_configured = true;
+        if (builtin.os.tag == .macos and host.chrome_install.claim(host.ui_app.installed)) {
             canopy_use_compact_titlebar();
-        }
-        if (!host.geometry_pending.any() and host.ui_app.model.sidebar_persistence.canSave()) {
-            if (runtime.findViewIndex(1, canvas_label)) |index| {
-                if (runtime.views[index].canvas_widget_pressed_id == 0) try host.ui_app.dispatch(runtime, 1, .save_sidebar_width);
-            }
-        }
-        var grip_active = false;
-        if (!host.ui_app.model.terminalActionsBlocked() and !host.ui_app.model.sidebar.compact and !host.ui_app.model.sidebar.collapsed) {
-            if (runtime.findViewIndex(1, canvas_label)) |index| {
-                const view = &runtime.views[index];
-                const layout = runtime.canvasWidgetLayout(1, canvas_label) catch null;
-                if (layout) |tree| for (tree.nodes) |node| {
-                    if (node.widget.kind == .split_divider and
-                        (node.widget.id == view.canvas_widget_hovered_id or node.widget.id == view.canvas_widget_pressed_id))
-                    {
-                        grip_active = true;
-                        break;
-                    }
-                };
-            }
-        }
-        const grip_changed = host.ui_app.model.sidebar.grip_active != grip_active;
-        host.ui_app.model.sidebar.grip_active = grip_active;
-        // Request the next display tick only while a disclosure is moving.
-        // A toggle's dispatch already requests its first frame.
-        if (host.ui_app.model.sidebar.needsFrame() or grip_changed) {
-            if (runtime.findViewIndex(1, canvas_label)) |index| try runtime.requestCanvasFrameForView(index);
-        }
-    }
-
-    fn stageGeometry(host: *CanopyHost, event_value: native_sdk.Event) bool {
-        if (!host.ui_app.installed) return false;
-        switch (event_value) {
-            .gpu_surface_resized => |resize| {
-                if (!std.mem.eql(u8, resize.label, canvas_label)) return false;
-                host.geometry_pending.recordResize(resize);
-                return true;
-            },
-            .canvas_widget_resize => |resize| {
-                if (!std.mem.eql(u8, resize.view_label, canvas_label)) return false;
-                const tree = host.ui_app.tree orelse return false;
-                const msg = tree.msgForResize(resize.id, resize.fraction) orelse return false;
-                if (msg != .sidebar_resized) return false;
-                host.geometry_pending.sidebar = msg.sidebar_resized;
-                return true;
-            },
-            else => return false,
         }
     }
 
@@ -2431,7 +2188,7 @@ const CanopyHost = struct {
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
-        if (host.geometry_pending.take().sidebar) |fraction| update(&host.ui_app.model, .{ .sidebar_resized = fraction }, &host.ui_app.effects);
+        host.sidebar_controller.flushPending(host.ui_app, update);
         host.menu.deinit();
         if (builtin.os.tag == .macos) host.terminals.detach(runtime);
         host.terminals.deinit();
@@ -2548,6 +2305,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("ghostty_host.zig");
+    _ = @import("canvas_host.zig");
+    _ = @import("sidebar_controller_tests.zig");
     _ = @import("geometry_updates.zig");
     _ = @import("ghostty_config_tests.zig");
     _ = @import("db_page.zig");

@@ -538,6 +538,10 @@ test "Git lane keeps exactly one command in flight and never queues user work" {
     try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
     const running_key = fx.pendingSpawnAt(0).?.key;
 
+    app.update(&model, .{ .git_done = .{ .key = running_key + 99, .code = 0 } }, &fx);
+    try std.testing.expect(model.gitBusy());
+    try std.testing.expectEqual(running_key, fx.pendingSpawnAt(0).?.key);
+
     const second = app.PathPayload.from("/tmp/must-not-be-queued").?;
     app.update(&model, .{ .folder_selected = second }, &fx);
     app.update(&model, .open_folder, &fx);
@@ -550,6 +554,10 @@ test "Git lane keeps exactly one command in flight and never queues user work" {
     try std.testing.expect(model.gitBusy());
     try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
     try std.testing.expectEqualStrings("list", fx.pendingSpawnAt(0).?.argv[4]);
+    const refresh_key = fx.pendingSpawnAt(0).?.key;
+    app.update(&model, .{ .git_done = .{ .key = running_key, .code = 0 } }, &fx);
+    try std.testing.expectEqual(refresh_key, fx.pendingSpawnAt(0).?.key);
+    try std.testing.expect(model.gitBusy());
     try finishSpawn(&fx, &model, 0, &.{
         "worktree /tmp/slow-repository",
         "HEAD 1111111",
@@ -558,6 +566,34 @@ test "Git lane keeps exactly one command in flight and never queues user work" {
     });
     try std.testing.expect(!model.gitBusy());
     try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+}
+
+test "failed worktree checkout refreshes state without deleting the created branch" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    defer model.active_tab_by_workspace.deinit(std.testing.allocator);
+    const attached = stores.projects.attachPlaceholder("/tmp/checkout-failure").?;
+    try std.testing.expect(stores.projects.setWorktreesBase("/tmp/canopy-worktrees"));
+    try std.testing.expect(stores.projects.markGit(attached.project_id, "/tmp/checkout-failure"));
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&model, .{ .begin_create_worktree = attached.project_id }, &fx);
+    model.create_branch.set("feature/retained");
+    app.update(&model, .confirm_create_worktree, &fx);
+    try finishSpawn(&fx, &model, 0, &.{}); // valid name
+    try finishSpawn(&fx, &model, 0, &.{}); // absent target
+    try finishSpawn(&fx, &model, 1, &.{}); // absent branch
+    try finishSpawn(&fx, &model, 0, &.{}); // branch created
+    try std.testing.expectEqualStrings("add", fx.pendingSpawnAt(0).?.argv[4]);
+    try finishSpawn(&fx, &model, 128, &.{});
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
+    try std.testing.expectEqualStrings("list", fx.pendingSpawnAt(0).?.argv[4]);
+    try finishSpawn(&fx, &model, 0, &.{ "worktree /tmp/checkout-failure", "HEAD 1111111", "branch refs/heads/main", "" });
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingSpawnCount());
+    try std.testing.expect(!model.gitBusy());
+    try std.testing.expectEqualStrings("Worktree creation failed; branch retained and Git state refreshed", model.status_text);
 }
 
 test "worktree removal waits for PTY exit and requires force for dirty state" {

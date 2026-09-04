@@ -120,6 +120,25 @@ The native container is detached while any modal is open. Tabs from
 another worktree remain alive but are filtered from the current tab strip, so
 switching worktrees restores that worktree's last active tab.
 
+`ghostty_bridge.h` is the shared ABI contract, imported by Zig through
+`ghostty_abi.zig`; named events route by tab identity, not recycled PTY keys.
+`ghostty_input.h` holds the tested mouse/overlay gating policy used by AppKit.
+
+`CanopyHost.event` keeps an explicit order: prepare sidebar geometry, deliver the
+UI event, synchronize native services, then finish sidebar interaction and
+persistence. `sidebar_controller.zig` owns that sidebar coordination;
+`canvas_host.zig` isolates the retained-canvas pointer fields and frame requests.
+Event-order tests cover resize coalescing, startup, pointer release, hover and
+shutdown staging without needing a GUI or a live PTY.
+
+Git operations use `git_workflow.zig` for semantic requests, creation-step
+transitions, removal safety snapshots and the single-flight lane. `git_cli.zig`
+is the current transport: it builds argv and maps process outcomes into workflow
+results. UI selection, approval dialogs and PTY teardown coordination remain in
+`main.zig`; worktree porcelain decoding remains in `workspaces.zig`. This is a
+refactoring boundary, not a switch to libgit2. Calls still run one at a time,
+without a backlog or execution timeout; stale results cannot release the lane.
+
 `npm test` also runs the real Ghostty session and terminal painter suites via
 `zig build test-terminal`. The upstream SDK-wide tests use an inert VT seam,
 so they are not sufficient to verify alternate screens or full-screen TUI

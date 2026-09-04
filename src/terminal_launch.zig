@@ -1,7 +1,7 @@
 //! Owned handoff to the full Ghostty host. Never expose command/env to UI data.
 const std = @import("std");
 const sdk = @import("native_sdk");
-pub const Env = extern struct { name: [*:0]const u8, value: [*:0]const u8 };
+pub const Env = @import("ghostty_abi.zig").c.canopy_ghostty_env;
 pub const Pending = struct {
     arena: std.heap.ArenaAllocator,
     command: [:0]const u8,

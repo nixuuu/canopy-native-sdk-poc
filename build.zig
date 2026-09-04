@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
         .manifest = "app.json",
         .terminal_sessions = true,
     });
+    app.exe.root_module.addIncludePath(b.path("src"));
+    app.tests.root_module.addIncludePath(b.path("src"));
     if (app.exe.root_module.resolved_target.?.result.os.tag == .macos) {
         const ghostty = b.lazyDependency("ghostty", .{}) orelse return;
         const output = b.pathFromRoot("zig-out/ghostty");

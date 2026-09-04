@@ -4,6 +4,11 @@
 #include "ghostty.h"
 #include "ghostty_bridge.h"
 #include "ghostty_activity.h"
+#include "ghostty_input.h"
+
+_Static_assert(sizeof(canopy_ghostty_event_kind) == sizeof(int), "bridge event ABI changed");
+_Static_assert(sizeof(canopy_ghostty_env) == sizeof(ghostty_env_var_s), "Ghostty environment ABI changed");
+_Static_assert(offsetof(canopy_ghostty_env, value) == offsetof(ghostty_env_var_s, value), "Ghostty environment layout changed");
 
 @class CanopyGhosttyHost;
 @interface CanopyGhosttyView : NSView <NSTextInputClient>
@@ -41,7 +46,7 @@
 @property(nonatomic, assign) BOOL focused;
 @property(nonatomic, assign) void (*notify)(void *);
 @property(nonatomic, assign) void *notifyContext;
-- (void)queue:(uint64_t)tab kind:(int)kind code:(int)code;
+- (void)queue:(uint64_t)tab kind:(canopy_ghostty_event_kind)kind code:(int)code;
 @end
 
 static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
@@ -180,7 +185,7 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
 }
 - (void)keyDown:(NSEvent *)event {
     if (self.sidebarOverlay) {
-        if (event.keyCode == 53) [self.host queue:self.tab kind:4 code:0];
+        if (event.keyCode == 53) [self.host queue:self.tab kind:CANOPY_GHOSTTY_DISMISS_SIDEBAR code:0];
         return;
     }
     self.keyEvent = event;
@@ -234,26 +239,28 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
 - (void)copy:(id)sender { if (self.surface) ghostty_surface_binding_action(self.surface,"copy_to_clipboard",17); }
 - (void)paste:(id)sender { if (self.surface && !self.sidebarOverlay) ghostty_surface_binding_action(self.surface,"paste_from_clipboard",20); }
 - (void)mouseMoved:(NSEvent *)event { if (self.sidebarOverlay) return; NSPoint p=[self convertPoint:event.locationInWindow fromView:nil]; if(self.surface) ghostty_surface_mouse_pos(self.surface,p.x,p.y,mods(event.modifierFlags)); }
-- (void)mouseDown:(NSEvent *)event {
-    if (self.sidebarOverlay) {
-        self.suppressMouseUp = YES;
-        [self.host queue:self.tab kind:4 code:0];
+- (void)sendMouseButton:(ghostty_input_mouse_button_e)button state:(ghostty_input_mouse_state_e)state event:(NSEvent *)event {
+    bool suppress = self.suppressMouseUp;
+    CanopyMouseDecision decision = CanopyTerminalMouseInput(self.sidebarOverlay,
+        button == GHOSTTY_MOUSE_LEFT, state == GHOSTTY_MOUSE_PRESS, &suppress);
+    self.suppressMouseUp = suppress;
+    if (decision == CANOPY_MOUSE_DISMISS_SIDEBAR) {
+        [self.host queue:self.tab kind:CANOPY_GHOSTTY_DISMISS_SIDEBAR code:0];
         return;
     }
-    [self.window makeFirstResponder:self]; [self mouseMoved:event];
-    if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_LEFT,mods(event.modifierFlags));
+    if (decision == CANOPY_MOUSE_BLOCK) return;
+    if (button == GHOSTTY_MOUSE_LEFT && state == GHOSTTY_MOUSE_PRESS) [self.window makeFirstResponder:self];
+    [self mouseMoved:event];
+    if (self.surface) ghostty_surface_mouse_button(self.surface, state, button, mods(event.modifierFlags));
 }
-- (void)mouseUp:(NSEvent *)event {
-    if (self.suppressMouseUp) { self.suppressMouseUp = NO; return; }
-    if (self.sidebarOverlay) return;
-    [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_LEFT,mods(event.modifierFlags));
-}
+- (void)mouseDown:(NSEvent *)event { [self sendMouseButton:GHOSTTY_MOUSE_LEFT state:GHOSTTY_MOUSE_PRESS event:event]; }
+- (void)mouseUp:(NSEvent *)event { [self sendMouseButton:GHOSTTY_MOUSE_LEFT state:GHOSTTY_MOUSE_RELEASE event:event]; }
 - (void)mouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
-- (void)rightMouseDown:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_RIGHT,mods(event.modifierFlags)); }
-- (void)rightMouseUp:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_RIGHT,mods(event.modifierFlags)); }
+- (void)rightMouseDown:(NSEvent *)event { [self sendMouseButton:GHOSTTY_MOUSE_RIGHT state:GHOSTTY_MOUSE_PRESS event:event]; }
+- (void)rightMouseUp:(NSEvent *)event { [self sendMouseButton:GHOSTTY_MOUSE_RIGHT state:GHOSTTY_MOUSE_RELEASE event:event]; }
 - (void)rightMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
-- (void)otherMouseDown:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_PRESS,GHOSTTY_MOUSE_MIDDLE,mods(event.modifierFlags)); }
-- (void)otherMouseUp:(NSEvent *)event { if (self.sidebarOverlay) return; [self mouseMoved:event]; if(self.surface) ghostty_surface_mouse_button(self.surface,GHOSTTY_MOUSE_RELEASE,GHOSTTY_MOUSE_MIDDLE,mods(event.modifierFlags)); }
+- (void)otherMouseDown:(NSEvent *)event { [self sendMouseButton:GHOSTTY_MOUSE_MIDDLE state:GHOSTTY_MOUSE_PRESS event:event]; }
+- (void)otherMouseUp:(NSEvent *)event { [self sendMouseButton:GHOSTTY_MOUSE_MIDDLE state:GHOSTTY_MOUSE_RELEASE event:event]; }
 - (void)otherMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
 - (void)mouseExited:(NSEvent *)event { if(self.surface) ghostty_surface_mouse_pos(self.surface,-1,-1,mods(event.modifierFlags)); }
 - (void)scrollWheel:(NSEvent *)event {
@@ -274,7 +281,7 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
 @end
 
 @implementation CanopyGhosttyHost
-- (void)queue:(uint64_t)tab kind:(int)kind code:(int)code {
+- (void)queue:(uint64_t)tab kind:(canopy_ghostty_event_kind)kind code:(int)code {
     if (self.stopping) return;
     canopy_ghostty_event event = {tab,kind,code};
     [self.events addObject:[NSValue valueWithBytes:&event objCType:@encode(canopy_ghostty_event)]];
@@ -294,14 +301,14 @@ static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s 
         case GHOSTTY_ACTION_RENDER: if (view.surface) ghostty_surface_draw(view.surface); return true;
         // The pinned Ghostty macOS login wrapper does not reliably preserve
         // the command's exit code (see Surface.childExited). Do not report 0.
-        case GHOSTTY_ACTION_SHOW_CHILD_EXITED: if(view) [host queue:view.tab kind:1 code:-1]; return true;
-        case GHOSTTY_ACTION_CLOSE_TAB: if(view) [host queue:view.tab kind:2 code:0]; return view != nil;
-        case GHOSTTY_ACTION_NEW_TAB: if(view) [host queue:view.tab kind:3 code:0]; return view != nil;
+        case GHOSTTY_ACTION_SHOW_CHILD_EXITED: if(view) [host queue:view.tab kind:CANOPY_GHOSTTY_PROCESS_EXIT code:-1]; return true;
+        case GHOSTTY_ACTION_CLOSE_TAB: if(view) [host queue:view.tab kind:CANOPY_GHOSTTY_CLOSE_TAB code:0]; return view != nil;
+        case GHOSTTY_ACTION_NEW_TAB: if(view) [host queue:view.tab kind:CANOPY_GHOSTTY_NEW_TERMINAL code:0]; return view != nil;
         case GHOSTTY_ACTION_SET_TITLE: case GHOSTTY_ACTION_PWD: case GHOSTTY_ACTION_CELL_SIZE: case GHOSTTY_ACTION_INITIAL_SIZE: case GHOSTTY_ACTION_SIZE_LIMIT: case GHOSTTY_ACTION_SCROLLBAR: return true;
         default: return false;
     }
 }
-static void closeSurface(void *userdata, bool alive) { CanopyGhosttyView *view=(__bridge CanopyGhosttyView *)userdata; [view.host queue:view.tab kind:2 code:0]; }
+static void closeSurface(void *userdata, bool alive) { CanopyGhosttyView *view=(__bridge CanopyGhosttyView *)userdata; [view.host queue:view.tab kind:CANOPY_GHOSTTY_CLOSE_TAB code:0]; }
 static bool readClipboard(void *userdata, ghostty_clipboard_e clipboard, void *state) {
     CanopyGhosttyView *view=(__bridge CanopyGhosttyView *)userdata;
     if (!view.surface || clipboard != GHOSTTY_CLIPBOARD_STANDARD) return false;
