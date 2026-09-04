@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const preferences_mod = @import("preferences.zig");
+const ghostty_config_mod = @import("ghostty_config.zig");
 const profile_editor = @import("profile_editor.zig");
 const profiles_mod = @import("profiles.zig");
 const terminal_tabs = @import("terminal_tabs.zig");
@@ -2101,6 +2102,9 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 const CanopyHost = struct {
     ui_app: *CanopyApp,
     io: std.Io,
+    // Host-only, not Model: raw Ghostty directives can contain secrets and
+    // must not be serialized into UI snapshots or session fingerprints.
+    ghostty_config: ?*const ghostty_config_mod.Snapshot = null,
     handled_picker_serial: u64 = 0,
     handled_worktrees_base_serial: u64 = 0,
 
@@ -2209,6 +2213,20 @@ const CanopyHost = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    var ghostty_config = ghostty_config_mod.Snapshot.init(init.gpa);
+    defer ghostty_config.deinit();
+    try ghostty_config.loadEnvironment(init.io, init.environ_map);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--inspect-ghostty-config")) {
+            var buffer: [4096]u8 = undefined;
+            var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+            try ghostty_config.writeSummary(init.gpa, &stdout.interface);
+            try stdout.interface.flush();
+            return;
+        }
+    }
+    std.debug.print("canopy: Ghostty config loaded ({d} sources, {d} diagnostics; renderer unchanged)\n", .{ ghostty_config.sources.items.len, ghostty_config.diagnostics.items.len });
     const tab_store = try TabStore.create(std.heap.page_allocator);
     defer tab_store.destroy();
     const project_store = try workspaces.Store.create(std.heap.page_allocator);
@@ -2245,6 +2263,7 @@ pub fn main(init: std.process.Init) !void {
         user_shell,
     );
     defer host.destroy(std.heap.page_allocator);
+    host.ghostty_config = &ghostty_config;
 
     try runner.runWithOptions(host.app(), .{
         .app_name = "canopy-native-sdk-poc",
@@ -2262,6 +2281,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("ghostty_config_tests.zig");
     _ = @import("db_page.zig");
     _ = @import("tests.zig");
     _ = @import("profiles.zig");

@@ -60,6 +60,36 @@ the lazy Ghostty terminal dependency remain reproducibly pinned in
 
 ## Architecture
 
+### Ghostty configuration (read-only foundation)
+
+The app reads Ghostty configuration once during startup, without changing the
+current Native SDK renderer or executing any directives. Inspect the snapshot
+without opening a window or modifying application storage:
+
+```bash
+./zig-out/bin/canopy-native-sdk-poc --inspect-ghostty-config
+```
+
+`src/ghostty_config.zig` owns source bytes, ordered directives and diagnostics.
+It loads XDG `ghostty/config` then `ghostty/config.ghostty`, followed by the
+equivalent macOS Application Support paths. `XDG_CONFIG_HOME` overrides the
+default `~/.config`. Deferred `config-file` includes support relative/absolute
+paths, `~/`, optional `?` files, resets, and canonical-path cycle detection.
+Themes are a lower-priority layer, resolved from XDG `ghostty/themes`, then
+Ghostty resource directories (`GHOSTTY_RESOURCES_DIR` or standard installation
+locations). Both `light:...,dark:...` branches are retained separately.
+
+The reader preserves unknown keys, repeated values, explicit resets and source
+line numbers. It is not yet Ghostty's complete typed validator/default resolver:
+conditional directives beyond paired themes, CLI overrides and hot reload are
+not interpreted. These belong to the later full Ghostty integration. Config is
+kept outside the UI model; diagnostics never dump arbitrary option values.
+Limits protect startup from malformed inputs: 256 KiB/file, 2 MiB total, 64 file
+attempts, 16,384 entries and 128 diagnostics. No config files are created or
+rewritten, including when no default config exists.
+
+### Application ownership
+
 The implementation mirrors Canopy Desktop's important ownership boundary:
 
 ```text
