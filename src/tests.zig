@@ -303,7 +303,11 @@ const Stores = struct {
     profiles: *profiles.Store,
 
     fn init() !Stores {
-        const tabs = try app.TabStore.create(std.testing.allocator);
+        return initWithTabAllocator(std.testing.allocator);
+    }
+
+    fn initWithTabAllocator(allocator: std.mem.Allocator) !Stores {
+        const tabs = try app.TabStore.create(allocator);
         errdefer tabs.destroy();
         const projects = try workspaces.Store.create(std.testing.allocator);
         errdefer projects.destroy();
@@ -317,6 +321,73 @@ const Stores = struct {
         stores.profiles.destroy();
     }
 };
+
+test "shell and tool allocation failure leave no tab or pending process" {
+    for ([_]bool{ false, true }) |ghostty| {
+        for ([_]bool{ false, true }) |tool| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            const stores = try Stores.initWithTabAllocator(failing.allocator());
+            defer stores.deinit();
+            var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+            defer model.active_tab_by_workspace.deinit(failing.allocator());
+            model.use_ghostty = ghostty;
+            model.active_workspace_id = stores.projects.attachPlaceholder("/tmp/start-failure").?.workspace_id;
+            _ = try addProfile(stores, 1, .codex, "Default");
+            model.profiles_loaded = true;
+            model.codex_available = true;
+            try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
+            try stores.tabs.free_pty_keys.ensureTotalCapacity(failing.allocator(), 1);
+            failing.fail_index = failing.alloc_index;
+            failing.resize_fail_index = failing.resize_index;
+            var fx = app.Effects.init(std.testing.allocator);
+            defer fx.deinit();
+            fx.executor = .fake;
+            app.update(&model, if (tool) .launch_codex else .open_active_terminal, &fx);
+            try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
+            try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+            try std.testing.expectEqual(@as(u64, 1), stores.tabs.free_pty_keys.items[0]);
+            try std.testing.expectEqual(@as(?u64, null), model.active_tab_by_workspace.get(model.active_workspace_id));
+        }
+    }
+}
+
+test "failed Ghostty handoff stays closable and retries with a fresh tab identity" {
+    for ([_]bool{ false, true }) |tool| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const stores = try Stores.initWithTabAllocator(failing.allocator());
+        defer stores.deinit();
+        var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+        defer model.active_tab_by_workspace.deinit(failing.allocator());
+        model.use_ghostty = true;
+        model.active_workspace_id = stores.projects.attachPlaceholder("/tmp/handoff-failure").?.workspace_id;
+        _ = try addProfile(stores, 1, .codex, "Default");
+        model.profiles_loaded = true;
+        model.codex_available = true;
+        try std.testing.expect(model.setToolExecutable(.codex, "/usr/local/bin/codex"));
+        try stores.tabs.items.ensureTotalCapacity(failing.allocator(), 1);
+        try stores.tabs.free_pty_keys.ensureTotalCapacity(failing.allocator(), 1);
+        try model.active_tab_by_workspace.ensureTotalCapacity(failing.allocator(), 1);
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+        var fx = app.Effects.init(std.testing.allocator);
+        defer fx.deinit();
+        fx.executor = .fake;
+        app.update(&model, if (tool) .launch_codex else .open_active_terminal, &fx);
+        const failed = stores.tabs.items.items[0];
+        try std.testing.expectEqual(app.TerminalPhase.failed, failed.phase);
+        try std.testing.expect(failed.pending_launch == null);
+        try std.testing.expectEqual(@as(usize, 0), fx.pendingPtyCount());
+        app.update(&model, .{ .close_tab = failed.id }, &fx);
+        try std.testing.expectEqual(@as(usize, 0), stores.tabs.items.items.len);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        app.update(&model, if (tool) .launch_codex else .open_active_terminal, &fx);
+        const retried = stores.tabs.items.items[0];
+        try std.testing.expect(retried.id != failed.id);
+        try std.testing.expectEqual(failed.pty, retried.pty);
+        try std.testing.expect(retried.pending_launch != null);
+    }
+}
 
 fn finishSpawn(fx: *app.Effects, model: *app.Model, code: i32, output_lines: []const []const u8) !void {
     const request = fx.pendingSpawnAt(0) orelse return error.MissingSpawn;

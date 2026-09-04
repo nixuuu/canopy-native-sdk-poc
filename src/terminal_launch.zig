@@ -62,3 +62,21 @@ test "explicit profile NO_COLOR is preserved" {
     defer pending.destroy();
     try std.testing.expectEqualStrings("'/bin/sh'", pending.command);
 }
+
+fn prepareWithFailingAllocator(allocator: std.mem.Allocator) !void {
+    const pending = try Pending.create(allocator, "/tmp/quoted workspace", &.{ "/bin/sh", "a'b", "" }, &.{
+        .{ .name = "SHELL", .value = "/bin/zsh" },
+        .{ .name = "COLORTERM", .value = "truecolor" },
+    });
+    defer pending.destroy();
+    try std.testing.expectEqualStrings("/tmp/quoted workspace", pending.cwd);
+    try std.testing.expectEqualStrings("truecolor", std.mem.span(pending.env[1].value));
+}
+
+test "Ghostty handoff releases every partial allocation on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, prepareWithFailingAllocator, .{});
+}
+
+test "invalid launch argument releases partially built Ghostty handoff" {
+    try std.testing.expectError(error.InvalidArgument, Pending.create(std.testing.allocator, "/tmp", &.{ "/bin/sh", "invalid\x00argument" }, &.{}));
+}

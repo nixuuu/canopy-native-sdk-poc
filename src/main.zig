@@ -1065,44 +1065,46 @@ fn countNonEmptyLines(bytes: []const u8) usize {
     return count;
 }
 
-fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
-    if (!model.project_store.workspaceAvailable(workspace_id)) return;
-    const workspace = model.project_store.findWorktree(workspace_id) orelse return;
-    if (!workspace.active) return;
-    model.active_workspace_id = workspace_id;
+// Borrowed launch data: startTerminal copies metadata and the selected backend
+// takes ownership of argv/env before the caller releases its temporary arena.
+const TerminalStartSpec = struct {
+    workspace: *const workspaces.Worktree,
+    title: []const u8,
+    tool: TerminalTool = .shell,
+    profile_id: []const u8 = "",
+    argv: []const []const u8,
+    env: []const native_sdk.PtyEnvEntry,
+};
 
+fn startTerminal(model: *Model, fx: *Effects, spec: TerminalStartSpec) void {
     const tab_id = model.next_tab_id;
     const pty_key = model.tab_store.allocatePtyKey(&model.next_pty_key);
     model.next_tab_id +%= 1;
-
     var tab = TerminalTab{
         .id = tab_id,
-        .workspace_id = workspace_id,
+        .workspace_id = spec.workspace.id,
         .pty = pty_key,
+        .tool = spec.tool,
     };
-    _ = tab.title.set(workspace.name.slice());
-    _ = tab.path.set(workspace.path.slice());
-    _ = tab.branch.set(workspace.branch.slice());
+    _ = tab.title.set(spec.title);
+    _ = tab.path.set(spec.workspace.path.slice());
+    _ = tab.branch.set(spec.workspace.branch.slice());
+    _ = tab.profile_id.set(spec.profile_id);
     model.tab_store.items.append(model.tab_store.allocator, tab) catch {
         model.tab_store.releasePtyKey(pty_key);
-        model.status_text = "The host could not allocate another terminal tab";
+        model.status_text = if (spec.tool == .shell) "The host could not allocate another terminal tab" else "The host could not allocate another tool tab";
         return;
     };
-    model.setActiveTab(workspace_id, tab_id);
-    model.status_text = "Starting login shell";
-
-    // The workspace and preferred shell are argv data, not interpolated shell
-    // source. A neutral POSIX wrapper performs only the safe `cd`, then the
-    // user's actual login shell owns its startup files and environment.
-    const user_shell = model.userShell();
-    const argv = &.{ "/bin/sh", "-c", terminal_bootstrap, "canopy-shell", workspace.path.slice(), user_shell };
-    const env = &[_]native_sdk.PtyEnvEntry{
-        .{ .name = "SHELL", .value = user_shell },
-        .{ .name = "COLORTERM", .value = "truecolor" },
+    model.setActiveTab(spec.workspace.id, tab_id);
+    model.status_text = switch (spec.tool) {
+        .shell => "Starting login shell",
+        .claude => "Starting Claude Code",
+        .codex => "Starting Codex",
     };
+
     if (model.use_ghostty) {
         const added = &model.tab_store.items.items[model.tab_store.items.items.len - 1];
-        added.pending_launch = @import("terminal_launch.zig").Pending.create(model.tab_store.allocator, workspace.path.slice(), argv, env) catch {
+        added.pending_launch = @import("terminal_launch.zig").Pending.create(model.tab_store.allocator, spec.workspace.path.slice(), spec.argv, spec.env) catch {
             added.phase = .failed;
             model.status_text = "Could not prepare Ghostty session";
             return;
@@ -1111,15 +1113,32 @@ fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
     }
     fx.ptySpawn(.{
         .key = pty_key,
-        .argv = argv,
+        .argv = spec.argv,
         .cols = 100,
         .rows = 30,
         .term = "xterm-256color",
+        .env = spec.env,
+        .on_event = Effects.ptyMsg(.terminal_event),
+    });
+}
+
+fn openTerminal(model: *Model, fx: *Effects, workspace_id: u64) void {
+    if (!model.project_store.workspaceAvailable(workspace_id)) return;
+    const workspace = model.project_store.findWorktree(workspace_id) orelse return;
+    if (!workspace.active) return;
+    model.active_workspace_id = workspace_id;
+
+    // cwd/shell remain argv data, not interpolated shell source. The neutral
+    // wrapper changes cwd, then the login shell owns startup and environment.
+    const user_shell = model.userShell();
+    startTerminal(model, fx, .{
+        .workspace = workspace,
+        .title = workspace.name.slice(),
+        .argv = &.{ "/bin/sh", "-c", terminal_bootstrap, "canopy-shell", workspace.path.slice(), user_shell },
         .env = &.{
             .{ .name = "SHELL", .value = user_shell },
             .{ .name = "COLORTERM", .value = "truecolor" },
         },
-        .on_event = Effects.ptyMsg(.terminal_event),
     });
 }
 
@@ -1568,40 +1587,15 @@ fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mod.Pr
         profile,
     ) orelse return;
 
-    const tab_id = model.next_tab_id;
-    const pty_key = model.tab_store.allocatePtyKey(&model.next_pty_key);
-    model.next_tab_id +%= 1;
     var title_buffer: [workspaces.max_name_bytes]u8 = undefined;
     const title = toolTitle(model, workspace.id, tool, profile, &title_buffer) orelse profile.agent_type.displayName();
-    var tab = TerminalTab{ .id = tab_id, .workspace_id = workspace.id, .pty = pty_key, .tool = tool };
-    _ = tab.title.set(title);
-    _ = tab.path.set(workspace.path.slice());
-    _ = tab.branch.set(workspace.branch.slice());
-    _ = tab.profile_id.set(profile.id.slice());
-    model.tab_store.items.append(model.tab_store.allocator, tab) catch {
-        model.tab_store.releasePtyKey(pty_key);
-        model.status_text = "The host could not allocate another tool tab";
-        return;
-    };
-    model.setActiveTab(workspace.id, tab_id);
-    model.status_text = if (tool == .claude) "Starting Claude Code" else "Starting Codex";
-    if (model.use_ghostty) {
-        const added = &model.tab_store.items.items[model.tab_store.items.items.len - 1];
-        added.pending_launch = @import("terminal_launch.zig").Pending.create(model.tab_store.allocator, workspace.path.slice(), launch.argv(), launch.env()) catch {
-            added.phase = .failed;
-            model.status_text = "Could not prepare Ghostty session";
-            return;
-        };
-        return;
-    }
-    fx.ptySpawn(.{
-        .key = pty_key,
+    startTerminal(model, fx, .{
+        .workspace = workspace,
+        .title = title,
+        .tool = tool,
+        .profile_id = profile.id.slice(),
         .argv = launch.argv(),
-        .cols = 100,
-        .rows = 30,
-        .term = "xterm-256color",
         .env = launch.env(),
-        .on_event = Effects.ptyMsg(.terminal_event),
     });
 }
 
