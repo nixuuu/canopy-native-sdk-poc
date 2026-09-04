@@ -9,10 +9,186 @@ index 0000000..16cc72d
 +    _ = @import("runtime/terminal_session_tests.zig");
 +}
 diff --git a/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m b/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
-index 3225c78..f11db33 100644
+index 3225c78..452ce13 100644
 --- a/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
 +++ b/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
-@@ -6995,6 +6995,21 @@ - (void)setScrollDrivers:(const native_sdk_appkit_scroll_driver_t *)drivers coun
+@@ -555,6 +555,7 @@ @interface NativeSdkMetalSurfaceView : NSView <NSTextInputClient, NSDraggingDest
+  * nonblank, retained canvas state) are already view state by the time
+  * the block fires, so the one event carries the freshest truth. */
+ @property(nonatomic, assign) BOOL frameEventEmissionScheduled;
++@property(nonatomic, strong) NSTimer *frameEventEmissionTimer;
+ /* Supersede token for the scheduled emission: a queued dispatch block
+  * whose captured generation no longer matches is stale and must no-op.
+  * Bumped on de-occlusion, where a heartbeat-paced emission (parked up
+@@ -3206,8 +3207,20 @@ static BOOL NativeSdkGpuCompositeEnabled(void) {
+  * upload/evict action lands, so a re-registered id re-rasterizes — and
+  * caching the SCALED output turns the expensive per-present resample
+  * (the dominant cost of image-heavy first frames) into a 1:1 blit. */
++#include "native_sdk_raster_policy.h"
++
+ static BOOL NativeSdkPacketCommandRasterCacheable(NSDictionary *command, NSString *kind) {
+-    if (command[@"transform"]) return NO;
++    // Layout translations (with float32 roundoff around identity) remain pure
++    // functions of immutable commands. Apply the ORIGINAL matrix to the raster;
++    // the tolerance only admits the cache, it never snaps rendered geometry.
++    // Real scaling, rotation, shear and reflections stay on the direct path.
++    if (command[@"transform"]) {
++        NSArray *transform = NativeSdkPacketArray(command[@"transform"], 6);
++        if (!transform || !NativeSdkRasterTranslationCacheable(
++                NativeSdkPacketNumber(transform[0], NAN), NativeSdkPacketNumber(transform[1], NAN),
++                NativeSdkPacketNumber(transform[2], NAN), NativeSdkPacketNumber(transform[3], NAN),
++                NativeSdkPacketNumber(transform[4], NAN), NativeSdkPacketNumber(transform[5], NAN))) return NO;
++    }
+     if (command[@"clip"] && !NativeSdkPacketArray(command[@"clip"], 4)) return NO;
+     if ([kind isEqualToString:@"draw_text"] || [kind isEqualToString:@"shadow"]) return YES;
+     if ([kind hasPrefix:@"fill_rect"] || [kind hasPrefix:@"fill_rounded_rect"] || [kind hasPrefix:@"stroke_rect"] || [kind hasPrefix:@"draw_line"]) return YES;
+@@ -3862,6 +3875,8 @@ static void NativeSdkPremultiplyStraightRgba8(const uint8_t *source, uint8_t *de
+     }
+ }
+ 
++#include "native_sdk_frame_clock.h"
++
+ @implementation NativeSdkMetalSurfaceView
+ 
+ - (NSString *)viewLabel {
+@@ -3886,6 +3901,9 @@ - (instancetype)initWithFrame:(NSRect)frameRect {
+     _metalLayer.framebufferOnly = NO;
+     _metalLayer.opaque = YES;
+     _metalLayer.contentsGravity = kCAGravityTopLeft;
++    // Canvas UI and adopted native children must reach the screen with the
++    // same AppKit geometry transaction, especially during live window resize.
++    _metalLayer.presentsWithTransaction = YES;
+     // No nextDrawable timeout: with the timeout allowed (the default), a
+     // non-composited window's starved pool makes nextDrawable stall a full
+     // second per frame before returning nil. Disallowing it means
+@@ -3946,6 +3964,7 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+ 
+ - (void)dealloc {
+     [self stopDisplayTimer];
++    [self.frameEventEmissionTimer invalidate];
+     [[NSNotificationCenter defaultCenter] removeObserver:self];
+     if (self.canvasColorSpace) {
+         CGColorSpaceRelease(self.canvasColorSpace);
+@@ -4984,9 +5003,17 @@ - (void)verifyCompositeIncrementalWithCommands:(NSArray *)commands keys:(NSArray
+         NSUInteger firstDiff = 0;
+         while (firstDiff < byteLength && incremental[firstDiff] == reference[firstDiff]) firstDiff += 1;
+         NSUInteger diffPixel = firstDiff / 4;
+-        fprintf(stderr, "native-sdk: gpu incremental verify MISMATCH view=%s check=%llu pixel=(%lu,%lu) scissor=(%.2f,%.2f %.2fx%.2f)\n",
++        NSUInteger maxDelta = 0;
++        NSUInteger changedBytes = 0;
++        for (NSUInteger i = 0; i < byteLength; i++) {
++            NSUInteger delta = (NSUInteger)abs((int)incremental[i] - (int)reference[i]);
++            maxDelta = MAX(maxDelta, delta);
++            if (delta) changedBytes++;
++        }
++        fprintf(stderr, "native-sdk: gpu incremental verify MISMATCH view=%s check=%llu pixel=(%lu,%lu) max_delta=%lu changed_bytes=%lu scissor=(%.2f,%.2f %.2fx%.2f)\n",
+                 self.surfaceLabel.UTF8String ?: "", (unsigned long long)self.canvasVerifyCheckCount,
+                 (unsigned long)(diffPixel % pixelWidth), (unsigned long)(diffPixel / pixelWidth),
++                (unsigned long)maxDelta, (unsigned long)changedBytes,
+                 scissorRect.origin.x, scissorRect.origin.y, scissorRect.size.width, scissorRect.size.height);
+     }
+     if (self.canvasVerifyCheckCount == 1 || self.canvasVerifyCheckCount % 30 == 0 || self.canvasVerifyMismatchCount > 0) {
+@@ -5187,7 +5214,8 @@ - (NativeSdkPacketCommandRaster *)rasterCacheBuildEntryForCommand:(NSDictionary
+     if (hasCommandClip) {
+         [NSBezierPath clipRect:commandClip];
+     }
+-    BOOL ok = NativeSdkPacketDrawCommandBody(command, kind, opacity, bitmap, scale, hasCommandClip, commandClip, self.canvasImageCache);
++    BOOL ok = NativeSdkPacketApplyTransform(command[@"transform"]) &&
++        NativeSdkPacketDrawCommandBody(command, kind, opacity, bitmap, scale, hasCommandClip, commandClip, self.canvasImageCache);
+     [NSGraphicsContext restoreGraphicsState];
+     CGImageRef cgImage = ok ? CGBitmapContextCreateImage(bitmap) : NULL;
+     CGContextRelease(bitmap);
+@@ -5465,7 +5493,8 @@ - (void)verifyIncrementalBackingWithCommands:(NSArray *)commands keys:(NSArray *
+         self.canvasVerifyPixels = [NSMutableData dataWithLength:byteLength];
+     }
+     if (!self.canvasVerifyPixels) return;
+-    if ([self drawPacketCommands:commands keys:keys pixels:self.canvasVerifyPixels pixelWidth:pixelWidth pixelHeight:pixelHeight scale:scale surfaceWidth:surfaceWidth surfaceHeight:surfaceHeight clearColor:clearColor fullSurfacePass:YES hasScissor:NO scissorRect:NSZeroRect dirtyRects:nil] != 1) {
++    // Independent oracle: do not reuse the very raster cache being verified.
++    if ([self drawPacketCommands:commands keys:nil pixels:self.canvasVerifyPixels pixelWidth:pixelWidth pixelHeight:pixelHeight scale:scale surfaceWidth:surfaceWidth surfaceHeight:surfaceHeight clearColor:clearColor fullSurfacePass:YES hasScissor:NO scissorRect:NSZeroRect dirtyRects:nil] != 1) {
+         return;
+     }
+     self.canvasVerifyCheckCount += 1;
+@@ -5476,9 +5505,17 @@ - (void)verifyIncrementalBackingWithCommands:(NSArray *)commands keys:(NSArray *
+         NSUInteger firstDiff = 0;
+         while (firstDiff < byteLength && incremental[firstDiff] == reference[firstDiff]) firstDiff += 1;
+         NSUInteger diffPixel = firstDiff / 4;
+-        fprintf(stderr, "native-sdk: gpu incremental verify MISMATCH view=%s check=%llu pixel=(%lu,%lu) scissor=(%.2f,%.2f %.2fx%.2f)\n",
++        NSUInteger maxDelta = 0;
++        NSUInteger changedBytes = 0;
++        for (NSUInteger i = 0; i < byteLength; i++) {
++            NSUInteger delta = (NSUInteger)abs((int)incremental[i] - (int)reference[i]);
++            maxDelta = MAX(maxDelta, delta);
++            if (delta) changedBytes++;
++        }
++        fprintf(stderr, "native-sdk: gpu incremental verify MISMATCH view=%s check=%llu pixel=(%lu,%lu) max_delta=%lu changed_bytes=%lu scissor=(%.2f,%.2f %.2fx%.2f)\n",
+                 self.surfaceLabel.UTF8String ?: "", (unsigned long long)self.canvasVerifyCheckCount,
+                 (unsigned long)(diffPixel % pixelWidth), (unsigned long)(diffPixel / pixelWidth),
++                (unsigned long)maxDelta, (unsigned long)changedBytes,
+                 scissorRect.origin.x, scissorRect.origin.y, scissorRect.size.width, scissorRect.size.height);
+     }
+     if (self.canvasVerifyCheckCount == 1 || self.canvasVerifyCheckCount % 30 == 0 || self.canvasVerifyMismatchCount > 0) {
+@@ -6110,6 +6147,8 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+         self.frameEventEmissionScheduled = NO;
+     }
+     self.frameEventEmissionScheduled = YES;
++    [self.frameEventEmissionTimer invalidate];
++    self.frameEventEmissionTimer = nil;
+     // Armed: suspend app-nap timer coalescing until the channel goes
+     // quiet, so the paced deadlines below fire on time even for an
+     // unfocused or occluded window (see the property comment) — the
+@@ -6136,7 +6175,11 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+     }
+     const NSUInteger generation = self.frameEventEmissionGeneration;
+     __weak NativeSdkMetalSurfaceView *weakSelf = self;
+-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delayNs), dispatch_get_main_queue(), ^{
++    // AppKit live resize and menu tracking run nested event loops. A main
++    // dispatch-queue deadline can wait behind those loops; a COMMON-mode
++    // one-shot keeps the canvas clock running alongside native geometry.
++    self.frameEventEmissionTimer = NativeSdkScheduleCanvasFrameTimer((double)delayNs / NativeSdkNanosecondsPerSecond, ^(NSTimer *firedTimer) {
++        (void)firedTimer;
+         NativeSdkMetalSurfaceView *strongSelf = weakSelf;
+         if (!strongSelf) return;
+         // Superseded (de-occlusion rescheduled a fresher emission while
+@@ -6144,6 +6187,7 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+         // and the activity — touch nothing.
+         if (strongSelf.frameEventEmissionGeneration != generation) return;
+         strongSelf.frameEventEmissionScheduled = NO;
++        strongSelf.frameEventEmissionTimer = nil;
+         [strongSelf emitScheduledFrameEvent];
+         // The emission's engine dispatch re-arms the channel when more
+         // frames are wanted; if it did not, the animation is over —
+@@ -6177,6 +6221,16 @@ - (void)emitScheduledFrameEvent {
+ - (void)renderFrame {
+     if (![self isAvailable] || self.hidden || self.bounds.size.width <= 0 || self.bounds.size.height <= 0) return;
+     [self updateDrawableSize];
++    // AppKit can resize the layer before the runtime's new layout is ready.
++    // Keep the last valid contents instead of presenting a clear-only frame
++    // (or stretching an old layout) between those two geometry generations.
++    if (self.hasCanvasTexture && !NativeSdkCanvasSizeMatches(
++            self.canvasTextureWidth, self.canvasTextureHeight,
++            (uint64_t)self.metalLayer.drawableSize.width, (uint64_t)self.metalLayer.drawableSize.height)) {
++        self.glassFlushPending = YES;
++        [self scheduleFrameEventEmission];
++        return;
++    }
+ 
+     /* Occluded (or minimized, or hidden-app) windows never touch the
+      * drawable pool: complete the frame logically from retained state
+@@ -6339,8 +6393,12 @@ - (void)renderFrame {
+     }];
+ 
+     self.glassFlushPending = NO;
+-    [commandBuffer presentDrawable:drawable];
+     [commandBuffer commit];
++    // Apple's CAMetalLayer transaction contract: present the drawable on the
++    // main thread after scheduling, not via MTLCommandBuffer.presentDrawable.
++    // This waits for scheduling only, never for completion of GPU rendering.
++    [commandBuffer waitUntilScheduled];
++    [drawable present];
+     self.hasEverPresented = YES;
+ 
+     self.frameIndex += 1;
+@@ -6995,6 +7053,21 @@ - (void)setScrollDrivers:(const native_sdk_appkit_scroll_driver_t *)drivers coun
          driver.occluderMask = desired.occluder_mask;
          NSRect target = NSMakeRect(desired.x, self.bounds.size.height - desired.y - desired.height, desired.width, desired.height);
          if (!NSEqualRects(driver.frame, target)) driver.frame = target;
@@ -34,6 +210,60 @@ index 3225c78..f11db33 100644
          NSSize contentSize = NSMakeSize(MAX(desired.content_width, 1), MAX(desired.content_height, 1));
          if (driver.documentView && !NSEqualSizes(driver.documentView.frame.size, contentSize)) {
              [driver.documentView setFrameSize:contentSize];
+@@ -10786,7 +10859,11 @@ - (void)scheduleFrame {
+     if (self.timer) return;
+     // Common modes so frames keep pumping during live resize and menu
+     // tracking (default-mode timers do not fire in tracking runloops).
+-    NSTimer *frame_timer = [NSTimer timerWithTimeInterval:(1.0 / 60.0)
++    // Use the same display cadence as canvas input/presentation, not a second
++    // fixed 60 Hz clock that delays resize work on ProMotion/120 Hz displays.
++    NSScreen *screen = NSApp.keyWindow.screen ?: self.window.screen ?: NSScreen.mainScreen;
++    NSTimeInterval interval = (double)NativeSdkRetainedFrameIntervalNanoseconds(screen) / NativeSdkNanosecondsPerSecond;
++    NSTimer *frame_timer = [NSTimer timerWithTimeInterval:interval
+                                                    target:self
+                                                  selector:@selector(emitFrame)
+                                                  userInfo:nil
+diff --git a/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_frame_clock.h b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_frame_clock.h
+new file mode 100644
+index 0000000..858d295
+--- /dev/null
++++ b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_frame_clock.h
+@@ -0,0 +1,11 @@
++#pragma once
++#import <Foundation/Foundation.h>
++
++// A one-shot, coalesced canvas deadline must also run in AppKit's nested
++// tracking loop. Do not replace this with a default-mode timer/queue hop.
++static inline NSTimer *NativeSdkScheduleCanvasFrameTimer(NSTimeInterval delay,
++                                                       void (^callback)(NSTimer *)) {
++    NSTimer *timer = [NSTimer timerWithTimeInterval:MAX(0.000001, delay) repeats:NO block:callback];
++    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
++    return timer;
++}
+diff --git a/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_raster_policy.h b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_raster_policy.h
+new file mode 100644
+index 0000000..3da374e
+--- /dev/null
++++ b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_raster_policy.h
+@@ -0,0 +1,18 @@
++#pragma once
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++// Classification only. The original transform must still be applied when
++// producing cached pixels; admitting float32 roundoff does not snap geometry.
++static inline bool NativeSdkRasterTranslationCacheable(double a, double b, double c,
++                                                      double d, double tx, double ty) {
++    return isfinite(a) && isfinite(b) && isfinite(c) && isfinite(d) &&
++        isfinite(tx) && isfinite(ty) && fabs(a - 1) <= 1e-6 &&
++        b == 0 && c == 0 && fabs(d - 1) <= 1e-6;
++}
++
++static inline bool NativeSdkCanvasSizeMatches(uint64_t width, uint64_t height,
++                                            uint64_t drawableWidth, uint64_t drawableHeight) {
++    return width == drawableWidth && height == drawableHeight;
++}
 diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig
 index f36fa7d..1956e36 100644
 --- a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig
@@ -41,7 +271,7 @@ index f36fa7d..1956e36 100644
 @@ -28,14 +28,13 @@ const canvas = @import("root.zig");
  const geometry = @import("geometry");
  const box = @import("terminal_box.zig");
-
+ 
 -/// Grid ceilings, derived from the per-view canvas budgets: the glyph
 -/// budget bounds how many cells can hold ink at once, and the command
 -/// budget bounds per-row style runs. A viewport is clamped to these
@@ -55,12 +285,12 @@ index f36fa7d..1956e36 100644
 +// Grid geometry is independent from painter budgets: repeated glyphs and
 +// merged runs do not cost one atlas entry/command per terminal cell.
 +pub const max_cells: usize = max_cols * max_rows;
-
+ 
  /// Painter budgets when the grid rides the WIDGET tree, where it shares
  /// the per-view stores with every other widget. The command reserve is
 @@ -226,13 +225,10 @@ pub fn cellMetrics(tokens: canvas.DesignTokens) TerminalCellMetrics {
  }
-
+ 
  /// Clamp a proposed grid to the canvas budgets: the glyph budget bounds
 -/// total cells, so a very wide viewport trades rows for columns to stay
 -/// under the cell ceiling instead of overflowing the frame.
@@ -74,11 +304,11 @@ index f36fa7d..1956e36 100644
 +    const r = std.math.clamp(proposed_rows, 2, max_rows);
      return .{ .x = @intCast(c), .y = @intCast(r) };
  }
-
+ 
 @@ -414,6 +410,16 @@ fn rowPathElements(row: TerminalRow) usize {
      return total;
  }
-
+ 
 +fn squareCorner(cp: u21) u21 {
 +    return switch (cp) {
 +        0x256D => 0x250C,
@@ -95,7 +325,7 @@ index f36fa7d..1956e36 100644
 @@ -444,41 +450,47 @@ fn displayListPathElements(list: canvas.DisplayList) usize {
      return total;
  }
-
+ 
 -/// An UPPER BOUND on the display-list commands one row emits, assuming
 -/// no runs merge (the pathological worst case): a background run per
 -/// cell that carries one, plus the cell's ink — eight commands for a
@@ -218,7 +448,7 @@ index ef7c027..bb271a6 100644
 @@ -750,7 +750,10 @@ test "the widget diff reports paint damage for a changed bound grid" {
      try testing.expect(saw_paint_dirty);
  }
-
+ 
 -test "clampGrid trades rows for columns under the cell ceiling" {
 +test "clampGrid preserves viewport rows independently of its width" {
 +    const viewport = grid_model.clampGrid(178, 51);
@@ -230,7 +460,7 @@ index ef7c027..bb271a6 100644
 @@ -1020,6 +1023,43 @@ test "rounded-corner path elements survive the builder's lifetime" {
      try testing.expect(saw_path);
  }
-
+ 
 +test "path exhaustion squares TUI corners instead of hiding terminal content" {
 +    const cells = [_]grid_model.TerminalCell{
 +        .{ .cp = 0x256D, .fg = white },
@@ -297,7 +527,7 @@ index e780399..45a7ce4 100644
 -    const requestCanvasFrameForView = CanvasFrameMethods.requestCanvasFrameForView;
 +    pub const requestCanvasFrameForView = CanvasFrameMethods.requestCanvasFrameForView;
      const invalidateForCanvasChanges = CanvasFrameMethods.invalidateForCanvasChanges;
-
+ 
      const CanvasImageMethods = runtime_canvas_images.RuntimeCanvasImages(Runtime);
 diff --git a/node_modules/@native-sdk/cli/src/runtime/effects.zig b/node_modules/@native-sdk/cli/src/runtime/effects.zig
 index ce420b0..26ab2ba 100644
@@ -363,12 +593,12 @@ index ce420b0..26ab2ba 100644
 +    /// retire the PTY first and forget its emulator after the exit delivery.
 +    forget: ?*const fn (context: *anyopaque, key: u64) void = null,
  };
-
+ 
  /// What one channel event Msg reports. `.data` is one delivered post;
 @@ -2255,41 +2288,136 @@ fn fallbackEnviron() std.process.Environ {
      }
  }
-
+ 
 -/// Flatten the bound environ into the pty transport's env list — the
 -/// spawn effect's inherit-the-host policy, made explicit because execve
 -/// takes a flat envp. TERM is injected by the transport whether or not
@@ -542,7 +772,7 @@ index ce420b0..26ab2ba 100644
 @@ -2544,6 +2670,256 @@ fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation
      }
  }
-
+ 
 +/// One stable registration in the Darwin kqueue reactor. Registrations are
 +/// retained until reactor teardown so a queued kernel event can never point at
 +/// freed memory; `active` and `generation` make stale events inert.
@@ -815,7 +1045,7 @@ index ce420b0..26ab2ba 100644
              term: []const u8,
 +            env: []const PtyEnvEntry = &.{},
          };
-
+ 
          /// How one pty table slot advances: `.running` from the
 @@ -3496,6 +3879,8 @@ pub fn Effects(comptime Msg: type) type {
              transport: if (pty_transport.supported) ?pty_transport.Pty else void =
@@ -879,7 +1109,7 @@ index ce420b0..26ab2ba 100644
 +                slot.env_bytes_len = 0;
 +            }
          };
-
+ 
          /// How one channel table slot advances: `.open` accepts posts
 @@ -5026,7 +5452,12 @@ pub fn Effects(comptime Msg: type) type {
          /// occupancies beside the channel table. Loop-thread only —
@@ -1049,7 +1279,7 @@ index ce420b0..26ab2ba 100644
 @@ -8317,7 +8764,7 @@ pub fn Effects(comptime Msg: type) type {
                  if (self.executor != .fake) return self.rejectPty(options.key, options.on_event, false);
              }
-
+ 
 -            const slot = &self.pty_slots[slot_index];
 +            const slot = &self.pty_slots.items[slot_index];
              const generation = self.nextChannelGeneration();
@@ -1064,7 +1294,7 @@ index ce420b0..26ab2ba 100644
 +            if (self.pty_tap) |tap| if (tap.spawn) |notify_spawn| {
 +                notify_spawn(tap.context, options.key);
 +            };
-
+ 
              if (slot.fake) {
                  // Session replay: PARK — the fake-slot discipline. The
 @@ -8496,7 +8948,13 @@ pub fn Effects(comptime Msg: type) type {
@@ -1081,7 +1311,7 @@ index ce420b0..26ab2ba 100644
 +            }
              return accepted;
          }
-
+ 
 @@ -8574,7 +9032,20 @@ pub fn Effects(comptime Msg: type) type {
                  if (slot.transport) |transport| transport.kill(false);
              }
@@ -1102,7 +1332,7 @@ index ce420b0..26ab2ba 100644
 +                forget(tap.context, key);
 +            };
          }
-
+ 
          /// Ask the desktop host to show a system notification. This is
 @@ -11444,7 +11915,7 @@ pub fn Effects(comptime Msg: type) type {
                  shared.wake.pending.store(false, .seq_cst);
@@ -1182,7 +1412,7 @@ index ce420b0..26ab2ba 100644
                  self.journalNote(.{
 @@ -13857,22 +14329,23 @@ pub fn Effects(comptime Msg: type) type {
          }
-
+ 
          fn findPtySlot(self: *Self, key: u64) ?*PtySlot {
 -            for (&self.pty_slots) |*slot| {
 +            for (self.pty_slots.items) |*slot| {
@@ -1190,7 +1420,7 @@ index ce420b0..26ab2ba 100644
              }
              return null;
          }
-
+ 
 -        fn findIdlePtySlot(self: *Self) ?usize {
 -            for (&self.pty_slots, 0..) |*slot, index| {
 +        fn claimIdlePtySlot(self: *Self) ?usize {
@@ -1201,7 +1431,7 @@ index ce420b0..26ab2ba 100644
 +            self.pty_slots.append(self.allocator, .{}) catch return null;
 +            return self.pty_slots.items.len - 1;
          }
-
+ 
          fn idlePtySlotCount(self: *Self) usize {
              var count: usize = 0;
 -            for (&self.pty_slots) |*slot| {
@@ -1330,9 +1560,9 @@ index a92c59f..5d011e4 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/effects_pty_tests.zig
 @@ -46,6 +46,26 @@ const DirectMsg = union(enum) {
-
+ 
  const DirectFx = effects_mod.Effects(DirectMsg);
-
+ 
 +const PtyTapRecorder = struct {
 +    spawned: usize = 0,
 +    forgotten: usize = 0,
@@ -1359,7 +1589,7 @@ index a92c59f..5d011e4 100644
 @@ -70,13 +90,21 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
      defer fx.deinit();
      fx.executor = .fake;
-
+ 
 +    var overlay_name: [15]u8 = "PTY_TEST_MARKER".*;
 +    var overlay_value: [7]u8 = "overlay".*;
 +
@@ -1387,13 +1617,13 @@ index a92c59f..5d011e4 100644
 +    try testing.expectEqual(@as(usize, 1), request.env.len);
 +    try testing.expectEqualStrings("PTY_TEST_MARKER", request.env[0].name);
 +    try testing.expectEqualStrings("overlay", request.env[0].value);
-
+ 
      try fx.feedPtyOutput(9, "$ ");
      try fx.feedPtyOutput(9, "hello\r\n");
 @@ -102,6 +135,31 @@ test "fake pty lifecycle: spawn parks the request, feeds deliver, exit retires t
      try testing.expectEqual(@as(usize, 1), fx.pendingPtyCount());
  }
-
+ 
 +test "pty presentation lifecycle observes accepted spawn and explicit forget" {
 +    var fx = DirectFx.init(testing.allocator);
 +    defer fx.deinit();
@@ -1425,7 +1655,7 @@ index a92c59f..5d011e4 100644
 @@ -131,20 +189,39 @@ test "pty admission: every refused spawn delivers exactly one rejected exit" {
      fx.ptySpawn(.{ .key = 5, .argv = &.{"sh"}, .term = long_term, .on_event = DirectFx.ptyMsg(.pty) });
      _ = try expectExit(&fx, 5, .rejected);
-
+ 
 +    // Environment names are map keys, not shell fragments: reject empty
 +    // names, '=' and NUL in names/values, and TERM (owned by `.term`).
 +    fx.ptySpawn(.{ .key = 100, .argv = &.{"sh"}, .env = &.{.{ .name = "", .value = "x" }}, .on_event = DirectFx.ptyMsg(.pty) });
@@ -1451,7 +1681,7 @@ index a92c59f..5d011e4 100644
      fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
      fx.ptySpawn(.{ .key = 6, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
      _ = try expectExit(&fx, 6, .rejected);
-
+ 
 -    // Table exhaustion: the table already holds key 6; filling the
 -    // remaining slots leaves the next spawn refused.
 +    // Dynamic growth: the table already holds key 6 and accepts a burst
@@ -1466,18 +1696,18 @@ index a92c59f..5d011e4 100644
 -    try testing.expectEqual(@as(usize, effects_mod.max_effect_ptys), fx.pendingPtyCount());
 +    try testing.expectEqual(@as(usize, 65), fx.pendingPtyCount());
  }
-
+ 
  test "fake pty write capture, resize mirror, and kill mirror" {
 @@ -542,13 +619,13 @@ test "a fed output batch over the chunk bound is refused, never truncated" {
      try testing.expectError(error.PtyChunkTooLarge, fx.feedPtyOutput(72, &over));
  }
-
+ 
 -test "a fed output batch past the inline entry bound rides a heap payload intact" {
 +test "a fed output batch at the chunk bound arrives intact" {
      var fx = DirectFx.init(testing.allocator);
      defer fx.deinit();
      fx.executor = .fake;
-
+ 
      fx.ptySpawn(.{ .key = 21, .argv = &.{"sh"}, .on_event = DirectFx.ptyMsg(.pty) });
 -    var big: [effects_mod.max_effect_line_bytes + 128]u8 = undefined;
 +    var big: [effects_mod.max_effect_pty_chunk_bytes]u8 = undefined;
@@ -1487,7 +1717,7 @@ index a92c59f..5d011e4 100644
 @@ -676,6 +753,40 @@ test "live pty end to end: output, coalescing, and the exit code" {
      try testing.expectEqual(effects_mod.EffectExitReason.exited, result.exit.reason);
  }
-
+ 
 +test "live pty env overlay replaces host values and is not argv" {
 +    if (comptime !live_posix) return;
 +    const host_marker = try testing.allocator.dupeZ(u8, "CANOPY_PTY_OVERLAY=host");
@@ -1548,7 +1778,7 @@ index 4ed1f37..b4165cc 100644
 @@ -1087,6 +1096,124 @@ pub const Ready = struct {
      nudged: bool = false,
  };
-
+ 
 +/// Darwin readiness reactor used by the effects layer to serve every live PTY
 +/// from one blocking thread. kqueue registration and wake calls are safe from
 +/// the loop thread while another thread is inside `kevent`.
@@ -1695,9 +1925,9 @@ index 808265e..0df466e 100644
  const effects = @import("effects.zig");
 +const runtime_clock = @import("clock.zig");
  const term_vt = @import("terminal_vt");
-
+ 
  pub const enabled = term_vt.enabled;
-
+ 
 -/// One session per pty slot: the effects engine's own table bound.
 -pub const max_sessions: usize = effects.max_effect_ptys;
 +const DeviceAttributesCallback = if (enabled)
@@ -1710,7 +1940,7 @@ index 808265e..0df466e 100644
 +/// Emulators are allocated on demand; rendering capacity is independent from
 +/// the number of live PTY transports.
 +pub const max_sessions: ?usize = null;
-
+ 
  /// The journaled pty verbs the store drives, type-erased so this module
  /// never names the Msg-generic engine: the app loop wraps its engine.
 @@ -101,6 +110,14 @@ const DisabledStore = struct {
@@ -1740,7 +1970,7 @@ index 808265e..0df466e 100644
      /// `beginBuild` (the palette's theme mapping needs them). Valid for
 @@ -184,10 +202,14 @@ const EnabledStore = struct {
      }
-
+ 
      pub fn deinit(self: *EnabledStore) void {
 -        for (&self.entries) |*entry| {
 +        for (self.entries.items) |*entry| {
@@ -1755,12 +1985,12 @@ index 808265e..0df466e 100644
              threaded.deinit();
              self.allocator.destroy(threaded);
 @@ -201,6 +223,7 @@ const EnabledStore = struct {
-
+ 
      pub fn beginBuild(self: *EnabledStore, tokens: canvas.DesignTokens) void {
          self.tokens = tokens;
 +        self.visible_keys.clearRetainingCapacity();
      }
-
+ 
      /// The builder seam (`Ui.terminal_lookup`): finalize resolves each
 @@ -214,7 +237,15 @@ const EnabledStore = struct {
      fn resolveOpaque(context: *anyopaque, pty: u64) ?*const canvas.TerminalGrid {
@@ -1780,7 +2010,7 @@ index 808265e..0df466e 100644
          }
          return &session.grid;
 @@ -231,7 +262,7 @@ const EnabledStore = struct {
-
+ 
      fn find(self: *EnabledStore, pty: u64) ?*Session {
          if (pty == 0) return null;
 -        for (&self.entries) |*entry| {
@@ -1808,7 +2038,7 @@ index 808265e..0df466e 100644
 +        };
 +        return session;
      }
-
+ 
      pub fn hasSession(self: *const EnabledStore, pty: u64) bool {
          if (pty == 0) return false;
 -        for (&self.entries) |*entry| {
@@ -1817,7 +2047,7 @@ index 808265e..0df466e 100644
          }
          return false;
      }
-
+ 
 +    /// Reset an emulator at the accepted-spawn boundary rather than waiting
 +    /// for the child's first output. Keys may be recycled after exit delivery;
 +    /// the new tab must start blank even when the child is initially silent.
@@ -1876,7 +2106,7 @@ index 808265e..0df466e 100644
      ended: bool = false,
 +    clock: runtime_clock.Clock = .system,
 +    synchronized_since_ms: ?u64 = null,
-
+ 
      /// View state for the source-wins scrollback echo and the
      /// `on-terminal` change compare.
 @@ -602,7 +663,7 @@ const Session = if (enabled) struct {
@@ -1911,7 +2141,7 @@ index 808265e..0df466e 100644
 @@ -703,6 +770,13 @@ const Session = if (enabled) struct {
          session.response_len += bytes.len;
      }
-
+ 
 +    /// Advertise the libghostty-vt defaults (VT220 + ANSI color). Leaving
 +    /// this callback null makes DA1 queries disappear even though write_pty
 +    /// is wired, which stalls shells such as fish during startup.
@@ -1923,9 +2153,9 @@ index 808265e..0df466e 100644
          session.response_len = 0;
      }
 @@ -1238,14 +1312,31 @@ const Session = if (enabled) struct {
-
+ 
      // --------------------------------------------------------- snapshot
-
+ 
 +    /// DEC synchronized output brackets one logical TUI frame. Keep the last
 +    /// published snapshot until the closing marker, with Ghostty's one-second
 +    /// safety timeout for a producer that never closes its transaction.
@@ -1958,18 +2188,18 @@ index 808265e..0df466e 100644
          // Push the theme colors into the emulator's DEFAULTS (never the
          // OSC overrides) so ghostty itself composes the final
 @@ -1260,7 +1351,7 @@ const Session = if (enabled) struct {
-
+ 
          try session.render.update(gpa, &session.term);
          const rs = &session.render;
 -        const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
 +        const palette = Palette.init(&rs.colors, &session.term.colors.palette);
-
+ 
          const row_count = @min(rs.row_data.len, canvas.max_terminal_rows);
          var col_count: usize = 0;
 @@ -1464,58 +1555,24 @@ fn rgbToColor(rgb: anytype) canvas.Color {
      return canvas.Color.rgb8(rgb.r, rgb.g, rgb.b);
  }
-
+ 
 -/// The theme mapping, stated plainly: where the emulator's palette entry
 -/// still holds its DEFAULT value, the ANSI-16 slot derives from the
 -/// active theme tokens so a themed app and its terminal read as one
@@ -1989,7 +2219,7 @@ index 808265e..0df466e 100644
 -    /// explicit OSC 4 set is honored even when it equals the default
 -    /// RGB — the mask, not RGB equality, decides "untouched".
      dynamic: *const vt.color.DynamicPalette,
-
+ 
 -    fn init(tokens: canvas.DesignTokens, terminal_colors: *const vt.RenderState.Colors, dynamic: *const vt.color.DynamicPalette) Palette {
 -        const colors = tokens.colors;
 -        const dark = colors.background.r + colors.background.g + colors.background.b < 1.5;
@@ -2022,7 +2252,7 @@ index 808265e..0df466e 100644
 -            },
          };
      }
-
+ 
      fn indexed(palette: *const Palette, index: u8) canvas.Color {
 -        if (index < 16 and !palette.dynamic.mask.isSet(index)) {
 -            return palette.ansi[index];
@@ -2141,12 +2371,12 @@ index 951dbaa..2cb876c 100644
 +    const grid = resolveGrid(&store, 93) orelse return error.TestExpectedGrid;
 +    try testing.expect(std.mem.indexOf(u8, gridText(grid), "TIMEOUT-FRAME") != null);
  }
-
+ 
  test "pointer gestures select terminal cells words and lines for clipboard copy" {
 @@ -386,7 +464,7 @@ test "typing while scrolled back snaps the viewport to the live screen" {
      try testing.expectEqual(@as(u32, 0), (store.currentState(5) orelse return error.TestExpectedState).scrollback);
  }
-
+ 
 -test "an exit parks the session and output on the reused key resets to a clean terminal" {
 +test "an accepted respawn clears a reused key before the first output" {
      if (comptime !terminal_session.enabled) return error.SkipZigTest;
@@ -2155,7 +2385,7 @@ index 951dbaa..2cb876c 100644
 @@ -404,8 +482,14 @@ test "an exit parks the session and output on the reused key resets to a clean t
      try testing.expect(!store.textInput(2, "late"));
      try testing.expect(!store.keyEvent(2, .{ .phase = .key_down, .key = "enter" }));
-
+ 
 -    // A new spawn reused the key: its first output resets the emulator
 -    // before feeding, so the old screen and modes never leak in.
 +    // A new spawn reused the key: accepting it resets the emulator before the
@@ -2180,7 +2410,7 @@ index 951dbaa..2cb876c 100644
 +    feedOutput(&store, 4, "\x1b[c");
 +    try testing.expectEqualStrings("\x1b[?62;22c", gw.written.items);
  }
-
+ 
  test "the wide-cell spacer extends its primary's background in the published snapshot" {
 diff --git a/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig b/node_modules/@native-sdk/cli/src/runtime/ts_core_host.zig
 index becd14f..063c209 100644
@@ -2214,7 +2444,7 @@ index becd14f..063c209 100644
              entry.key_len = key.len;
              @memcpy(entry.key[0..key.len], key);
 @@ -2700,17 +2700,18 @@ pub fn TsCoreHost(comptime core: type) type {
-
+ 
          fn findPty(key: []const u8) ?usize {
              if (key.len == 0) return null;
 -            for (&ptys, 0..) |*entry, index| {
@@ -2223,7 +2453,7 @@ index becd14f..063c209 100644
              }
              return null;
          }
-
+ 
          fn freePtyIndex() ?usize {
 -            for (&ptys, 0..) |*entry, index| {
 +            for (ptys.items, 0..) |*entry, index| {
@@ -2233,7 +2463,7 @@ index becd14f..063c209 100644
 +            ptys.append(std.heap.page_allocator, .{}) catch return null;
 +            return ptys.items.len - 1;
          }
-
+ 
          /// `PtyMsgFn` for pty sessions: every event routes the entry's
 @@ -2722,10 +2723,10 @@ pub fn TsCoreHost(comptime core: type) type {
                  @panic("ts core host: a pty event arrived outside the bridge's pty key namespace");
@@ -2287,7 +2517,7 @@ index 02589cb..3534ef6 100644
 @@ -1568,6 +1573,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              self.terminal_sessions.notePtyEvent(event);
          }
-
+ 
 +        fn terminalPtySpawn(context: *anyopaque, key: u64) void {
 +            const self: *Self = @ptrCast(@alignCast(context));
 +            self.terminal_sessions.notePtySpawn(key);

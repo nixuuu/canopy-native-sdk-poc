@@ -15,6 +15,10 @@
 @property(nonatomic, assign) NSEventModifierFlags translationFlags;
 @property(nonatomic, strong) NSTrackingArea *tracking;
 @property(nonatomic, assign) BOOL displayVisible;
+@property(nonatomic, assign) double appliedScale;
+@property(nonatomic, assign) uint32_t appliedPixelWidth;
+@property(nonatomic, assign) uint32_t appliedPixelHeight;
+@property(nonatomic, assign) uint32_t appliedDisplayID;
 - (void)syncSize;
 - (void)syncOcclusion;
 @end
@@ -55,6 +59,10 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
 }
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
+    // This app-owned adoption container preserves its edge insets while the
+    // window is resized. Ghostty can resize natively even when canvas layout
+    // rebuilds are coalesced to the next display tick.
+    if (self.superview) self.superview.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [NSNotificationCenter.defaultCenter removeObserver:self name:NSWindowDidChangeOcclusionStateNotification object:nil];
     if (self.window) [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(windowOcclusionChanged:) name:NSWindowDidChangeOcclusionStateNotification object:self.window];
     [self syncSize]; [self syncOcclusion];
@@ -69,10 +77,24 @@ static ghostty_input_mods_e mods(NSEventModifierFlags flags) {
 - (void)syncSize {
     if (!self.surface) return;
     double scale = self.window.backingScaleFactor ?: NSScreen.mainScreen.backingScaleFactor;
-    ghostty_surface_set_content_scale(self.surface, scale, scale);
-    ghostty_surface_set_size(self.surface, MAX(1, lround(self.bounds.size.width * scale)), MAX(1, lround(self.bounds.size.height * scale)));
+    if (scale != self.appliedScale) {
+        ghostty_surface_set_content_scale(self.surface, scale, scale);
+        self.appliedScale = scale;
+    }
+    uint32_t width = MAX(1, lround(self.bounds.size.width * scale));
+    uint32_t height = MAX(1, lround(self.bounds.size.height * scale));
+    if (width != self.appliedPixelWidth || height != self.appliedPixelHeight) {
+        ghostty_surface_set_size(self.surface, width, height);
+        self.appliedPixelWidth = width;
+        self.appliedPixelHeight = height;
+    }
     NSNumber *display = self.window.screen.deviceDescription[@"NSScreenNumber"];
-    if (display) ghostty_surface_set_display_id(self.surface, display.unsignedIntValue);
+    // The C API enqueues into the renderer's bounded mailbox and updates its
+    // display link. A window resize is not a monitor change.
+    if (display && display.unsignedIntValue != self.appliedDisplayID) {
+        ghostty_surface_set_display_id(self.surface, display.unsignedIntValue);
+        self.appliedDisplayID = display.unsignedIntValue;
+    }
 }
 - (void)sendKey:(NSEvent *)event text:(NSString *)text action:(ghostty_input_action_e)action {
     if (!self.surface) return;

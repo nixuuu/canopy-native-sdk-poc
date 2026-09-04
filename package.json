@@ -15,6 +15,7 @@
     "doctor": "native doctor --strict --manifest app.json",
     "format": "zig fmt build.zig src/*.zig",
     "format:check": "zig fmt --check build.zig src/*.zig",
+    "perf:sidebar": "node scripts/profile-sidebar.mjs",
     "verify": "npm run format:check && npm run check && npm test && npm run build"
   },
   "devDependencies": {

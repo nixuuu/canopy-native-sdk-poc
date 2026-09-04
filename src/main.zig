@@ -2138,6 +2138,7 @@ fn appOptions(io: std.Io) CanopyApp.Options {
 }
 
 const CanopyHost = struct {
+    geometry_pending: @import("geometry_updates.zig").Pending = .{},
     menu: @import("app_menu.zig").Host = .{},
     terminals: @import("ghostty_host.zig").Host = .{},
     ui_app: *CanopyApp,
@@ -2196,12 +2197,45 @@ const CanopyHost = struct {
 
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
+        if (host.stageGeometry(event_value)) {
+            if (runtime.findViewIndex(1, canvas_label)) |index| try runtime.requestCanvasFrameForView(index);
+            return;
+        }
+        if (event_value == .gpu_surface_frame and std.mem.eql(u8, event_value.gpu_surface_frame.label, canvas_label)) {
+            const pending = host.geometry_pending.take();
+            // This reducer arm changes only a scalar; preserve the typed
+            // update route without rebuilding once for each mouse sample.
+            if (pending.sidebar) |fraction| update(&host.ui_app.model, .{ .sidebar_resized = fraction }, &host.ui_app.effects);
+            if (pending.resize) |resize| {
+                try host.ui_app.app().event(runtime, .{ .gpu_surface_resized = resize });
+            } else if (pending.sidebar != null) try host.ui_app.rebuild(runtime, 1);
+        }
         try host.ui_app.app().event(runtime, event_value);
         while (host.menu.takeClose()) try host.ui_app.dispatch(runtime, 1, .close_active_tab);
         try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
-        if (builtin.os.tag == .macos) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
+        if (builtin.os.tag == .macos and !host.geometry_pending.any()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
+    }
+
+    fn stageGeometry(host: *CanopyHost, event_value: native_sdk.Event) bool {
+        if (!host.ui_app.installed) return false;
+        switch (event_value) {
+            .gpu_surface_resized => |resize| {
+                if (!std.mem.eql(u8, resize.label, canvas_label)) return false;
+                host.geometry_pending.recordResize(resize);
+                return true;
+            },
+            .canvas_widget_resize => |resize| {
+                if (!std.mem.eql(u8, resize.view_label, canvas_label)) return false;
+                const tree = host.ui_app.tree orelse return false;
+                const msg = tree.msgForResize(resize.id, resize.fraction) orelse return false;
+                if (msg != .sidebar_resized) return false;
+                host.geometry_pending.sidebar = msg.sidebar_resized;
+                return true;
+            },
+            else => return false,
+        }
     }
 
     fn ensureWorktreesBase(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
@@ -2330,6 +2364,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("geometry_updates.zig");
     _ = @import("ghostty_config_tests.zig");
     _ = @import("db_page.zig");
     _ = @import("tests.zig");

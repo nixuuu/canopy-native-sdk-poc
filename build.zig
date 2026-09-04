@@ -20,6 +20,16 @@ pub fn build(b: *std.Build) void {
             &.{ "-fobjc-arc", "-fno-sanitize=builtin" };
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/ghostty_bridge.m"), .flags = flags });
         app.exe.root_module.addCSourceFile(.{ .file = b.path("src/app_menu.m"), .flags = flags });
+        const clock_module = b.createModule(.{ .target = app.exe.root_module.resolved_target, .optimize = .Debug, .link_libc = true });
+        clock_module.addIncludePath(sdk.path("src/platform/macos"));
+        clock_module.addCSourceFile(.{ .file = b.path("src/frame_clock_tests.m"), .flags = flags });
+        clock_module.linkFramework("AppKit", .{});
+        clock_module.linkFramework("Foundation", .{});
+        clock_module.linkFramework("CoreFoundation", .{});
+        if (b.sysroot) |sysroot| clock_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sysroot}) });
+        const clock_tests = b.addExecutable(.{ .name = "canopy-frame-clock-tests", .root_module = clock_module });
+        const run_clock_tests = b.addRunArtifact(clock_tests);
+        b.top_level_steps.get("test").?.step.dependOn(&run_clock_tests.step);
         app.exe.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ output, "lib/libghostty.a" }) });
         for ([_][]const u8{ "Metal", "MetalKit", "CoreText", "QuartzCore", "CoreGraphics", "Carbon", "IOSurface", "IOKit" }) |framework|
             app.exe.root_module.linkFramework(framework, .{});
@@ -58,4 +68,15 @@ pub fn build(b: *std.Build) void {
     const run_painter_tests = b.addRunArtifact(painter_tests);
     b.top_level_steps.get("test-terminal").?.step.dependOn(&run_painter_tests.step);
     b.top_level_steps.get("test").?.step.dependOn(&run_painter_tests.step);
+
+    const policy_module = b.createModule(.{
+        .target = app.tests.root_module.resolved_target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    policy_module.addIncludePath(sdk.path("src/platform/macos"));
+    policy_module.addCSourceFile(.{ .file = b.path("src/raster_policy_tests.c"), .flags = &.{"-std=c11"} });
+    const policy_tests = b.addExecutable(.{ .name = "canopy-raster-policy-tests", .root_module = policy_module });
+    const run_policy_tests = b.addRunArtifact(policy_tests);
+    b.top_level_steps.get("test").?.step.dependOn(&run_policy_tests.step);
 }

@@ -204,6 +204,48 @@ Keep that directory when distributing the binary; a macOS bundle should carry
 it at `Contents/Resources/ghostty`, with `share/terminfo` copied alongside as
 `Contents/Resources/terminfo`. First compilation is substantially slower.
 
+## Rendering and resize diagnostics
+
+The Canopy SDK patch keeps the canvas frame clock active in AppKit tracking
+modes using a cancellable, one-shot common-mode timer. It uses the display's
+30–120 Hz cadence rather than a separate fixed 60 Hz application timer, and
+still coalesces requests instead of queuing missed frames. Metal canvas presents
+follow the [Core Animation transaction contract](https://developer.apple.com/documentation/quartzcore/cametallayer/presentswithtransaction),
+and stale-size textures are retained rather than presented as blank resize frames.
+Ghostty's own renderer remains independent; its adapter only sends DPI, display
+identity and pixel-size changes when those values actually change.
+
+`geometry_updates.zig` retains only the newest window size and sidebar fraction.
+The application consumes them on the next canvas frame instead of rebuilding
+the whole widget tree for every intermediate mouse event. Native view
+autoresizing keeps the Ghostty container fluid in between canvas frames; its
+final frame still comes from the authoritative widget layout.
+
+Canvas raster caching admits layout translations, including float32 roundoff
+around identity, but not real scaling/rotation/shear. The original transform is
+applied without snapping. The cache's existing 64 MiB budget remains unchanged.
+The experimental SDK GPU compositor remains off: the initial benchmark was
+slower than the CPU path for this UI. Duplicate backgrounds under the native
+terminal surface are omitted.
+
+To repeat a bounded CPU-stage benchmark, launch an automation-enabled build,
+open one terminal, and leave the window size unchanged during the measurement:
+
+```sh
+npm run dev:automation
+# In another terminal, from this repository:
+npm run perf:sidebar -- /path/to/the/running/apps/working-directory 24
+```
+
+The script prints per-stage p50/p90/max timings and viewport dimensions. Compare
+the same viewport and project set; CLI/IPC gaps make the `interval` field unsuitable
+as an FPS measurement. `NATIVE_SDK_GPU_DRAW_TRACE=1` attributes native raster cost.
+`NATIVE_SDK_GPU_VERIFY_INCREMENTAL=1` compares dirty updates to an independent
+uncached full redraw; its extra rendering must not be included in performance
+measurements. `max_delta`/`changed_bytes` distinguish 8-bit antialias rounding
+from significant geometry errors. `npm test` also covers the native frame clock
+in tracking mode and the raster/presentation admission policy.
+
 ## Known PoC boundaries
 
 - Native SDK is pre-1.0; this PoC carries a focused patch that should eventually
