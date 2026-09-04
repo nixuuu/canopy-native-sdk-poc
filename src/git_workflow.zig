@@ -16,6 +16,18 @@ pub const Kind = enum {
     remove_submodules,
     remove_unmerged,
     remove_worktree,
+
+    pub const Group = enum { none, discovery, listing, creation, removal };
+
+    pub fn group(self: Kind) Group {
+        return switch (self) {
+            .none => .none,
+            .restore_check, .detect_repo => .discovery,
+            .list_worktrees => .listing,
+            .validate_branch, .check_target, .check_branch, .create_branch, .create_worktree => .creation,
+            .remove_status, .remove_submodules, .remove_unmerged, .remove_worktree => .removal,
+        };
+    }
 };
 
 pub const Request = union(enum) {
@@ -189,6 +201,16 @@ test "lane rejects overlap and stale completions without allocating another key"
     try std.testing.expectEqual(@as(u64, 7), lane.finish(key).?.project_id);
     try std.testing.expect(lane.finish(key) == null);
     try std.testing.expect(!lane.busy());
+}
+
+test "every Git operation belongs to one explicit result group" {
+    for (std.enums.values(Kind)) |kind| switch (kind) {
+        .none => try std.testing.expectEqual(Kind.Group.none, kind.group()),
+        .restore_check, .detect_repo => try std.testing.expectEqual(Kind.Group.discovery, kind.group()),
+        .list_worktrees => try std.testing.expectEqual(Kind.Group.listing, kind.group()),
+        .validate_branch, .check_target, .check_branch, .create_branch, .create_worktree => try std.testing.expectEqual(Kind.Group.creation, kind.group()),
+        .remove_status, .remove_submodules, .remove_unmerged, .remove_worktree => try std.testing.expectEqual(Kind.Group.removal, kind.group()),
+    };
 }
 
 test "creation transitions keep context and stop on unsuccessful checks" {

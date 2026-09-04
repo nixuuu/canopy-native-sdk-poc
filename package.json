@@ -13,10 +13,10 @@
     "test": "native test --yes",
     "build": "native build --yes",
     "doctor": "native doctor --strict --manifest app.json",
-    "format": "zig fmt build.zig src/*.zig",
-    "format:check": "zig fmt --check build.zig src/*.zig",
+    "format": "zig fmt build.zig src",
+    "format:check": "zig fmt --check build.zig src",
     "perf:sidebar": "node scripts/profile-sidebar.mjs",
-    "verify": "npm run format:check && npm run check && npm test && npm run build"
+    "verify": "npm run format:check && npm test && npm run check && npm run build"
   },
   "devDependencies": {
     "@native-sdk/cli": "0.10.1",

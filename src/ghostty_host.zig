@@ -104,7 +104,7 @@ pub const Host = struct {
         // Exited tabs may be removed without another process-exit callback.
         // Sweep only on membership changes, never on each render/input event.
         // A hash set keeps the common all-tabs-alive path linear, not quadratic.
-        if (self.observed_tab_count != model.tab_store.items.items.len or self.observed_next_tab_id != model.next_tab_id) {
+        if (self.observed_tab_count != model.tab_store.items.items.len or self.observed_next_tab_id != model.terminal_state.next_tab_id) {
             var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
             defer live.deinit(allocator);
             for (model.tab_store.items.items) |tab| try live.put(allocator, tab.id, {});
@@ -123,11 +123,11 @@ pub const Host = struct {
                 _ = self.surfaces.remove(id);
             }
             self.observed_tab_count = model.tab_store.items.items.len;
-            self.observed_next_tab_id = model.next_tab_id;
+            self.observed_next_tab_id = model.terminal_state.next_tab_id;
         }
 
         const blocked = model.terminalActionsBlocked();
-        const selected = model.active_tab_by_workspace.get(model.active_workspace_id) orelse 0;
+        const selected = model.terminal_state.active(model.active_workspace_id);
         const layout = runtime.canvasWidgetLayout(1, "main-canvas") catch return;
         var frame: ?geometry.RectF = null;
         if (!blocked) for (layout.nodes) |node| {

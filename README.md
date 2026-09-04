@@ -129,6 +129,11 @@ routing; the Electron-compatible schema and profile JSON dialect are unchanged.
 `ghostty_abi.zig`; named events route by tab identity, not recycled PTY keys.
 `ghostty_input.h` holds the tested mouse/overlay gating policy used by AppKit.
 
+`terminal_controller.zig` owns monotonic tab identity, recyclable PTY keys,
+per-worktree selection and close/output/exit state transitions.
+`main.zig` keeps only the Native SDK PTY effects and user-facing statuses;
+`ghostty_host.zig` consumes the same controller state for surface adoption.
+
 `CanopyHost.event` keeps an explicit order: prepare sidebar geometry, deliver the
 UI event, synchronize native services, then finish sidebar interaction and
 persistence. `sidebar_controller.zig` owns that sidebar coordination;
@@ -137,12 +142,52 @@ Event-order tests cover resize coalescing, startup, pointer release, hover and
 shutdown staging without needing a GUI or a live PTY.
 
 Git operations use `git_workflow.zig` for semantic requests, creation-step
-transitions, removal safety snapshots and the single-flight lane. `git_cli.zig`
+transitions, explicit result groups, removal safety snapshots and the
+single-flight lane. `main.zig` routes completed operations to focused discovery,
+listing, creation and removal handlers. `git_cli.zig`
 is the current transport: it builds argv and maps process outcomes into workflow
-results. UI selection, approval dialogs and PTY teardown coordination remain in
-`main.zig`; worktree porcelain decoding remains in `workspaces.zig`. This is a
+results. `teardown_state.zig` owns the approved target and the transition from
+terminal shutdown to fresh safety review. `main.zig` dispatches the resulting
+effects and keeps UI selection and approval dialogs; worktree porcelain
+decoding remains in `workspaces.zig`. This is a
 refactoring boundary, not a switch to libgit2. Calls still run one at a time,
 without a backlog or execution timeout; stale results cannot release the lane.
+
+Claude and Codex share the `agent-launcher` template in
+`components/tools-sidebar.native`, including profile expansion and launch
+bindings. Agent keys keep widget identity stable when availability changes.
+`tool_registry.zig` owns discovery completion, executable validation and
+per-agent expansion state; duplicate completion callbacks are ignored.
+`tool_launch.zig` remains the pure argv/environment builder.
+
+Application integration tests live in `src/tests/`, grouped by profiles,
+sidebar, terminals, workspaces, Git and persistence, with shared fixtures in
+`support.zig`. `src/tests.zig` only imports the suites; pure state-machine tests
+stay beside their implementations. Run `npm run verify` locally for recursive
+format checks, markup checks, all test suites and the ReleaseFast build.
+
+`project_persistence.zig` owns restore scanning and coalesced project-snapshot
+writes. File effects remain in `main.zig`; only the matching active write key
+can complete a write, so delayed callbacks cannot release a newer operation.
+
+`workspace_dialogs.zig` groups the create-worktree draft, removal safety review
+and detach selection. It also retains checkout refresh state until the matching
+Git listing completes; Git and PTY effects remain in `main.zig`.
+
+`preferences_editor.zig` owns the preferences dialog draft, navigation,
+validation and save/load lifecycle. SQLite effects remain in `main.zig`, while
+the editor decides whether a completion is current and whether it commits the
+Electron-compatible preference values.
+
+`model.zig` owns application state and all projections required by Native
+markup. It has no host effects. `main.zig` is limited to messages, effect
+routing, application boot and native-host coordination.
+
+`messages.zig` is the typed UI/host message contract. `app_controller.zig`
+owns the reducer and side-effect orchestration. `main.zig` only assembles the
+compiled view, migrations, native host and process entrypoint.
+The dependency direction and lifecycle invariants are summarized in
+[`docs/architecture.md`](docs/architecture.md).
 
 `npm test` also runs the real Ghostty session and terminal painter suites via
 `zig build test-terminal`. The upstream SDK-wide tests use an inert VT seam,
