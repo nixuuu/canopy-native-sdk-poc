@@ -207,7 +207,11 @@ it at `Contents/Resources/ghostty`, with `share/terminfo` copied alongside as
 ## Rendering and resize diagnostics
 
 The header sidebar button toggles the docked project rail. Its user-selected
-width is stored in logical points, not a window percentage. Below 960 points
+width is stored in logical points, not a window percentage, and persisted in
+SQLite as the Electron-compatible `preferences` key `sidebar.width` (numeric
+text). Writes coalesce until the divider is released; shutdown flushes the last
+change. Collapsing or resizing the window never overwrites the preferred width.
+Below 960 points
 the rail collapses automatically; the same button reveals it over the terminal.
 Escape, an outside click, selecting a worktree or launching a sidebar tool
 closes the overlay. Returning to a wide window restores the dock unless it was
@@ -286,7 +290,7 @@ in tracking mode and the raster/presentation admission policy.
   restorable sessions.
 - Worktree creation currently covers new local branches only; attaching an
   existing branch and choosing a base branch are not implemented yet.
-- Preference compatibility currently covers startup restore and the worktree
+- Preference compatibility currently covers sidebar width, startup restore and the worktree
   directory. Electron-only encrypted credentials are intentionally untouched,
   and terminal typography is configured in Ghostty's config file.
 - Claude/Codex API keys currently use the CLI's own login or inherited process

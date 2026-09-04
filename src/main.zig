@@ -91,6 +91,7 @@ pub const Model = struct {
     next_tab_id: u64 = 1,
     next_pty_key: u64 = 1,
     sidebar_width: f32 = 210,
+    sidebar_persistence: @import("sidebar_persistence.zig").State = .{},
     canvas_width: f32 = window_width,
     sidebar: @import("sidebar_state.zig").State = .{},
     window_chrome: native_sdk.WindowChrome = .{},
@@ -161,6 +162,7 @@ pub const Model = struct {
     codex_executable: workspaces.PathText = .{},
 
     pub const view_unbound = .{
+        "sidebar_persistence",
         "window_chrome",
         "sidebar_width",
         "canvas_width",
@@ -780,12 +782,16 @@ pub const Msg = union(enum) {
     store_done: native_sdk.EffectFileResult,
     terminal_event: native_sdk.EffectPtyEvent,
     sidebar_resized: f32,
+    save_sidebar_width,
+    sidebar_width_saved: native_sdk.EffectDbResult,
     toggle_sidebar,
     dismiss_sidebar,
     set_appearance: native_sdk.Appearance,
     chrome_changed: native_sdk.WindowChrome,
 
     pub const view_unbound = .{
+        "save_sidebar_width",
+        "sidebar_width_saved",
         "folder_selected",
         "folder_dialog_cancelled",
         "folder_dialog_failed",
@@ -2078,7 +2084,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .store_done => |result| handleStoreResult(model, fx, result),
         .terminal_event => |event| handleTerminalEvent(model, fx, event),
         .sidebar_resized => |fraction| {
-            if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating() and std.math.isFinite(fraction)) model.sidebar_width = @max(210, std.math.clamp(fraction, 0, 1) * @max(1, model.canvas_width - sidebar_divider_width));
+            if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating() and std.math.isFinite(fraction)) {
+                const width = @max(210, std.math.clamp(fraction, 0, 1) * @max(1, model.canvas_width - sidebar_divider_width));
+                if (model.sidebar_width != width) {
+                    model.sidebar_width = width;
+                    model.sidebar_persistence.edit(width);
+                }
+            }
+        },
+        .save_sidebar_width => saveSidebarWidth(model, fx),
+        .sidebar_width_saved => |result| if (result.key == sidebar_write_key and result.kind == .exec) {
+            model.sidebar_persistence.finish(result.outcome == .ok);
+            if (result.outcome != .ok) model.status_text = "Could not save sidebar width";
         },
         .toggle_sidebar => model.sidebar.toggle(),
         .dismiss_sidebar => model.sidebar.overlay_open = false,
@@ -2088,6 +2105,33 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 }
 
 pub const preferences_load_key: u64 = 8_000;
+pub const sidebar_write_key: u64 = 8_004;
+
+fn saveSidebarWidth(model: *Model, fx: *Effects) void {
+    const width = model.sidebar_persistence.begin() orelse return;
+    var buffer: [16]u8 = undefined;
+    const value = std.fmt.bufPrint(&buffer, "{d}", .{width}) catch unreachable;
+    fx.dbExec(.{
+        .key = sidebar_write_key,
+        .statements = &.{.{ .sql = preferences_mod.sidebar_upsert_sql, .params = &.{.{ .text = value }} }},
+        .on_result = Effects.dbMsg(.sidebar_width_saved),
+    });
+}
+
+// Shutdown uses the still-live runtime binding after Effects have stopped, so
+// a queued completion or final drag sample cannot lose the latest width.
+pub fn flushSidebarWidth(model: *Model, binding: native_sdk.relational_store.Binding) bool {
+    if (!model.sidebar_persistence.needsFlush()) return true;
+    var buffer: [16]u8 = undefined;
+    const width = model.sidebar_persistence.desired;
+    const value = std.fmt.bufPrint(&buffer, "{d}", .{width}) catch unreachable;
+    const outcome = binding.exec_fn(binding.context, &.{.{ .sql = preferences_mod.sidebar_upsert_sql, .params = &.{.{ .text = value }} }});
+    if (outcome != .ok) return false;
+    model.sidebar_persistence.saved = width;
+    model.sidebar_persistence.dirty = false;
+    model.sidebar_persistence.submitted = null;
+    return true;
+}
 
 fn beginProjectRestore(model: *Model, fx: *Effects) void {
     if (!model.preferences_saved.reopen_last_workspace) {
@@ -2106,6 +2150,7 @@ fn beginProjectRestore(model: *Model, fx: *Effects) void {
 
 fn finishPreferencesLoad(model: *Model, fx: *Effects) void {
     if (!model.preferences_load_valid) model.preferences_saved = .{};
+    if (model.sidebar_persistence.restore(model.preferences_saved.sidebar_width)) |width| model.sidebar_width = width;
     model.preferences_draft = model.preferences_saved;
     model.preferences_loaded = true;
     const base_dir = if (model.preferences_saved.worktrees_base_dir.len > 0)
@@ -2321,6 +2366,11 @@ const CanopyHost = struct {
         try host.presentPendingFolderDialog(runtime);
         if (builtin.os.tag == .macos and !host.geometry_pending.any()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
+        if (!host.geometry_pending.any() and host.ui_app.model.sidebar_persistence.canSave()) {
+            if (runtime.findViewIndex(1, canvas_label)) |index| {
+                if (runtime.views[index].canvas_widget_pressed_id == 0) try host.ui_app.dispatch(runtime, 1, .save_sidebar_width);
+            }
+        }
         var grip_active = false;
         if (!host.ui_app.model.terminalActionsBlocked() and !host.ui_app.model.sidebar.compact and !host.ui_app.model.sidebar.collapsed) {
             if (runtime.findViewIndex(1, canvas_label)) |index| {
@@ -2378,10 +2428,14 @@ const CanopyHost = struct {
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
+        if (host.geometry_pending.take().sidebar) |fraction| update(&host.ui_app.model, .{ .sidebar_resized = fraction }, &host.ui_app.effects);
         host.menu.deinit();
         if (builtin.os.tag == .macos) host.terminals.detach(runtime);
         host.terminals.deinit();
         try host.ui_app.app().stop(runtime);
+        if (runtime.options.relational_store) |binding| {
+            if (!flushSidebarWidth(&host.ui_app.model, binding)) std.debug.print("canopy: final sidebar width save failed\n", .{});
+        }
         host.flushProjectsOnStop() catch |err| std.debug.print("canopy: final project snapshot failed ({s})\n", .{@errorName(err)});
     }
 

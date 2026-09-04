@@ -9,6 +9,8 @@ pub const key_reopen_last_workspace = "reopenLastWorkspace";
 pub const key_font_size = "fontSize";
 pub const key_worktrees_base_dir = "worktrees.baseDir";
 pub const key_native_appearance = "native.appearance";
+pub const key_sidebar_width = "sidebar.width";
+pub const sidebar_upsert_sql = "INSERT OR REPLACE INTO preferences (key, value) VALUES ('sidebar.width', ?1);";
 
 pub const AppearanceMode = enum { system, light, dark };
 
@@ -24,9 +26,13 @@ pub const Values = struct {
     font_size: u8 = 13,
     appearance_mode: AppearanceMode = .system,
     worktrees_base_dir: workspaces.PathText = .{},
+    sidebar_width: ?f32 = null,
 
     pub fn apply(values: *Values, key: []const u8, value: []const u8) void {
-        if (std.mem.eql(u8, key, key_reopen_last_workspace)) {
+        if (std.mem.eql(u8, key, key_sidebar_width)) {
+            const parsed = std.fmt.parseFloat(f32, value) catch return;
+            if (std.math.isFinite(parsed) and parsed >= 1 and parsed <= 100_000) values.sidebar_width = parsed;
+        } else if (std.mem.eql(u8, key, key_reopen_last_workspace)) {
             values.reopen_last_workspace = !std.mem.eql(u8, value, "false");
         } else if (std.mem.eql(u8, key, key_font_size)) {
             const parsed = std.fmt.parseInt(u8, value, 10) catch return;
@@ -56,7 +62,7 @@ pub const Values = struct {
 pub const load_sql =
     \\SELECT key, value
     \\FROM preferences
-    \\WHERE key IN ('reopenLastWorkspace', 'fontSize', 'worktrees.baseDir', 'native.appearance')
+    \\WHERE key IN ('reopenLastWorkspace', 'fontSize', 'worktrees.baseDir', 'native.appearance', 'sidebar.width')
     \\ORDER BY key;
 ;
 
@@ -85,6 +91,17 @@ test "Electron-compatible preferences decode and clamp values" {
     try std.testing.expectEqualStrings("/tmp/canopy-worktrees", values.worktrees_base_dir.slice());
     values.apply(key_font_size, "99");
     try std.testing.expectEqual(@as(u8, 18), values.font_size);
+}
+
+test "sidebar width accepts Electron numeric text and rejects corrupt values" {
+    var values: Values = .{};
+    try std.testing.expectEqual(@as(?f32, null), values.sidebar_width);
+    values.apply(key_sidebar_width, "375");
+    try std.testing.expectEqual(@as(?f32, 375), values.sidebar_width);
+    for ([_][]const u8{ "", "bad", "NaN", "inf", "-1", "0", "9999999999" }) |invalid| {
+        values.apply(key_sidebar_width, invalid);
+        try std.testing.expectEqual(@as(?f32, 375), values.sidebar_width);
+    }
 }
 
 test "malformed preference page leaves the previous values unchanged" {

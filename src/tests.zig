@@ -4,6 +4,83 @@ const profiles = @import("profiles.zig");
 const workspaces = @import("workspaces.zig");
 const sdk = @import("native_sdk");
 
+test "sidebar saves only on commit, coalesces outstanding writes and ignores collapse geometry" {
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    _ = model.sidebar_persistence.restore(300);
+    model.sidebar_width = 300;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    for (301..421) |width| app.update(&model, .{ .sidebar_resized = @as(f32, @floatFromInt(width)) / (model.canvas_width - app.sidebar_divider_width) }, &fx);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingDbCount());
+    app.update(&model, .save_sidebar_width, &fx);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
+    try std.testing.expectEqual(@as(?u32, 420), model.sidebar_persistence.submitted);
+    app.update(&model, .{ .sidebar_resized = 450 / (model.canvas_width - app.sidebar_divider_width) }, &fx);
+    app.update(&model, .save_sidebar_width, &fx);
+    try std.testing.expectEqual(@as(usize, 1), fx.pendingDbCount());
+    try fx.feedDbResult(app.sidebar_write_key, .exec, .ok, "");
+    while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
+    app.update(&model, .save_sidebar_width, &fx);
+    try std.testing.expectEqual(@as(?u32, 450), model.sidebar_persistence.submitted);
+    try fx.feedDbResult(app.sidebar_write_key, .exec, .ok, "");
+    while (fx.takeMsg()) |msg| app.update(&model, msg, &fx);
+    _ = model.sidebar.advance(860, 0, true);
+    app.update(&model, .{ .sidebar_resized = 0.001 }, &fx);
+    app.update(&model, .save_sidebar_width, &fx);
+    try std.testing.expectEqual(@as(u32, 450), model.sidebar_persistence.desired);
+    try std.testing.expectEqual(@as(usize, 0), fx.pendingDbCount());
+}
+
+test "sidebar width survives a real SQLite close and reopen without changing other preferences" {
+    const prefs = @import("preferences.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    const stores = try Stores.init();
+    defer stores.deinit();
+    var model = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    {
+        var db = try sdk.relational_store.Database.open(std.testing.allocator, path);
+        defer db.deinit();
+        try std.testing.expectEqual(sdk.relational_store.Outcome.ok, db.exec(&.{
+            .{ .sql = prefs.ensure_schema_sql },
+            .{ .sql = "INSERT INTO preferences (key,value) VALUES ('fontSize','18'),('sidebar.width','300');" },
+        }));
+        _ = model.sidebar_persistence.restore(300);
+        model.sidebar_persistence.edit(420);
+        // Last drag is still unsaved when shutdown starts.
+        try std.testing.expect(app.flushSidebarWidth(&model, db.binding()));
+        try std.testing.expect(!model.sidebar_persistence.needsFlush());
+    }
+    var reopened = try sdk.relational_store.Database.open(std.testing.allocator, path);
+    defer reopened.deinit();
+    const Capture = struct {
+        values: prefs.Values = .{},
+        valid: bool = true,
+        fn page(context: *anyopaque, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.valid = self.valid and prefs.decodePage(&self.values, bytes);
+        }
+    };
+    var captured: Capture = .{};
+    try std.testing.expectEqual(sdk.relational_store.Outcome.ok, reopened.query(prefs.load_sql, &.{}, &captured, Capture.page));
+    try std.testing.expect(captured.valid);
+    try std.testing.expectEqual(@as(u8, 18), captured.values.font_size);
+    var restarted = app.initialModel(stores.tabs, stores.projects, stores.profiles);
+    restarted.preferences_saved = captured.values;
+    var fx = app.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    app.update(&restarted, .{ .preferences_load_done = .{ .key = app.preferences_load_key, .kind = .done, .outcome = .ok } }, &fx);
+    try std.testing.expectEqual(@as(f32, 420), restarted.sidebar_width);
+    try std.testing.expect(!restarted.sidebar_persistence.dirty);
+}
+
 test "sidebar grip paints one flat darker block even on hover and press" {
     for ([_]sdk.Appearance{ .{ .color_scheme = .dark }, .{ .color_scheme = .light } }) |appearance| {
         const tokens = @import("theme.zig").tokens(appearance);
