@@ -207,3 +207,25 @@ test "hover reads SDK identities after save and holds highlight through dragging
     try controller.finishEvent(&runtime, &ui);
     try testing.expectEqual(@as(usize, 2), runtime.frames);
 }
+
+test "retained sidebar motion only rebuilds for structural cleanup at settle" {
+    var log: Log = .{};
+    var ui: Ui = .{ .effects = .{ .log = &log } };
+    var runtime: Runtime = .{};
+    var controller: Controller = .{ .retained_motion = true };
+    _ = ui.model.sidebar.advance(1180, 1, false);
+    ui.model.sidebar.collapsed = true;
+    var sample = frame(1180);
+    sample.gpu_surface_frame.size.width = 1180;
+    sample.gpu_surface_frame.timestamp_ns = 10;
+    _ = try controller.prepareEvent(&runtime, &ui, sample, reduce);
+    try testing.expectEqual(@as(usize, 0), log.len);
+    for (1..10) |i| {
+        sample.gpu_surface_frame.timestamp_ns = 10 + i * 16_000_000;
+        _ = try controller.prepareEvent(&runtime, &ui, sample, reduce);
+    }
+    try testing.expectEqual(@as(usize, 0), log.len);
+    sample.gpu_surface_frame.timestamp_ns = 200_000_010;
+    _ = try controller.prepareEvent(&runtime, &ui, sample, reduce);
+    try testing.expectEqualSlices(Step, &.{.rebuild}, log.items[0..log.len]);
+}

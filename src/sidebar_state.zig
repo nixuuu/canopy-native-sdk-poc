@@ -6,7 +6,7 @@ const Motion = struct {
     from: f32 = 0,
     target: f32 = 0,
     started: u64 = 0,
-    duration_ns: u64 = 180_000_000,
+    duration_ns: u64 = @import("ui_motion.zig").panel_open_ns,
 
     fn set(self: *Motion, target: f32, now: u64, reduced: bool) void {
         if (reduced) {
@@ -51,6 +51,10 @@ pub const State = struct {
         self.compact = compact;
         const snap = reduced or !self.initialized;
         self.initialized = true;
+        const opening = !compact and !self.collapsed;
+        if (self.dock.target != @as(f32, if (opening) 1 else 0)) self.dock.duration_ns = if (opening) @import("ui_motion.zig").panel_open_ns else @import("ui_motion.zig").panel_close_ns;
+        const overlay_opening = compact and self.overlay_open;
+        if (self.overlay.target != @as(f32, if (overlay_opening) 1 else 0)) self.overlay.duration_ns = if (overlay_opening) @import("ui_motion.zig").panel_open_ns else @import("ui_motion.zig").panel_close_ns;
         self.dock.set(if (!compact and !self.collapsed) 1 else 0, now, snap);
         self.overlay.set(if (compact and self.overlay_open) 1 else 0, now, snap);
         const grip_target: f32 = if (self.grip_active and !compact and !self.collapsed) 1 else 0;

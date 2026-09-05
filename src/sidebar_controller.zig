@@ -9,6 +9,7 @@ const Pending = @import("geometry_updates.zig").Pending;
 // deterministic event-order tests without starting a macOS window or a PTY.
 pub const Controller = struct {
     pending: Pending = .{},
+    retained_motion: bool = false,
 
     pub fn hasPendingGeometry(self: *const Controller) bool {
         return self.pending.any();
@@ -26,10 +27,15 @@ pub const Controller = struct {
             // adopting the new width, then perform at most one rebuild.
             if (pending.sidebar) |fraction| reduce(&ui.model, .{ .sidebar_resized = fraction }, &ui.effects);
             ui.model.canvas_width = event.gpu_surface_frame.size.width;
+            const was_moving = ui.model.sidebar.animating();
+            const old_compact = ui.model.sidebar.compact;
             const moved = ui.model.sidebar.advance(ui.model.canvas_width, event.gpu_surface_frame.timestamp_ns, ui.model.appearance.reduce_motion);
+            // Input dispatch already built the destination. Only responsive
+            // mode changes and the final structural cleanup need another build.
+            const endpoint = old_compact != ui.model.sidebar.compact or (was_moving and !ui.model.sidebar.animating());
             if (pending.resize) |resize| {
                 try ui.app().event(runtime, .{ .gpu_surface_resized = resize });
-            } else if (ui.installed and (pending.sidebar != null or moved)) try ui.rebuild(runtime, canvas_host.window_id);
+            } else if (ui.installed and (pending.sidebar != null or (if (self.retained_motion) endpoint else moved))) try ui.rebuild(runtime, canvas_host.window_id);
         }
         if (event == .gpu_surface_resized and std.mem.eql(u8, event.gpu_surface_resized.label, canvas_host.label)) {
             ui.model.canvas_width = event.gpu_surface_resized.frame.width;

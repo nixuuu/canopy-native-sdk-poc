@@ -73,6 +73,9 @@ pub const SidebarRow = struct {
     selected: bool = false,
     is_main: bool = false,
     can_remove: bool = false,
+    agent_status: []const u8 = "",
+    agent_icon: []const u8 = "git-branch",
+    agent_color: []const u8 = "text_muted",
     is_git: bool = false,
 };
 
@@ -320,7 +323,7 @@ pub const Store = struct {
         return true;
     }
 
-    pub fn sidebarRows(store: *const Store, arena: std.mem.Allocator, active_workspace_id: u64) []const SidebarRow {
+    pub fn sidebarRows(store: *const Store, arena: std.mem.Allocator, active_workspace_id: u64) []SidebarRow {
         var count: usize = 0;
         for (store.projects.items) |project| {
             if (!project.attached) continue;

@@ -21,6 +21,8 @@ const profiles_mod = @import("profiles.zig");
 const preferences_mod = @import("preferences.zig");
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
+    defer agent_actions.acknowledge(model);
+    defer model.observeUiMotion();
     // Restore owns an index cursor until the scan ends. Keep membership stable.
     defer if (!model.project_io.scanning()) switch (msg) {
         .git_done,
@@ -61,6 +63,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .activate_tab,
         .previous_tab,
         .next_tab,
+        .tabs_scrolled,
         .close_tab,
         .close_active_tab,
         .terminal_event,
@@ -113,6 +116,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         => {
             settings_actions.handle(model, msg, fx);
         },
+        .agent_hook_event,
+        .agent_setup_failed,
+        .agent_tracking_failed,
         .tool_check_done,
         .toggle_agent_profiles,
         .launch_agent,

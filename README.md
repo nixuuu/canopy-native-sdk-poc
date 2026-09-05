@@ -35,6 +35,11 @@ terminal tabs. The shipped app uses no Chromium, WebView, or JavaScript runtime.
 - terminal shutdown fencing: removal/detach waits for every owned PTY exit
   before mutating Git state or hiding the project.
 
+Agent tracking for Claude Code and Codex is now wired through per-session,
+authenticated loopback hooks. Tabs show lifecycle status and attention,
+with optional Claude context/cost metrics in the footer; worktrees aggregate agent status.
+See [agent hooks](docs/agent-hooks.md) for protocols, compatibility and limits.
+
 ## Run
 
 Requirements: macOS 13+, Xcode with Metal tools, Node.js 24+, CMake 3.16+, and Zig 0.16.0.
@@ -152,7 +157,7 @@ settings, agent and sidebar operations. Editors protect dirty drafts and freeze
 edits during writes. Profile reloads atomically replace staged data; malformed
 known fields are rejected and unknown JSON properties survive editing.
 
-The build requires CMake but no system libgit2 installation. SSH/HTTPS, Git hooks
+The build requires CMake but no system libgit2 installation. SSH/HTTPS, repository Git hooks
 and external filters (including LFS) are not enabled. Bare primary repositories
 and line-break paths are unsupported. SDK replay of host-owned Git results is
 not yet implemented. See [architecture](docs/architecture.md) for ownership,
@@ -377,8 +382,7 @@ in tracking mode and the raster/presentation admission policy.
 - Claude/Codex API keys currently use the CLI's own login or inherited process
   environment. Native SDK has an OS credential store, but its current text
   control has no secure model-free password binding, so the PoC does not expose
-  an unsafe secret field. Codex `settingsJson` is persisted compatibly; Canopy's
-  hook server and `.codex/hooks.json` ref-counted lifecycle remain future work.
+  an unsafe secret field. Agent hook configuration is per invocation; Codex project files are not modified.
 - Closing a live tab keeps it in `closing` until Ghostty surface teardown
   completes. Callbacks use never-reused tab identities, preventing a delayed
   callback from changing a newly opened tab that recycled a legacy PTY key.

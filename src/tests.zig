@@ -1,5 +1,8 @@
 // Application integration suites; pure module tests remain beside their implementation.
 test {
+    _ = @import("tests/motion_performance_tests.zig");
+    _ = @import("tests/chrome_tests.zig");
+    _ = @import("tests/agent_hooks_tests.zig");
     _ = @import("tests/git_service_tests.zig");
     _ = @import("tests/maintainability_tests.zig");
     _ = @import("effect_keys.zig");

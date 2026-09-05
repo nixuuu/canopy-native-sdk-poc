@@ -45,3 +45,21 @@ test "native configuration can only be claimed once after UI installation" {
 
 /// Authored global-key in terminal-workspace.native, independent of its label.
 pub const terminal_viewport_id = @import("native_sdk").canvas.globalWidgetId(.column, .{ .str = "canopy-terminal-viewport" });
+
+/// Descendant layout stays at its destination during retained split motion.
+/// Native views must use the visible pane bounds, not that uncropped width.
+pub fn terminalViewport(layout: @import("native_sdk").canvas.WidgetLayoutTree) ?@import("native_sdk").geometry.RectF {
+    const Rect = @import("native_sdk").geometry.RectF;
+    for (layout.nodes) |node| {
+        if (node.widget.id != terminal_viewport_id) continue;
+        var bounds = node.frame;
+        var parent = node.parent_index;
+        while (parent) |index| : (parent = layout.nodes[index].parent_index) {
+            if (layout.nodes[index].parent_index) |ancestor| {
+                if (layout.nodes[ancestor].widget.kind == .split) bounds = Rect.intersection(bounds, layout.nodes[index].frame);
+            }
+        }
+        return if (bounds.width > 0 and bounds.height > 0) bounds else null;
+    }
+    return null;
+}

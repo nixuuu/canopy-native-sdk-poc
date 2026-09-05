@@ -103,3 +103,17 @@ Keep fixes separate from future feature changes. Never write Electron Canopy's
 database. Raw Ghostty configuration remains host-only. libgit2 is statically
 linked from hash-pinned sources; network transports, hooks and external Git
 filters are not enabled by this local integration.
+
+## Agent observations
+
+`agent_hook_config` prepares invocation-only hook settings; `agent_hook_host`
+owns credentials and registers before PTY startup. `agent_hook_server` is a
+bounded loopback HTTP worker that only emits sanitized `agent_events` packets.
+`agent_state` is pure and lives with the tab; `agent_actions` gates incoming
+packets by live tab identity and exposes current status and attention. The native host
+prepares hooks before reconciling Ghostty and prunes registrations afterward.
+The detailed contract and limits are in [agent-hooks.md](agent-hooks.md).
+
+Tab geometry, scroll visibility and short chrome transitions are documented in
+[ui-motion.md](ui-motion.md). `ui_motion` only transforms canvas chrome; it never
+animates an adopted terminal surface or delays a domain operation.

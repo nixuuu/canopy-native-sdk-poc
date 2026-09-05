@@ -16,9 +16,10 @@
     "format": "zig fmt build.zig src",
     "format:check": "zig fmt --check build.zig src",
     "perf:sidebar": "node scripts/profile-sidebar.mjs",
-    "verify": "npm run format:check && npm run check:patch && npm test && npm run check && npm run build",
+    "verify": "npm run format:check && npm run check:patch && npm run test:motion-metrics && npm test && npm run check && npm run build",
     "check:patch": "node scripts/check-sdk-patch.mjs",
-    "format:native": "clang-format -i src/ghostty_bridge.m src/ghostty_view.m src/ghostty_native.h"
+    "format:native": "clang-format -i src/ghostty_bridge.m src/ghostty_view.m src/ghostty_native.h",
+    "test:motion-metrics": "node --test scripts/analyze-motion-frames.test.mjs"
   },
   "devDependencies": {
     "@native-sdk/cli": "0.10.1",

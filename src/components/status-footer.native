@@ -1,0 +1,73 @@
+<!-- Content-sized groups share one baseline and one flexible space. -->
+<template name="status-footer">
+  <column>
+    <separator />
+    <row height="32" padding="2" cross="center" background="surface" global-key="status-footer" label="Workspace status">
+      <spacer width="10" />
+      <row height="28" gap="8" cross="center" global-key="footer-agent">
+        <for each="tabs" key="id" as="tab">
+          <if test="{tab.selected}">
+            <if test="{tab.tool != 'shell'}">
+              <row height="28" gap="6" cross="center" label="{tab.agent_status}">
+                <if test="{tab.agent_tone == 'ready'}"><icon name="check-circle" width="16" height="16" foreground="success" /></if>
+                <if test="{tab.agent_tone == 'working'}"><icon name="circle-dot" width="16" height="16" foreground="accent" /></if>
+                <if test="{tab.agent_tone == 'attention'}"><icon name="alert" width="16" height="16" foreground="warning" /></if>
+                <if test="{tab.agent_tone == 'failed'}"><icon name="alert" width="16" height="16" foreground="destructive" /></if>
+                <if test="{tab.agent_tone == 'muted'}"><icon name="clock" width="16" height="16" foreground="text_muted" /></if>
+                <text size="sm" max-width="150" wrap="false" overflow="ellipsis">{tab.agent_status}</text>
+                <tooltip anchor="above">{tab.agent_summary}</tooltip>
+              </row>
+              <if test="{canvas_width >= 720 and tab.agent_model != ''}">
+                <separator width="1" height="12" />
+                <text size="sm" foreground="text_muted" max-width="160" wrap="false" overflow="ellipsis">{tab.agent_model}</text>
+              </if>
+              <if test="{canvas_width >= 1400 and tab.agent_tool != ''}">
+                <text size="sm" foreground="text_muted" max-width="100" wrap="false" overflow="ellipsis">{tab.agent_tool}</text>
+              </if>
+              <if test="{canvas_width >= 1400 and tab.agent_tools != ''}">
+                <text size="sm" foreground="text_muted" max-width="90" wrap="false" overflow="ellipsis">{tab.agent_tools}</text>
+              </if>
+              <if test="{canvas_width >= 1100 and tab.agent_context != ''}">
+                <separator width="1" height="12" />
+                <text size="sm" foreground="text_muted" max-width="100" wrap="false" overflow="ellipsis">{tab.agent_context}</text>
+              </if>
+              <if test="{canvas_width >= 1100 and tab.agent_cost != ''}">
+                <text size="sm" foreground="text_muted" max-width="100" wrap="false" overflow="ellipsis">{tab.agent_cost}</text>
+              </if>
+            </if>
+            <else>
+              <icon name="terminal" width="16" height="16" foreground="text_muted" />
+              <if test="{tab.phase == 'starting'}"><text size="sm">Starting shell</text></if>
+              <if test="{tab.phase == 'running'}"><text size="sm">Shell</text></if>
+              <if test="{tab.phase == 'closing'}"><text size="sm">Closing shell</text></if>
+              <if test="{tab.phase == 'exited'}"><text size="sm" foreground="text_muted">Shell exited</text></if>
+              <if test="{tab.phase == 'failed'}"><text size="sm" foreground="destructive">Shell failed</text></if>
+            </else>
+          </if>
+        </for>
+      </row>
+      <spacer grow="1" min-width="24" />
+      <row height="28" gap="12" cross="center" global-key="footer-worktree">
+        <if test="{activeWorkspacePath != ''}">
+          <row height="28" gap="6" cross="center" label="Active worktree">
+            <icon name="git-branch" width="16" height="16" foreground="text_muted" />
+            <text size="sm" max-width="160" wrap="false" overflow="ellipsis">{activeWorkspaceBranch}</text>
+            <tooltip anchor="above">{activeWorkspaceBranch}</tooltip>
+          </row>
+          <if test="{canvas_width >= 1400}">
+            <text size="sm" foreground="text_muted" max-width="320" wrap="false" overflow="ellipsis" label="{activeWorkspacePath}">{activeWorkspacePath}</text>
+          </if>
+          <else>
+            <if test="{canvas_width >= 720 and activeWorkspaceName != activeWorkspaceBranch}"><text size="sm" foreground="text_muted" max-width="100" wrap="false" overflow="ellipsis" label="{activeWorkspacePath}">{activeWorkspaceName}</text></if>
+          </else>
+          <separator width="1" height="12" />
+        </if>
+        <stack width="28" height="28">
+          <button variant="ghost" width="28" height="28" size="icon" icon="info" label="{status_text}" />
+          <tooltip anchor="above">{status_text}</tooltip>
+        </stack>
+      </row>
+      <spacer width="10" />
+    </row>
+  </column>
+</template>

@@ -8,7 +8,7 @@
 <template name="preferences-dialog">
   <panel background="scrim" label="Preferences backdrop">
     <column grow="1" main="center" cross="center">
-      <dialog width="920" height="668" background="background" label="Preferences" on-dismiss="close_preferences">
+      <dialog width="860" height="580" background="background" radius="xl" label="Preferences" on-dismiss="close_preferences">
         <column grow="1">
           <use template="preferences-header" />
           <separator />
@@ -17,18 +17,18 @@
             <use template="preferences-sidebar" />
             <separator width="1" />
 
-            <column grow="1">
-              <row height="64" gap="12" cross="center">
-                <spacer width="28" />
+            <column grow="1" global-key="preferences-content">
+              <row height="80" gap="12" cross="center">
+                <spacer width="12" />
                 <column grow="1" gap="4">
-                  <text size="heading">{preferencesSectionTitle}</text>
-                  <text size="sm" foreground="text_muted">{preferencesSectionDescription}</text>
+                  <text size="display"><span weight="medium">{preferencesSectionTitle}</span></text>
+                  <text foreground="text_muted">{preferencesSectionDescription}</text>
                 </column>
                 <if test="{preferences_dirty}"><text size="sm" foreground="warning">Unsaved changes</text></if>
                 <if test="{preferencesShowSave}">
                   <button height="28" variant="secondary" on-press="save_preferences" disabled="{preferencesSaveDisabled}" label="Save preferences">{preferencesSaveLabel}</button>
                 </if>
-                <spacer width="28" />
+                <spacer width="12" />
               </row>
               <separator />
 

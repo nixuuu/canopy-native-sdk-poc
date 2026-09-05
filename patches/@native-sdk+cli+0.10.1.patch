@@ -9,25 +9,77 @@ index 0000000..16cc72d
 +    _ = @import("runtime/terminal_session_tests.zig");
 +}
 diff --git a/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m b/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
-index 3225c78..452ce13 100644
+index 3225c78..b57902c 100644
 --- a/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
 +++ b/node_modules/@native-sdk/cli/src/platform/macos/appkit_host.m
-@@ -555,6 +555,7 @@ @interface NativeSdkMetalSurfaceView : NSView <NSTextInputClient, NSDraggingDest
+@@ -11,6 +11,7 @@
+ #import <Accelerate/Accelerate.h>
+ #import <Metal/Metal.h>
+ #import <QuartzCore/CAMetalLayer.h>
++#import <QuartzCore/CADisplayLink.h>
+ #import <WebKit/WebKit.h>
+ #import <CoreFoundation/CoreFoundation.h>
+ #import <CoreText/CoreText.h>
+@@ -26,6 +27,7 @@
+ #include <string.h>
+ #include <time.h>
+ #include <unistd.h>
++#include "native_sdk_frame_clock.h"
+
+ #include "../ios/apple_image_fit.h"
+
+@@ -193,9 +195,7 @@ static uint64_t NativeSdkTimestampNanoseconds(void) {
+
+ static uint64_t NativeSdkRetainedFrameIntervalNanoseconds(NSScreen *screen) {
+     NSInteger framesPerSecond = screen ? screen.maximumFramesPerSecond : 0;
+-    if (framesPerSecond <= 0) framesPerSecond = 60;
+-    framesPerSecond = MAX(30, MIN(120, framesPerSecond));
+-    return NativeSdkNanosecondsPerSecond / (uint64_t)framesPerSecond;
++    return NativeSdkCanvasFrameIntervalNs(framesPerSecond);
+ }
+
+ /* Pacing interval for logical frame completions while the window is
+@@ -555,6 +555,9 @@ @interface NativeSdkMetalSurfaceView : NSView <NSTextInputClient, NSDraggingDest
   * nonblank, retained canvas state) are already view state by the time
   * the block fires, so the one event carries the freshest truth. */
  @property(nonatomic, assign) BOOL frameEventEmissionScheduled;
 +@property(nonatomic, strong) NSTimer *frameEventEmissionTimer;
++@property(nonatomic, strong) id canvasFrameDisplayLink;
++@property(nonatomic, assign) NSInteger canvasDisplayLinkRate;
  /* Supersede token for the scheduled emission: a queued dispatch block
   * whose captured generation no longer matches is stale and must no-op.
   * Bumped on de-occlusion, where a heartbeat-paced emission (parked up
-@@ -3206,8 +3207,20 @@ static BOOL NativeSdkGpuCompositeEnabled(void) {
+@@ -752,6 +755,7 @@ - (BOOL)occludedFramePacingActive;
+ - (void)scheduleFrameEventEmission;
+ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion;
+ - (void)emitScheduledFrameEvent;
++- (void)canvasDisplayLinkTick:(id)sender;
+ - (void)emitFrameEventWithFrameIndex:(NSUInteger)frameIndex sampleColor:(uint32_t)sampleColor nonblank:(BOOL)nonblank occluded:(BOOL)occluded;
+ - (void)emitResizeEvent;
+ - (void)emitInputEventWithKind:(NSInteger)kind event:(NSEvent *)event button:(NSInteger)button deltaX:(double)deltaX deltaY:(double)deltaY;
+@@ -3173,7 +3177,7 @@ static BOOL NativeSdkPacketDrawCommandBody(NSDictionary *command, NSString *kind
+  * directly (a full-surface background fill is cheaper to paint than to
+  * hold); the total cap evicts least-recently-used entries. */
+ enum {
+-    NativeSdkPacketRasterCacheMaxEntryBytes = 4 * 1024 * 1024,
++    NativeSdkPacketRasterCacheMaxEntryBytes = 16 * 1024 * 1024,
+     NativeSdkPacketRasterCacheMaxBytes = 64 * 1024 * 1024,
+ };
+
+@@ -3206,8 +3210,26 @@ static BOOL NativeSdkGpuCompositeEnabled(void) {
   * upload/evict action lands, so a re-registered id re-rasterizes — and
   * caching the SCALED output turns the expensive per-present resample
   * (the dominant cost of image-heavy first frames) into a 1:1 blit. */
 +#include "native_sdk_raster_policy.h"
++#include "native_sdk_raster_translation.h"
 +
  static BOOL NativeSdkPacketCommandRasterCacheable(NSDictionary *command, NSString *kind) {
 -    if (command[@"transform"]) return NO;
++    // A flat fill is cheaper to draw than to allocate, retain and blend a
++    // full bitmap. In HiDPI windows these otherwise evict the useful text
++    // and shadow rasters on every pass.
++    NSDictionary *paint = NativeSdkPacketDictionary(command[@"paint"]);
++    if (([kind hasPrefix:@"fill_rect"] || [kind hasPrefix:@"fill_rounded_rect"]) && [paint[@"kind"] isEqual:@"color"]) return NO;
 +    // Layout translations (with float32 roundoff around identity) remain pure
 +    // functions of immutable commands. Apply the ORIGINAL matrix to the raster;
 +    // the tolerance only admits the cache, it never snaps rendered geometry.
@@ -42,16 +94,29 @@ index 3225c78..452ce13 100644
      if (command[@"clip"] && !NativeSdkPacketArray(command[@"clip"], 4)) return NO;
      if ([kind isEqualToString:@"draw_text"] || [kind isEqualToString:@"shadow"]) return YES;
      if ([kind hasPrefix:@"fill_rect"] || [kind hasPrefix:@"fill_rounded_rect"] || [kind hasPrefix:@"stroke_rect"] || [kind hasPrefix:@"draw_line"]) return YES;
-@@ -3862,6 +3875,8 @@ static void NativeSdkPremultiplyStraightRgba8(const uint8_t *source, uint8_t *de
+@@ -3862,6 +3884,21 @@ static void NativeSdkPremultiplyStraightRgba8(const uint8_t *source, uint8_t *de
      }
  }
  
-+#include "native_sdk_frame_clock.h"
++
++// CADisplayLink retains its target. The proxy keeps the surface weak so a
++// removed view can deallocate even while a frame request is armed.
++@interface NativeSdkCanvasFrameLinkTarget : NSObject
++@property(nonatomic, weak) NativeSdkMetalSurfaceView *view;
++- (void)tick:(id)sender;
++@end
++@implementation NativeSdkCanvasFrameLinkTarget
++- (void)tick:(id)sender {
++    NativeSdkMetalSurfaceView *view = self.view;
++    if (view) [view canvasDisplayLinkTick:sender];
++    else if (@available(macOS 14.0, *)) [(CADisplayLink *)sender invalidate];
++}
++@end
 +
  @implementation NativeSdkMetalSurfaceView
  
  - (NSString *)viewLabel {
-@@ -3886,6 +3901,9 @@ - (instancetype)initWithFrame:(NSRect)frameRect {
+@@ -3886,6 +3923,9 @@ - (instancetype)initWithFrame:(NSRect)frameRect {
      _metalLayer.framebufferOnly = NO;
      _metalLayer.opaque = YES;
      _metalLayer.contentsGravity = kCAGravityTopLeft;
@@ -61,15 +126,53 @@ index 3225c78..452ce13 100644
      // No nextDrawable timeout: with the timeout allowed (the default), a
      // non-composited window's starved pool makes nextDrawable stall a full
      // second per frame before returning nil. Disallowing it means
-@@ -3946,6 +3964,7 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+@@ -3945,7 +3985,9 @@ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+ }
  
  - (void)dealloc {
++    if (@available(macOS 14.0, *)) [(CADisplayLink *)self.canvasFrameDisplayLink invalidate];
      [self stopDisplayTimer];
 +    [self.frameEventEmissionTimer invalidate];
      [[NSNotificationCenter defaultCenter] removeObserver:self];
      if (self.canvasColorSpace) {
          CGColorSpaceRelease(self.canvasColorSpace);
-@@ -4984,9 +5003,17 @@ - (void)verifyCompositeIncrementalWithCommands:(NSArray *)commands keys:(NSArray
+@@ -3967,6 +4009,18 @@ - (BOOL)isOpaque {
+
+ - (void)viewDidMoveToWindow {
+     [super viewDidMoveToWindow];
++    if (!self.window) {
++        if (@available(macOS 14.0, *)) [(CADisplayLink *)self.canvasFrameDisplayLink invalidate];
++        self.canvasFrameDisplayLink = nil;
++        [self.frameEventEmissionTimer invalidate];
++        self.frameEventEmissionTimer = nil;
++        self.frameEventEmissionGeneration += 1;
++        self.frameEventEmissionScheduled = NO;
++        if (self.frameChannelActivity) {
++            [[NSProcessInfo processInfo] endActivity:self.frameChannelActivity];
++            self.frameChannelActivity = nil;
++        }
++    }
+     self.metalLayer.opaque = self.window ? self.window.opaque : YES;
+     self.window.acceptsMouseMovedEvents = YES;
+     [self updateDrawableSize];
+@@ -3987,7 +4041,15 @@ - (void)viewDidMoveToWindow {
+ - (void)windowOcclusionStateChanged:(NSNotification *)notification {
+     NSWindow *window = notification.object;
+     if (window != self.window) return;
+-    if ((window.occlusionState & NSWindowOcclusionStateVisible) == 0) return;
++    if ((window.occlusionState & NSWindowOcclusionStateVisible) == 0) {
++        if (@available(macOS 14.0, *)) [(CADisplayLink *)self.canvasFrameDisplayLink setPaused:YES];
++        if (self.frameEventEmissionScheduled) {
++            self.frameEventEmissionGeneration += 1;
++            self.frameEventEmissionScheduled = NO;
++            [self scheduleFrameEventEmission];
++        }
++        return;
++    }
+     // De-occlusion restores full cadence without dropping a beat: an
+     // armed channel may have its one emission parked on the heartbeat
+     // (up to a second out). The queued block cannot be cancelled, so
+@@ -4984,9 +5046,17 @@ - (void)verifyCompositeIncrementalWithCommands:(NSArray *)commands keys:(NSArray
          NSUInteger firstDiff = 0;
          while (firstDiff < byteLength && incremental[firstDiff] == reference[firstDiff]) firstDiff += 1;
          NSUInteger diffPixel = firstDiff / 4;
@@ -88,7 +191,15 @@ index 3225c78..452ce13 100644
                  scissorRect.origin.x, scissorRect.origin.y, scissorRect.size.width, scissorRect.size.height);
      }
      if (self.canvasVerifyCheckCount == 1 || self.canvasVerifyCheckCount % 30 == 0 || self.canvasVerifyMismatchCount > 0) {
-@@ -5187,7 +5214,8 @@ - (NativeSdkPacketCommandRaster *)rasterCacheBuildEntryForCommand:(NSDictionary
+@@ -5170,6 +5240,7 @@ - (NativeSdkPacketCommandRaster *)rasterCacheBuildEntryForCommand:(NSDictionary
+     if (rasterWidth == 0 || rasterHeight == 0) return nil;
+     NSUInteger byteCount = rasterWidth * rasterHeight * 4;
+     if (byteCount > NativeSdkPacketRasterCacheMaxEntryBytes) return nil;
++    if (byteCount > 4 * 1024 * 1024 && ![kind isEqual:@"shadow"] && ![kind isEqual:@"draw_text"] && ![kind isEqual:@"draw_image"]) return nil;
+     if (!self.canvasColorSpace) return nil;
+     NSMutableData *data = [NSMutableData dataWithLength:byteCount];
+     if (!data) return nil;
+@@ -5187,7 +5258,8 @@ - (NativeSdkPacketCommandRaster *)rasterCacheBuildEntryForCommand:(NSDictionary
      if (hasCommandClip) {
          [NSBezierPath clipRect:commandClip];
      }
@@ -98,7 +209,40 @@ index 3225c78..452ce13 100644
      [NSGraphicsContext restoreGraphicsState];
      CGImageRef cgImage = ok ? CGBitmapContextCreateImage(bitmap) : NULL;
      CGContextRelease(bitmap);
-@@ -5465,7 +5493,8 @@ - (void)verifyIncrementalBackingWithCommands:(NSArray *)commands keys:(NSArray *
+@@ -5234,7 +5306,9 @@ - (BOOL)drawPacketCommand:(NSDictionary *)command key:(NSNumber *)key context:(C
+     NSString *kind = [command[@"kind"] isKindOfClass:[NSString class]] ? command[@"kind"] : @"";
+     if (key && boundsArray && self.canvasCommandRasterCache && NativeSdkPacketCommandRasterCacheable(command, kind)) {
+         NativeSdkPacketCommandRaster *entry = self.canvasCommandRasterCache[key];
+-        if (entry && entry.command != command) {
++        NSPoint translation = NSZeroPoint;
++        const BOOL reusedTranslation = entry && entry.command != command && NativeSdkRasterTranslationReuse(entry.command, command, entry.destination, scale, pixelWidth, pixelHeight, &translation);
++        if (entry && entry.command != command && !reusedTranslation) {
+             /* Same key, new content instance: the raster is stale. */
+             [self rasterCacheRemoveKey:key];
+             entry = nil;
+@@ -5260,8 +5334,10 @@ - (BOOL)drawPacketCommand:(NSDictionary *)command key:(NSNumber *)key context:(C
+              * a 1:1 copy blend — no resampling. */
+             CGContextSaveGState(context);
+             if (hasClip) CGContextClipToRect(context, NSRectToCGRect(clipRect));
+-            CGContextSetInterpolationQuality(context, kCGInterpolationNone);
+-            CGContextTranslateCTM(context, entry.destination.origin.x, entry.destination.origin.y + entry.destination.size.height);
++            if (reusedTranslation && [command[@"clip"] isKindOfClass:NSArray.class])
++                CGContextClipToRect(context, NSRectToCGRect(NativeSdkPacketRect(command[@"clip"])));
++            CGContextSetInterpolationQuality(context, reusedTranslation ? kCGInterpolationLow : kCGInterpolationNone);
++            CGContextTranslateCTM(context, entry.destination.origin.x + translation.x, entry.destination.origin.y + translation.y + entry.destination.size.height);
+             CGContextScaleCTM(context, 1, -1);
+             CGContextDrawImage(context, CGRectMake(0, 0, entry.destination.size.width, entry.destination.size.height), entry.image);
+             CGContextRestoreGState(context);
+@@ -5357,7 +5433,7 @@ - (NSInteger)drawPacketCommands:(NSArray *)commands keys:(NSArray *)keys pixels:
+             NSString *kind = [command[@"kind"] isKindOfClass:[NSString class]] ? command[@"kind"] : @"";
+             if (!NativeSdkPacketCommandRasterCacheable(command, kind)) continue;
+             NativeSdkPacketCommandRaster *entry = self.canvasCommandRasterCache[key];
+-            if (entry && entry.command == command && entry.image) continue;
++            if (entry && entry.image && (entry.command == command || NativeSdkRasterTranslationReuse(entry.command, command, entry.destination, scale, pixelWidth, pixelHeight, NULL))) continue;
+             [missCommands addObject:command];
+             [missKinds addObject:kind];
+             [missKeys addObject:key];
+@@ -5465,7 +5541,8 @@ - (void)verifyIncrementalBackingWithCommands:(NSArray *)commands keys:(NSArray *
          self.canvasVerifyPixels = [NSMutableData dataWithLength:byteLength];
      }
      if (!self.canvasVerifyPixels) return;
@@ -108,7 +252,7 @@ index 3225c78..452ce13 100644
          return;
      }
      self.canvasVerifyCheckCount += 1;
-@@ -5476,9 +5505,17 @@ - (void)verifyIncrementalBackingWithCommands:(NSArray *)commands keys:(NSArray *
+@@ -5476,9 +5553,17 @@ - (void)verifyIncrementalBackingWithCommands:(NSArray *)commands keys:(NSArray *
          NSUInteger firstDiff = 0;
          while (firstDiff < byteLength && incremental[firstDiff] == reference[firstDiff]) firstDiff += 1;
          NSUInteger diffPixel = firstDiff / 4;
@@ -127,7 +271,21 @@ index 3225c78..452ce13 100644
                  scissorRect.origin.x, scissorRect.origin.y, scissorRect.size.width, scissorRect.size.height);
      }
      if (self.canvasVerifyCheckCount == 1 || self.canvasVerifyCheckCount % 30 == 0 || self.canvasVerifyMismatchCount > 0) {
-@@ -6110,6 +6147,8 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+@@ -5532,7 +5617,12 @@ - (NSInteger)presentGpuPacketObject:(NSDictionary *)packet surfaceWidth:(CGFloat
+             NSDictionary *command = NativeSdkPacketDictionary(upsert[@"command"]);
+             if (!key || !command) { self.hasCanvasRetainedState = NO; return 0; }
+             self.canvasRetainedCommands[key] = command;
+-            [self rasterCacheRemoveKey:key];
++            NativeSdkPacketCommandRaster *cached = self.canvasCommandRasterCache[key];
++            const BOOL sameSurface = self.canvasCommandRasterCacheScale == normalizedScale &&
++                self.canvasCommandRasterCachePixelWidth == pixelWidth && self.canvasCommandRasterCachePixelHeight == pixelHeight;
++            const BOOL reusable = cached && sameSurface && !NativeSdkGpuCompositeEnabled() &&
++                NativeSdkRasterTranslationReuse(cached.command, command, cached.destination, normalizedScale, pixelWidth, pixelHeight, NULL);
++            if (!reusable) [self rasterCacheRemoveKey:key];
+         }
+         if (self.canvasRetainedCommands.count > NativeSdkPacketRetainedCommandCap) { self.hasCanvasRetainedState = NO; return 0; }
+         /* Draw order comes exclusively from the order vector, and it must
+@@ -6110,6 +6200,8 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
          self.frameEventEmissionScheduled = NO;
      }
      self.frameEventEmissionScheduled = YES;
@@ -136,7 +294,37 @@ index 3225c78..452ce13 100644
      // Armed: suspend app-nap timer coalescing until the channel goes
      // quiet, so the paced deadlines below fire on time even for an
      // unfocused or occluded window (see the property comment) — the
-@@ -6136,7 +6175,11 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+@@ -6118,6 +6210,29 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+     if (!self.frameChannelActivity) {
+         self.frameChannelActivity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical) reason:@"armed gpu-surface frame channel"];
+     }
++    if (@available(macOS 14.0, *)) {
++        const BOOL visible = self.window && (self.window.occlusionState & NSWindowOcclusionStateVisible) != 0;
++        if (visible && self.hasEverPresented) {
++            CADisplayLink *link = (CADisplayLink *)self.canvasFrameDisplayLink;
++            if (!link) {
++                NativeSdkCanvasFrameLinkTarget *target = [NativeSdkCanvasFrameLinkTarget new];
++                target.view = self;
++                link = [self displayLinkWithTarget:target selector:@selector(tick:)];
++                link.paused = YES;
++                [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
++                self.canvasFrameDisplayLink = link;
++            }
++            const NSInteger reportedRate = (self.window.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
++            const NSInteger rate = reportedRate > 0 ? reportedRate : 60;
++            if (rate != self.canvasDisplayLinkRate) {
++                link.preferredFrameRateRange = CAFrameRateRangeMake((float)rate, (float)rate, (float)rate);
++                self.canvasDisplayLinkRate = rate;
++            }
++            link.paused = NO;
++            return;
++        }
++        [(CADisplayLink *)self.canvasFrameDisplayLink setPaused:YES];
++    }
+     const uint64_t now = NativeSdkTimestampNanoseconds();
+     const uint64_t frameIntervalNs = NativeSdkRetainedFrameIntervalNanoseconds(self.window.screen ?: NSScreen.mainScreen);
+     // Occluded surfaces pace on the heartbeat, not the display grid:
+@@ -6136,7 +6251,11 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
      }
      const NSUInteger generation = self.frameEventEmissionGeneration;
      __weak NativeSdkMetalSurfaceView *weakSelf = self;
@@ -149,7 +337,7 @@ index 3225c78..452ce13 100644
          NativeSdkMetalSurfaceView *strongSelf = weakSelf;
          if (!strongSelf) return;
          // Superseded (de-occlusion rescheduled a fresher emission while
-@@ -6144,6 +6187,7 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+@@ -6144,6 +6263,7 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
          // and the activity — touch nothing.
          if (strongSelf.frameEventEmissionGeneration != generation) return;
          strongSelf.frameEventEmissionScheduled = NO;
@@ -157,7 +345,32 @@ index 3225c78..452ce13 100644
          [strongSelf emitScheduledFrameEvent];
          // The emission's engine dispatch re-arms the channel when more
          // frames are wanted; if it did not, the animation is over —
-@@ -6177,6 +6221,16 @@ - (void)emitScheduledFrameEvent {
+@@ -6155,6 +6275,24 @@ - (void)scheduleFrameEventEmissionForPresentCompletion:(BOOL)presentCompletion {
+     });
+ }
+
++// Demand-driven: the runtime re-arms during this callback only while work
++// remains. No animation means no running display link and no idle polling.
++- (void)canvasDisplayLinkTick:(id)sender {
++    if (@available(macOS 14.0, *)) {
++        CADisplayLink *link = (CADisplayLink *)sender;
++        if (!self.frameEventEmissionScheduled) { link.paused = YES; return; }
++        self.frameEventEmissionScheduled = NO;
++        [self emitScheduledFrameEvent];
++        if (!self.frameEventEmissionScheduled) {
++            link.paused = YES;
++            if (self.frameChannelActivity) {
++                [[NSProcessInfo processInfo] endActivity:self.frameChannelActivity];
++                self.frameChannelActivity = nil;
++            }
++        }
++    }
++}
++
+ /* The single frame-event emission: retained canvas state is the
+  * payload (the completion handlers already folded their sample color
+  * and nonblank verdicts into view state before scheduling), so one
+@@ -6177,6 +6315,16 @@ - (void)emitScheduledFrameEvent {
  - (void)renderFrame {
      if (![self isAvailable] || self.hidden || self.bounds.size.width <= 0 || self.bounds.size.height <= 0) return;
      [self updateDrawableSize];
@@ -174,7 +387,21 @@ index 3225c78..452ce13 100644
  
      /* Occluded (or minimized, or hidden-app) windows never touch the
       * drawable pool: complete the frame logically from retained state
-@@ -6339,8 +6393,12 @@ - (void)renderFrame {
+@@ -6302,7 +6450,13 @@ - (void)renderFrame {
+     }
+
+     __weak NativeSdkMetalSurfaceView *weakSelf = self;
++    const NSUInteger completionTraceFrame = self.frameIndex;
+     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedBuffer) {
++        if (NativeSdkGpuFrameTraceEnabled() && completedBuffer.status == MTLCommandBufferStatusCompleted) {
++            fprintf(stderr, "native-sdk: gpu-complete frame=%lu completed_ns=%llu\n",
++                    (unsigned long)completionTraceFrame,
++                    (unsigned long long)(completedBuffer.GPUEndTime * NativeSdkNanosecondsPerSecond));
++        }
+         (void)completedBuffer;
+         uint32_t sampleColor = 0;
+         BOOL nonblank = NO;
+@@ -6339,8 +6493,20 @@ - (void)renderFrame {
      }];
  
      self.glassFlushPending = NO;
@@ -184,11 +411,19 @@ index 3225c78..452ce13 100644
 +    // main thread after scheduling, not via MTLCommandBuffer.presentDrawable.
 +    // This waits for scheduling only, never for completion of GPU rendering.
 +    [commandBuffer waitUntilScheduled];
++    if (NativeSdkGpuFrameTraceEnabled()) {
++        const NSUInteger submittedFrame = self.frameIndex;
++        [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
++            fprintf(stderr, "native-sdk: glass-present frame=%lu presented_ns=%llu\n",
++                    (unsigned long)submittedFrame,
++                    (unsigned long long)(presented.presentedTime * NativeSdkNanosecondsPerSecond));
++        }];
++    }
 +    [drawable present];
      self.hasEverPresented = YES;
  
      self.frameIndex += 1;
-@@ -6995,6 +7053,21 @@ - (void)setScrollDrivers:(const native_sdk_appkit_scroll_driver_t *)drivers coun
+@@ -6995,6 +7161,21 @@ - (void)setScrollDrivers:(const native_sdk_appkit_scroll_driver_t *)drivers coun
          driver.occluderMask = desired.occluder_mask;
          NSRect target = NSMakeRect(desired.x, self.bounds.size.height - desired.y - desired.height, desired.width, desired.height);
          if (!NSEqualRects(driver.frame, target)) driver.frame = target;
@@ -210,7 +445,7 @@ index 3225c78..452ce13 100644
          NSSize contentSize = NSMakeSize(MAX(desired.content_width, 1), MAX(desired.content_height, 1));
          if (driver.documentView && !NSEqualSizes(driver.documentView.frame.size, contentSize)) {
              [driver.documentView setFrameSize:contentSize];
-@@ -10786,7 +10859,11 @@ - (void)scheduleFrame {
+@@ -10786,7 +10967,11 @@ - (void)scheduleFrame {
      if (self.timer) return;
      // Common modes so frames keep pumping during live resize and menu
      // tracking (default-mode timers do not fire in tracking runloops).
@@ -225,12 +460,19 @@ index 3225c78..452ce13 100644
                                                   userInfo:nil
 diff --git a/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_frame_clock.h b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_frame_clock.h
 new file mode 100644
-index 0000000..858d295
+index 0000000..d60c1fd
 --- /dev/null
 +++ b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_frame_clock.h
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,18 @@
 +#pragma once
 +#import <Foundation/Foundation.h>
++#include <stdint.h>
++
++// Respect the display cadence, including 144/165/240 Hz panels. A 120 Hz
++// timer on a fixed 144 Hz panel can repeatedly miss the next vblank.
++static inline uint64_t NativeSdkCanvasFrameIntervalNs(NSInteger refreshRate) {
++    return 1000000000ULL / (uint64_t)(refreshRate > 0 ? refreshRate : 60);
++}
 +
 +// A one-shot, coalesced canvas deadline must also run in AppKit's nested
 +// tracking loop. Do not replace this with a default-mode timer/queue hop.
@@ -263,6 +505,81 @@ index 0000000..3da374e
 +static inline bool NativeSdkCanvasSizeMatches(uint64_t width, uint64_t height,
 +                                            uint64_t drawableWidth, uint64_t drawableHeight) {
 +    return width == drawableWidth && height == drawableHeight;
++}
+diff --git a/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_raster_translation.h b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_raster_translation.h
+new file mode 100644
+index 0000000..a8be6eb
+--- /dev/null
++++ b/node_modules/@native-sdk/cli/src/platform/macos/native_sdk_raster_translation.h
+@@ -0,0 +1,69 @@
++#pragma once
++#import <AppKit/AppKit.h>
++#include <math.h>
++#include "native_sdk_raster_policy.h"
++
++static inline NSArray *NativeSdkRasterNumericArray(id value, NSUInteger count) {
++    if (![value isKindOfClass:NSArray.class] || [value count] != count) return nil;
++    for (id item in value) if (![item isKindOfClass:NSNumber.class] || !isfinite([item doubleValue])) return nil;
++    return value;
++}
++static inline BOOL NativeSdkRasterClose(double a, double b) { return fabs(a - b) < .001; }
++static inline BOOL NativeSdkRasterRectTranslated(NSArray *before, NSArray *after, double dx, double dy) {
++    return before && after && NativeSdkRasterClose([after[0] doubleValue], [before[0] doubleValue] + dx) &&
++        NativeSdkRasterClose([after[1] doubleValue], [before[1] doubleValue] + dy) &&
++        NativeSdkRasterClose([after[2] doubleValue], [before[2] doubleValue]) && NativeSdkRasterClose([after[3] doubleValue], [before[3] doubleValue]);
++}
++
++// Reuse only an unchanged primitive under a pure translation. The cached
++// image starts on a device-pixel-aligned pose and is never surface-clipped.
++// A translated clip must move with it; all paint/text/opacity stays equal.
++// Removing the transform at settle forces a fresh, crisp raster.
++static inline BOOL NativeSdkRasterTranslationReuse(NSDictionary *before, NSDictionary *after, NSRect raster,
++                                                   CGFloat scale, NSUInteger pixelWidth, NSUInteger pixelHeight,
++                                                   NSPoint *delta) {
++    NSArray *a = NativeSdkRasterNumericArray(before[@"transform"], 6);
++    NSArray *b = NativeSdkRasterNumericArray(after[@"transform"], 6);
++    if (!a || !b || !(scale > 0) || !isfinite(scale)) return NO;
++    if (!NativeSdkRasterTranslationCacheable([a[0] doubleValue], [a[1] doubleValue], [a[2] doubleValue], [a[3] doubleValue], [a[4] doubleValue], [a[5] doubleValue]) ||
++        !NativeSdkRasterTranslationCacheable([b[0] doubleValue], [b[1] doubleValue], [b[2] doubleValue], [b[3] doubleValue], [b[4] doubleValue], [b[5] doubleValue])) return NO;
++    if (!NativeSdkRasterClose([a[4] doubleValue] * scale, round([a[4] doubleValue] * scale)) ||
++        !NativeSdkRasterClose([a[5] doubleValue] * scale, round([a[5] doubleValue] * scale))) return NO;
++    for (NSUInteger i = 0; i < 4; i++) if ([a[i] doubleValue] != [b[i] doubleValue]) return NO;
++    const double dx = [b[4] doubleValue] - [a[4] doubleValue];
++    const double dy = [b[5] doubleValue] - [a[5] doubleValue];
++    NSArray *oldBounds = NativeSdkRasterNumericArray(before[@"bounds"], 4);
++    NSArray *newBounds = NativeSdkRasterNumericArray(after[@"bounds"], 4);
++    if (!NativeSdkRasterRectTranslated(oldBounds, newBounds, dx, dy)) return NO;
++    id oldClip = before[@"clip"], newClip = after[@"clip"];
++    if (oldClip == NSNull.null) oldClip = nil;
++    if (newClip == NSNull.null) newClip = nil;
++    if (oldClip || newClip) {
++        NSArray *ca = NativeSdkRasterNumericArray(oldClip, 4), *cb = NativeSdkRasterNumericArray(newClip, 4);
++        if (!NativeSdkRasterRectTranslated(ca, cb, dx, dy)) {
++            if (!ca || !cb || ![ca isEqual:cb]) return NO;
++            // A stationary ancestor clip is harmless only when neither pose
++            // is clipped, including the antialiasing padding. Never reuse a
++            // cropped edge and then reveal pixels that were not rasterized.
++            NSRect clip = NSMakeRect([ca[0] doubleValue], [ca[1] doubleValue], [ca[2] doubleValue], [ca[3] doubleValue]);
++            NSRect oldRect = NSMakeRect([oldBounds[0] doubleValue], [oldBounds[1] doubleValue], [oldBounds[2] doubleValue], [oldBounds[3] doubleValue]);
++            NSRect newRect = NSMakeRect([newBounds[0] doubleValue], [newBounds[1] doubleValue], [newBounds[2] doubleValue], [newBounds[3] doubleValue]);
++            if (!NSContainsRect(clip, NSInsetRect(oldRect, -1 / scale, -1 / scale)) || !NSContainsRect(clip, NSInsetRect(newRect, -1 / scale, -1 / scale))) return NO;
++        }
++    }
++    for (NSString *key in before) {
++        if ([key isEqualToString:@"transform"] || [key isEqualToString:@"bounds"] || [key isEqualToString:@"clip"]) continue;
++        if (![before[key] isEqual:after[key]]) return NO;
++    }
++    for (NSString *key in after) {
++        if ([key isEqualToString:@"transform"] || [key isEqualToString:@"bounds"] || [key isEqualToString:@"clip"]) continue;
++        if (!before[key]) return NO;
++    }
++    const CGFloat margin = 1 / scale;
++    const CGFloat width = pixelWidth / scale, height = pixelHeight / scale;
++    const NSRect moved = NSOffsetRect(raster, dx, dy);
++    if (NSMinX(raster) < margin || NSMinY(raster) < margin || NSMaxX(raster) > width - margin || NSMaxY(raster) > height - margin ||
++        NSMinX(moved) < margin || NSMinY(moved) < margin || NSMaxX(moved) > width - margin || NSMaxY(moved) > height - margin) return NO;
++    if (delta) *delta = NSMakePoint(dx, dy);
++    return YES;
 +}
 diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/terminal_grid.zig
 index f36fa7d..1956e36 100644
@@ -529,10 +846,31 @@ index 9bd8032..455763f 100644
          next.skeleton = self.skeleton.apply(next.skeleton);
          next.spinner = self.spinner.apply(next.spinner);
          return next;
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_invalidation.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_invalidation.zig
+index 589555e..2aac6ce 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_invalidation.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_invalidation.zig
+@@ -326,6 +326,7 @@ fn widgetChange(
+         previous.widget.backdrop_blur != next.widget.backdrop_blur or
+         previous.widget.backdrop_blur_token != next.widget.backdrop_blur_token or
+         previous.widget.scrim != next.widget.scrim or
++        previous.widget.paint_scrim != next.widget.paint_scrim or
+         previous.widget.text_alignment != next.widget.text_alignment or
+         previous.widget.text_no_wrap != next.widget.text_no_wrap or
+         previous.widget.text_overflow != next.widget.text_overflow or
 diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig
-index 5a2701d..7e89b7b 100644
+index 5a2701d..2d7f620 100644
 --- a/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig
 +++ b/node_modules/@native-sdk/cli/src/primitives/canvas/widget_render.zig
+@@ -1069,7 +1069,7 @@ pub fn widgetBackdropBlur(widget: Widget, tokens: DesignTokens) f32 {
+ /// blur + dim treatment. Anchored surfaces (popover, menus, tooltips)
+ /// are NOT modal and never scrim.
+ pub fn widgetEmitsModalScrim(widget: Widget, tokens: DesignTokens) bool {
+-    if (!widget.scrim) return false;
++    if (!widget.scrim or !widget.paint_scrim) return false;
+     return switch (widget.kind) {
+         .dialog, .drawer, .sheet => tokens.colors.scrim.a > 0 or nonNegative(tokens.blur.scrim) > 0,
+         else => false,
 @@ -3128,26 +3128,35 @@ fn emitSplitDividerWidget(builder: *Builder, widget: Widget, tokens: DesignToken
      const visual = componentControlVisualTokens(widget, tokens);
      const normalized = widget.frame.normalized();
@@ -600,6 +938,20 @@ index ff01f76..ea76514 100644
          .skeleton => tokens.controls.skeleton,
          .spinner => tokens.controls.spinner,
          else => .{},
+diff --git a/node_modules/@native-sdk/cli/src/primitives/canvas/widgets.zig b/node_modules/@native-sdk/cli/src/primitives/canvas/widgets.zig
+index 0da67d2..96e1d15 100644
+--- a/node_modules/@native-sdk/cli/src/primitives/canvas/widgets.zig
++++ b/node_modules/@native-sdk/cli/src/primitives/canvas/widgets.zig
+@@ -1045,6 +1045,9 @@ pub const Widget = struct {
+     /// opts out of the scrim for a non-modal specimen; placement remains
+     /// root-relative. Ignored on every other kind.
+     scrim: bool = true,
++    /// Paint the SDK backdrop independently of modal input/scroll occlusion.
++    /// Disable when the application supplies its own stationary backdrop.
++    paint_scrim: bool = true,
+     state: WidgetState = .{},
+     layout: WidgetLayoutStyle = .{},
+     variant: WidgetVariant = .default,
 diff --git a/node_modules/@native-sdk/cli/src/root.zig b/node_modules/@native-sdk/cli/src/root.zig
 index 2da935a..84fb786 100644
 --- a/node_modules/@native-sdk/cli/src/root.zig
@@ -615,8 +967,82 @@ index 2da935a..84fb786 100644
  pub const EffectHostResult = runtime.EffectHostResult;
  pub const HostCallBinding = runtime.HostCallBinding;
  pub const HostCallCompletion = runtime.HostCallCompletion;
+diff --git a/node_modules/@native-sdk/cli/src/runtime/canvas_widget_state.zig b/node_modules/@native-sdk/cli/src/runtime/canvas_widget_state.zig
+index 11296ed..d49fe24 100644
+--- a/node_modules/@native-sdk/cli/src/runtime/canvas_widget_state.zig
++++ b/node_modules/@native-sdk/cli/src/runtime/canvas_widget_state.zig
+@@ -52,6 +52,60 @@ fn ensureCanvasWidgetLargeTextStorageThrough(runtime: anytype, index: usize) !vo
+
+ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
+     return struct {
++        /// Paint-only poses on the retained tree. Geometry, handlers and text
++        /// measurement stay intact; hit testing reads the updated transforms.
++        pub const CanvasWidgetPresentation = struct {
++            id: canvas.ObjectId,
++            transform: canvas.Affine = .{},
++            opacity: f32 = 1,
++        };
++
++        pub fn setCanvasWidgetPresentation(self: *Runtime, window_id: platform.WindowId, label: []const u8, updates: []const CanvasWidgetPresentation) anyerror!bool {
++            try validateRuntimeViewParent(self, window_id);
++            try validateViewLabel(label);
++            const index = runtimeFindViewIndex(self, window_id, label) orelse return error.ViewNotFound;
++            const view = &self.views[index];
++            if (view.kind != .gpu_surface) return error.InvalidViewOptions;
++            if (updates.len > max_canvas_widget_nodes_per_view) return error.WidgetNodeLimitReached;
++            // Validate the complete batch before changing retained state.
++            for (updates) |update| {
++                if (update.id == 0 or !std.math.isFinite(update.opacity) or update.opacity < 0 or update.opacity > 1) return error.InvalidCommand;
++                inline for (.{ "a", "b", "c", "d", "tx", "ty" }) |field| if (!std.math.isFinite(@field(update.transform, field))) return error.InvalidCommand;
++                if (update.transform.inverse() == null) return error.InvalidCommand;
++            }
++            var changed = false;
++            for (updates) |update| {
++                // A removed widget is a stale target, not a new lifetime.
++                const node_index = view.canvasWidgetNodeIndexById(update.id) orelse continue;
++                const widget = &view.widget_layout_nodes[node_index].widget;
++                if (std.meta.eql(widget.transform, update.transform) and widget.opacity == update.opacity) continue;
++                widget.transform = update.transform;
++                widget.opacity = update.opacity;
++                changed = true;
++            }
++            if (!changed) return false;
++            view.widget_revision += 1;
++            _ = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayListIfOwnedSkippingAccessibility(self, index);
++            return true;
++        }
++
++        /// Move a split boundary and crop/translate its already-laid-out panes.
++        /// The owner publishes a new source layout only at transition endpoints.
++        pub fn setCanvasWidgetSplitPresentation(self: *Runtime, window_id: platform.WindowId, label: []const u8, id: canvas.ObjectId, fraction: f32) anyerror!bool {
++            try validateRuntimeViewParent(self, window_id);
++            try validateViewLabel(label);
++            if (!std.math.isFinite(fraction) or fraction < 0 or fraction > 1) return error.InvalidCommand;
++            const index = runtimeFindViewIndex(self, window_id, label) orelse return error.ViewNotFound;
++            const view = &self.views[index];
++            if (view.kind != .gpu_surface) return error.InvalidViewOptions;
++            const node_index = view.canvasWidgetNodeIndexById(id) orelse return false;
++            if (view.widget_layout_nodes[node_index].widget.kind != .split) return error.InvalidCommand;
++            const dirty = try view.applyCanvasWidgetSplitFractionSlide(node_index, fraction) orelse return false;
++            self.invalidateFor(.state, dirty);
++            _ = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayListIfOwnedSkippingAccessibility(self, index);
++            return true;
++        }
++
+         pub fn setCanvasWidgetLayout(self: *Runtime, window_id: platform.WindowId, label: []const u8, layout: canvas.WidgetLayoutTree) anyerror!platform.ViewInfo {
+             try validateRuntimeViewParent(self, window_id);
+             try validateViewLabel(label);
+@@ -975,7 +1029,7 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
+             self.views[index].widget_tokens = tokens;
+             self.views[index].widget_revision += 1;
+             if (self.views[index].canvas_display_list_widget_owned) {
+-                _ = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayList(self, index);
++                _ = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayListIfOwnedSkippingAccessibility(self, index);
+             }
+             return self.views[index].info();
+         }
 diff --git a/node_modules/@native-sdk/cli/src/runtime/core.zig b/node_modules/@native-sdk/cli/src/runtime/core.zig
-index e780399..45a7ce4 100644
+index e780399..8cae867 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/core.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/core.zig
 @@ -931,7 +931,7 @@ pub const Runtime = struct {
@@ -628,6 +1054,29 @@ index e780399..45a7ce4 100644
      const invalidateForCanvasChanges = CanvasFrameMethods.invalidateForCanvasChanges;
  
      const CanvasImageMethods = runtime_canvas_images.RuntimeCanvasImages(Runtime);
+@@ -959,6 +959,9 @@ pub const Runtime = struct {
+
+     const CanvasWidgetStateMethods = runtime_canvas_widget_state.RuntimeCanvasWidgetState(Runtime);
+     pub const setCanvasWidgetLayout = CanvasWidgetStateMethods.setCanvasWidgetLayout;
++    pub const CanvasWidgetPresentation = CanvasWidgetStateMethods.CanvasWidgetPresentation;
++    pub const setCanvasWidgetPresentation = CanvasWidgetStateMethods.setCanvasWidgetPresentation;
++    pub const setCanvasWidgetSplitPresentation = CanvasWidgetStateMethods.setCanvasWidgetSplitPresentation;
+     pub const canvasWidgetLayout = CanvasWidgetStateMethods.canvasWidgetLayout;
+     pub const canvasWidgetSemantics = CanvasWidgetStateMethods.canvasWidgetSemantics;
+     pub const dispatchCanvasWidgetAccessibilityAction = CanvasWidgetStateMethods.dispatchCanvasWidgetAccessibilityAction;
+@@ -985,9 +988,9 @@ pub const Runtime = struct {
+     const refreshCanvasWidgetDisplayListIfOwnedSkippingAccessibility = CanvasWidgetDisplayMethods.refreshCanvasWidgetDisplayListIfOwnedSkippingAccessibility;
+     const refreshCanvasWidgetDisplayListIfOwnedWithAccessibility = CanvasWidgetDisplayMethods.refreshCanvasWidgetDisplayListIfOwnedWithAccessibility;
+     const refreshCanvasWidgetDisplayListIfOwnedWithAccessibilityImmediate = CanvasWidgetDisplayMethods.refreshCanvasWidgetDisplayListIfOwnedWithAccessibilityImmediate;
+-    const beginCanvasWidgetDisplayListRefreshBatch = CanvasWidgetDisplayMethods.beginCanvasWidgetDisplayListRefreshBatch;
+-    const cancelCanvasWidgetDisplayListRefreshBatch = CanvasWidgetDisplayMethods.cancelCanvasWidgetDisplayListRefreshBatch;
+-    const endCanvasWidgetDisplayListRefreshBatch = CanvasWidgetDisplayMethods.endCanvasWidgetDisplayListRefreshBatch;
++    pub const beginCanvasWidgetDisplayListRefreshBatch = CanvasWidgetDisplayMethods.beginCanvasWidgetDisplayListRefreshBatch;
++    pub const cancelCanvasWidgetDisplayListRefreshBatch = CanvasWidgetDisplayMethods.cancelCanvasWidgetDisplayListRefreshBatch;
++    pub const endCanvasWidgetDisplayListRefreshBatch = CanvasWidgetDisplayMethods.endCanvasWidgetDisplayListRefreshBatch;
+     const advanceCanvasWidgetKineticScrollForFrame = CanvasWidgetDisplayMethods.advanceCanvasWidgetKineticScrollForFrame;
+     const scheduleCanvasWidgetToggleAnimation = CanvasWidgetDisplayMethods.scheduleCanvasWidgetToggleAnimation;
+     const publishCanvasWidgetAccessibility = CanvasWidgetDisplayMethods.publishCanvasWidgetAccessibility;
 diff --git a/node_modules/@native-sdk/cli/src/runtime/effects.zig b/node_modules/@native-sdk/cli/src/runtime/effects.zig
 index ce420b0..26ab2ba 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/effects.zig
@@ -2578,10 +3027,19 @@ index becd14f..063c209 100644
              if (event.kind == .exit) entry.used = false;
              // Live delivery is same-frame, so the key rides the frame arena.
 diff --git a/node_modules/@native-sdk/cli/src/runtime/ui_app.zig b/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
-index 02589cb..3534ef6 100644
+index 02589cb..e222e94 100644
 --- a/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
 +++ b/node_modules/@native-sdk/cli/src/runtime/ui_app.zig
-@@ -1321,8 +1321,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -595,6 +595,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+             /// which point the interpreter takes over (compiled view for
+             /// release, hot reload in dev).
+             view: ?*const fn (ui: *Ui, model: *const ModelT) Ui.Node = null,
++            /// Shared post-build decoration for compiled and hot-reloaded markup.
++            decorate_view: ?*const fn (ui: *Ui, model: *const ModelT, node: Ui.Node) Ui.Node = null,
+             /// Runtime-parsed markup view. Requires
+             /// `UiAppFeatures.runtime_markup` (the default).
+             markup: ?MarkupOptions = null,
+@@ -1321,8 +1323,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
          /// the nested rebuild each dispatch runs reconciles to the same
          /// state and produces nothing new (`terminal_state_draining`
          /// makes that one level a hard guarantee).
@@ -2591,7 +3049,7 @@ index 02589cb..3534ef6 100644
          terminal_state_draining: bool = false,
          /// Live model-declared secondary windows (`Options.windows_fn`),
          /// keyed by window label.
-@@ -1447,6 +1446,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1447,6 +1448,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              // memory only and never touches the dead platform.
              self.effects.deinit();
              self.terminal_sessions.deinit();
@@ -2599,7 +3057,7 @@ index 02589cb..3534ef6 100644
              self.arenas[0].deinit();
              self.arenas[1].deinit();
              self.markup_arenas[0].deinit();
-@@ -1554,7 +1554,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1554,7 +1556,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              // emulator query answers) and grid sizes back through the
              // JOURNALED pty verbs. Idempotent, like every bind here.
              if (comptime terminal_session.enabled) {
@@ -2613,7 +3071,7 @@ index 02589cb..3534ef6 100644
                  self.terminal_sessions.setGateway(.{
                      .context = @ptrCast(self),
                      .write = terminalGatewayWrite,
-@@ -1568,6 +1573,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1568,6 +1575,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              self.terminal_sessions.notePtyEvent(event);
          }
  
@@ -2630,7 +3088,7 @@ index 02589cb..3534ef6 100644
          fn terminalGatewayWrite(context: *anyopaque, key: u64, bytes: []const u8) bool {
              const self: *Self = @ptrCast(@alignCast(context));
              return self.effects.ptyWrite(key, bytes);
-@@ -1779,6 +1794,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1779,6 +1796,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                      if (rebuild_error == null) rebuild_error = err;
                  };
              }
@@ -2642,7 +3100,7 @@ index 02589cb..3534ef6 100644
              if (rebuild_error) |err| return err;
              // A Msg dispatched FROM a secondary window still rebuilt the
              // main canvas above (one model, every window's view derives
-@@ -1822,7 +1842,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -1822,7 +1844,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              // an earlier dispatch, so replay's file-order feed always
              // finds the parked request (see Effects.DrainBoundary).
              var boundary = self.effects.drainBoundary();
@@ -2657,7 +3115,7 @@ index 02589cb..3534ef6 100644
                  self.applyMsg(msg);
                  dispatched = true;
              }
-@@ -2231,13 +2257,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -2231,13 +2259,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                      proposed.y,
                  ) orelse continue;
                  applied = true;
@@ -2675,7 +3133,7 @@ index 02589cb..3534ef6 100644
              }
              // An applied change moved the published snapshot AFTER this
              // rebuild handed its layout over: refresh the retained
-@@ -2270,13 +2293,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -2270,13 +2295,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
          fn drainTerminalStates(self: *Self, runtime: *Runtime, window_id: platform.WindowId) anyerror!void {
              if (comptime !terminal_session.enabled) return;
              if (self.terminal_state_draining) return;
@@ -2691,7 +3149,20 @@ index 02589cb..3534ef6 100644
                  const tree = self.tree orelse continue;
                  if (tree.msgForTerminal(pending.id, pending.state)) |msg| {
                      try self.dispatch(runtime, window_id, msg);
-@@ -4638,6 +4658,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+@@ -3373,6 +3395,12 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+         }
+
+         fn buildViewNode(self: *Self, ui: *Ui) anyerror!Ui.Node {
++            const node = try self.buildRawViewNode(ui);
++            if (self.options.decorate_view) |decorate| return decorate(ui, &self.model, node);
++            return node;
++        }
++
++        fn buildRawViewNode(self: *Self, ui: *Ui) anyerror!Ui.Node {
+             if (comptime features.runtime_markup) {
+                 // A markup-only app parses its embedded source on the first
+                 // build; with both `view` and `markup` set, the compiled
+@@ -4638,6 +4666,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
              // identically. A no-op when nothing is pending.
              if (comptime terminal_session.enabled) {
                  _ = self.terminal_sessions.flushPending();

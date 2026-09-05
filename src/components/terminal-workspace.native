@@ -5,44 +5,29 @@
        full terminal area again underneath the opaque native surface. -->
   <column min-width="520" global-key="terminal-workspace">
     <if test="{hasTabs}">
-      <row height="32" background="surface" cross="center">
-        <button width="24" height="24" size="icon" variant="ghost" icon="chevron-left" on-press="previous_tab" label="Previous terminal"></button>
-        <scroll axis="horizontal" overscroll="none" grow="1" label="Terminal tabs">
-          <row height="32" background="surface">
+      <row height="36" padding="4" gap="6" background="surface" cross="center" global-key="terminal-tab-strip">
+        <if test="{tabsOverflow}"><button width="24" height="24" size="icon" variant="ghost" icon="chevron-left" on-press="previous_tab" label="Previous terminal"></button></if>
+        <scroll global-key="terminal-tabs" axis="horizontal" overscroll="none" grow="1" min-width="0" value-x="{tabScrollOffset}" on-scroll="tabs_scrolled" label="Terminal tabs">
+          <row height="28" gap="6" background="surface">
             <for each="tabs" key="id" as="tab">
-            <list-item width="180" height="32" padding="6" gap="5" cross="center" role="tab" selected="{tab.selected}" on-press="activate_tab:{tab.id}" label="{tab.title}">
-              <if test="{tab.phase == 'running'}">
-                <icon name="circle-dot" width="10" height="10" foreground="success" />
-              </if>
-              <else>
-                <icon name="terminal" width="10" height="10" foreground="text_muted" />
-              </else>
+            <list-item width="180" height="28" padding="6" gap="5" cross="center" role="tab" selected="{tab.selected}" on-press="activate_tab:{tab.id}" label="{tab.title}">
+              <if test="{tab.indicator == 'attention'}"><icon name="alert" width="10" height="10" foreground="warning" /></if>
+              <if test="{tab.indicator == 'working'}"><icon name="circle-dot" width="10" height="10" foreground="accent" /></if>
+              <if test="{tab.indicator == 'running'}"><icon name="circle-dot" width="10" height="10" foreground="success" /></if>
+              <if test="{tab.indicator == 'stopped'}"><icon name="terminal" width="10" height="10" foreground="text_muted" /></if>
               <text size="sm" grow="1" wrap="false" overflow="ellipsis">{tab.title}</text>
               <button width="18" height="18" size="icon" variant="ghost" icon="x" on-press="close_tab:{tab.id}" label="Close terminal tab"></button>
             </list-item>
-            <separator width="1" height="32" />
             </for>
           </row>
         </scroll>
-        <badge>{activeWorkspaceTerminalCount}</badge>
-        <button width="24" height="24" size="icon" variant="ghost" icon="chevron-right" on-press="next_tab" label="Next terminal"></button>
+        <if test="{tabsOverflow}"><button width="24" height="24" size="icon" variant="ghost" icon="chevron-right" on-press="next_tab" label="Next terminal"></button></if>
       </row>
       <separator />
 
       <for each="tabs" key="id" as="tab">
         <if test="{tab.selected}">
           <column grow="1">
-            <row height="26" padding="6" gap="6" cross="center" background="surface">
-              <badge variant="outline">{tab.branch}</badge>
-              <text size="sm" foreground="text_muted" grow="1" overflow="ellipsis">{tab.path}</text>
-              <if test="{tab.phase == 'starting'}"><text size="sm">Starting...</text></if>
-              <if test="{tab.phase == 'closing'}"><text size="sm">Closing...</text></if>
-              <if test="{tab.phase == 'exited'}">
-                <if test="{use_ghostty}"><text size="sm">Exited</text></if>
-                <else><text size="sm">Exited {tab.exit_code}</text></else>
-              </if>
-              <if test="{tab.phase == 'failed'}"><text size="sm" foreground="destructive">Failed</text></if>
-            </row>
             <if test="{use_ghostty}"><column grow="1" global-key="canopy-terminal-viewport" label="Ghostty terminal viewport" /></if>
             <else><terminal pty="{tab.pty}" autofocus="true" grow="1" focus-ring="background" label="{tab.title}" /></else>
           </column>

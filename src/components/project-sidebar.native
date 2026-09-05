@@ -1,14 +1,13 @@
 <!-- Projects and their discovered worktrees. -->
 <import src="tools-sidebar.native"/>
-<template name="project-sidebar" args="width=210">
+<template name="project-sidebar" args="width=210 tree_id">
   <column width="{width}" grow="1" background="surface">
     <row height="30" padding="8" cross="center">
       <text size="sm" foreground="text_muted" grow="1">PROJECTS</text>
       <badge>{projectCount}</badge>
     </row>
     <separator />
-    <scroll grow="1" label="Projects and worktrees">
-      <tree padding="4" gap="0">
+    <scroll global-key="{tree_id}" grow="1" padding="4" virtualized="true" virtual-item-extent="28" role="tree" label="Projects and worktrees">
         <for each="sidebarRows" key="key" as="row">
           <if test="{row.kind == 'project'}">
             <list-item height="28" padding="4" gap="5" cross="center" role="treeitem" expanded="true" label="{row.name}">
@@ -21,14 +20,20 @@
           <if test="{row.kind == 'worktree'}">
             <list-item height="28" padding="4" gap="5" cross="center" tree-level="2" role="treeitem" selected="{row.selected}" on-press="select_workspace:{row.workspace_id}" label="{row.detail}">
               <spacer width="14" />
-              <icon name="git-branch" width="12" height="12" foreground="text_muted" />
-              <text size="sm" grow="1" wrap="false">{row.detail}</text>
+              <stack width="14" height="14" label="{row.agent_status}">
+                <if test="{row.agent_color == 'text_muted'}"><icon name="{row.agent_icon}" width="14" height="14" foreground="text_muted" /></if>
+                <if test="{row.agent_color == 'accent'}"><icon name="{row.agent_icon}" width="14" height="14" foreground="accent" /></if>
+                <if test="{row.agent_color == 'success'}"><icon name="{row.agent_icon}" width="14" height="14" foreground="success" /></if>
+                <if test="{row.agent_color == 'warning'}"><icon name="{row.agent_icon}" width="14" height="14" foreground="warning" /></if>
+                <if test="{row.agent_color == 'destructive'}"><icon name="{row.agent_icon}" width="14" height="14" foreground="destructive" /></if>
+              </stack>
+              <text size="sm" grow="1" wrap="false" overflow="ellipsis">{row.detail}</text>
               <if test="{row.can_remove}"><button width="20" height="20" size="icon" variant="ghost" icon="trash" on-press="request_remove_worktree:{row.workspace_id}" label="Remove worktree" disabled="{gitBusy}"></button></if>
               <button width="20" height="20" size="icon" variant="ghost" icon="terminal" on-press="open_terminal:{row.workspace_id}" label="Open terminal"></button>
+              <if test="{row.agent_status != ''}"><tooltip anchor="below" tooltip-delay="350">{row.agent_status}</tooltip></if>
             </list-item>
           </if>
         </for>
-      </tree>
     </scroll>
     <use template="tools-sidebar" />
   </column>

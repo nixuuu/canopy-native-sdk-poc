@@ -129,13 +129,7 @@ pub const Host = struct {
         const blocked = model.terminalActionsBlocked();
         const selected = model.terminal_state.active(model.active_workspace_id);
         const layout = runtime.canvasWidgetLayout(1, "main-canvas") catch return;
-        var frame: ?geometry.RectF = null;
-        if (!blocked) for (layout.nodes) |node| {
-            if (node.widget.id == @import("canvas_host.zig").terminal_viewport_id and node.frame.width > 0 and node.frame.height > 0) {
-                frame = node.frame;
-                break;
-            }
-        };
+        var frame = if (blocked) null else @import("canvas_host.zig").terminalViewport(layout);
         const view = self.surfaces.get(selected);
         if (frame == null or view == null) {
             self.detach(runtime);

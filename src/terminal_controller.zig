@@ -105,6 +105,7 @@ pub const State = struct {
         for (store.items.items, 0..) |*tab, index| {
             if (tab.pty != pty_key) continue;
             if (tab.phase == .closing) return .{ .removed = self.removeAt(store, index) };
+            if (tab.tool != .shell) tab.agent.processEnded(clean);
             tab.exit_code = code;
             tab.phase = if (clean) .exited else .failed;
             return .{ .completed = tab.phase };

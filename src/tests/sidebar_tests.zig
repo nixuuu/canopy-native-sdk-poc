@@ -238,7 +238,7 @@ test "compact sidebar overlay leaves terminal layout unchanged and dismisses on 
         var trees: usize = 0;
         var found = false;
         for (layout.nodes) |node| {
-            if (node.widget.kind == .tree) trees += 1;
+            if (node.widget.semantics.role == .tree) trees += 1;
             if (!std.mem.eql(u8, node.widget.semantics.label, "Ghostty terminal viewport")) continue;
             found = true;
             if (viewport) |previous| try std.testing.expectEqual(previous, node.frame);

@@ -4,6 +4,8 @@ const sdk = @import("native_sdk");
 pub const Env = @import("ghostty_abi.zig").c.canopy_ghostty_env;
 pub const Pending = struct {
     arena: std.heap.ArenaAllocator,
+    argv: []const []const u8,
+    sdk_env: []const sdk.PtyEnvEntry,
     command: [:0]const u8,
     original_command: [:0]const u8,
     cwd: [:0]const u8,
@@ -15,6 +17,10 @@ pub const Pending = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        const owned_args = try a.alloc([]const u8, argv.len);
+        for (argv, owned_args) |arg, *out| out.* = try a.dupe(u8, arg);
+        const owned_env = try a.alloc(sdk.PtyEnvEntry, env.len);
+        for (env, owned_env) |entry, *out| out.* = .{ .name = try a.dupe(u8, entry.name), .value = try a.dupe(u8, entry.value) };
         var command: std.ArrayList(u8) = .empty;
         // On macOS Ghostty wraps this as `exec -l <command>` itself.
         // An additional `exec` prefix would become the executable name.
@@ -38,8 +44,20 @@ pub const Pending = struct {
         // host's environment. An explicit profile setting still wins.
         const command_z = if (explicit_no_color) original_command else try std.fmt.allocPrintSentinel(a, "'/usr/bin/env' '-u' 'NO_COLOR' {s}", .{original_command}, 0);
         const cwd_z = try a.dupeZ(u8, cwd);
-        self.* = .{ .arena = arena, .command = command_z, .original_command = original_command, .cwd = cwd_z, .env = entries };
+        self.* = .{ .arena = arena, .argv = owned_args, .sdk_env = owned_env, .command = command_z, .original_command = original_command, .cwd = cwd_z, .env = entries };
         return self;
+    }
+
+    pub fn appendEnvironment(self: *Pending, extra: []const sdk.PtyEnvEntry) !void {
+        if (self.sdk_env.len + extra.len > sdk.max_effect_pty_env_entries) return error.EnvironmentTooLarge;
+        const a = self.arena.allocator();
+        const combined = try a.alloc(sdk.PtyEnvEntry, self.sdk_env.len + extra.len);
+        @memcpy(combined[0..self.sdk_env.len], self.sdk_env);
+        for (extra, combined[self.sdk_env.len..]) |entry, *out| out.* = .{ .name = try a.dupeZ(u8, entry.name), .value = try a.dupeZ(u8, entry.value) };
+        const native = try a.alloc(Env, combined.len);
+        for (combined, native) |entry, *out| out.* = .{ .name = try a.dupeZ(u8, entry.name), .value = try a.dupeZ(u8, entry.value) };
+        self.sdk_env = combined;
+        self.env = native;
     }
 
     pub fn destroy(self: *Pending) void {

@@ -9,9 +9,11 @@ pub fn build(b: *std.Build) void {
         .terminal_sessions = true,
     });
     const config = b.addOptions();
-    const smoke = b.option(bool, "smoke", "Use an isolated application identity for native-window smoke tests") orelse false;
-    config.addOption([]const u8, "bundle_id", if (smoke) "tech.itsol.canopy.native-poc.smoke" else "tech.itsol.canopy.native-poc");
+    const profile_motion = b.option(bool, "profile-motion", "Build an isolated, instrumented motion performance instance") orelse false;
+    const smoke = profile_motion or (b.option(bool, "smoke", "Use an isolated application identity for native-window smoke tests") orelse false);
+    config.addOption([]const u8, "bundle_id", if (profile_motion) "tech.itsol.canopy.native-poc.performance" else if (smoke) "tech.itsol.canopy.native-poc.smoke" else "tech.itsol.canopy.native-poc");
     config.addOption(bool, "smoke", smoke);
+    config.addOption(bool, "profile_motion", profile_motion);
     app.exe.root_module.addOptions("app_config", config);
     app.tests.root_module.addOptions("app_config", config);
     app.exe.root_module.addIncludePath(b.path("src"));

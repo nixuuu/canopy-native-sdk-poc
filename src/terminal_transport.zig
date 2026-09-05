@@ -4,8 +4,8 @@ const tabs = @import("terminal_tabs.zig");
 const launch = @import("terminal_launch.zig");
 const std = @import("std");
 
-pub fn start(ghostty: bool, allocator: std.mem.Allocator, tab: *tabs.Tab, argv: []const []const u8, env: []const sdk.PtyEnvEntry, fx: anytype) !void {
-    if (ghostty) {
+pub fn start(ghostty: bool, tracked: bool, allocator: std.mem.Allocator, tab: *tabs.Tab, argv: []const []const u8, env: []const sdk.PtyEnvEntry, fx: anytype) !void {
+    if (ghostty or tracked) {
         tab.pending_launch = try launch.Pending.create(allocator, tab.path.slice(), argv, env);
     } else {
         const Effects = @TypeOf(fx.*);

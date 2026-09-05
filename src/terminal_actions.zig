@@ -1,4 +1,5 @@
 //! Terminal actions: one application feature boundary.
+const std = @import("std");
 const types = @import("app_types.zig");
 const Model = types.Model;
 const Msg = types.Msg;
@@ -54,7 +55,7 @@ pub fn startTerminal(model: *Model, fx: *Effects, spec: TerminalStartSpec) void 
     };
 
     const added = &model.tab_store.items.items[model.tab_store.items.items.len - 1];
-    terminal_transport.start(model.use_ghostty, model.tab_store.allocator, added, spec.argv, spec.env, fx) catch {
+    terminal_transport.start(model.use_ghostty, model.use_agent_hooks and spec.tool != .shell, model.tab_store.allocator, added, spec.argv, spec.env, fx) catch {
         _ = model.terminal_state.exit(model.tab_store, added.pty, 0, false);
         model.status_text = "Could not prepare terminal session";
     };
@@ -167,6 +168,9 @@ pub fn handle(model: *Model, msg: Msg, fx: *Effects) void {
         .activate_tab => |id| {
             if (!model.terminal_state.activate(model.tab_store, model.active_workspace_id, id)) return;
             model.status_text = "Terminal focused";
+        },
+        .tabs_scrolled => |scroll| {
+            if (std.math.isFinite(scroll.offset_x)) model.tab_scroll_state.offset = @max(0, scroll.offset_x);
         },
         .previous_tab => cycleTab(model, false),
         .next_tab => cycleTab(model, true),

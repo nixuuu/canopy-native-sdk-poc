@@ -4,10 +4,11 @@
   "groups": [
     {
       "name": "PTY lifecycle and readiness",
-      "reason": "Dynamic terminal membership, readiness-only reactor, backpressure and owned shutdown.",
+      "reason": "Dynamic terminal membership, readiness-only reactor, backpressure and owned shutdown. UiApp also exposes one post-build decoration seam shared by compiled and reloaded markup, keeping native chrome motion consistent in development.",
       "tests": [
         "npm test: terminal_session_tests",
-        "npm test: terminal and application lifecycle regressions"
+        "npm test: terminal and application lifecycle regressions",
+        "npm test: chrome_tests compiled/reloaded view decoration"
       ],
       "files": [
         "src/canopy_terminal_tests.zig",
@@ -25,21 +26,22 @@
     },
     {
       "name": "Native frame scheduling and raster policy",
-      "reason": "Tracking-mode frame delivery and bounded retained-surface caching/presentation.",
+      "reason": "Demand-driven display-link pacing on macOS 14+, common-mode timer fallback, actual display refresh rates, opt-in drawable presentation timestamps, and bounded retained-surface caching/presentation. Translation-only raster reuse preserves paint/text/opacity/clip semantics, refreshes settled content, and supports HiDPI surfaces within a fixed 64 MiB total cache budget.",
       "tests": [
         "npm test: canopy-frame-clock-tests",
         "npm test: canopy-raster-policy-tests",
-        "Real macOS window smoke"
+        "Actual presentedTime cadence and native-window smoke"
       ],
       "files": [
         "src/platform/macos/appkit_host.m",
         "src/platform/macos/native_sdk_frame_clock.h",
-        "src/platform/macos/native_sdk_raster_policy.h"
+        "src/platform/macos/native_sdk_raster_policy.h",
+        "src/platform/macos/native_sdk_raster_translation.h"
       ]
     },
     {
       "name": "Canvas terminal painting and appearance",
-      "reason": "Terminal-grid paint/cache behavior and application token compatibility.",
+      "reason": "Terminal-grid paint/cache behavior and application token compatibility. Modal backdrop painting is independent of native scrollbar occlusion.",
       "tests": [
         "npm test: terminal_grid_tests",
         "npm run check",
@@ -50,7 +52,21 @@
         "src/primitives/canvas/terminal_grid_tests.zig",
         "src/primitives/canvas/tokens.zig",
         "src/primitives/canvas/widget_render.zig",
-        "src/primitives/canvas/widget_render_style.zig"
+        "src/primitives/canvas/widget_render_style.zig",
+        "src/primitives/canvas/widgets.zig",
+        "src/primitives/canvas/widget_invalidation.zig"
+      ]
+    },
+    {
+      "name": "Retained canvas motion",
+      "reason": "Paint-only poses and retained split movement avoid source rebuilds, text layout and accessibility publication on intermediate animation frames. Updates are validated before mutation and can be batched into one display-list emission.",
+      "tests": [
+        "npm test: motion_performance_tests",
+        "npm test: retained sidebar controller tests",
+        "Actual CAMetalDrawable presentation cadence in an isolated ReleaseFast instance"
+      ],
+      "files": [
+        "src/runtime/canvas_widget_state.zig"
       ]
     }
   ]

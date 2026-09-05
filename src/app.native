@@ -3,6 +3,7 @@
 <import src="components/titlebar.native"/>
 <import src="components/project-sidebar.native"/>
 <import src="components/terminal-workspace.native"/>
+<import src="components/status-footer.native"/>
 <import src="components/empty-state.native"/>
 <import src="components/dialogs.native"/>
 <import src="components/preferences.native"/>
@@ -16,18 +17,18 @@
       <stack grow="1">
         <if test="{sidebarDockVisible}">
           <!-- Wide, flat grip styled through the split-divider token. -->
-          <split grow="1" value="{sidebarFraction}" on-resize="sidebar_resized" gap="{sidebarDividerWidth}">
+          <split global-key="sidebar-dock" grow="1" value="{sidebarFraction}" on-resize="sidebar_resized" gap="{sidebarDividerWidth}">
             <column min-width="{sidebarDockMinimum}">
-              <use template="project-sidebar" width="{sidebar_width}" />
+              <use template="project-sidebar" width="{sidebar_width}" tree_id="dock-worktrees" />
             </column>
             <use template="terminal-workspace" />
           </split>
         </if>
         <else><use template="terminal-workspace" /></else>
         <if test="{sidebarOverlayVisible}">
-          <split grow="1" value="{sidebarOverlayFraction}" gap="1" label="Sidebar overlay">
-            <column min-width="{sidebarOverlayWidth}" background="surface"><use template="project-sidebar" width="{sidebarOverlayFullWidth}" /></column>
-            <column min-width="{canvas_width - sidebarOverlayWidth - 1}" on-press="dismiss_sidebar" label="Dismiss sidebar" />
+          <split global-key="sidebar-overlay" grow="1" value="{sidebarOverlayFraction}" gap="1" label="Sidebar overlay">
+            <column min-width="0" background="surface"><use template="project-sidebar" width="{sidebarOverlayFullWidth}" tree_id="overlay-worktrees" /></column>
+            <column min-width="{canvas_width - sidebarOverlayFullWidth - 1}" on-press="dismiss_sidebar" label="Dismiss sidebar" />
           </split>
         </if>
       </stack>
@@ -36,7 +37,7 @@
       <use template="project-empty-state" />
     </else>
 
-    <status-bar>{status_text} · Ghostty · host-limited sessions</status-bar>
+    <use template="status-footer" />
   </column>
 
   <if test="{create_dialog_open}"><use template="create-worktree-dialog" /></if>

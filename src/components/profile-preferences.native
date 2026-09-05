@@ -1,111 +1,104 @@
-<!-- Shallow profile manager matching Electron geometry without deep wrappers. -->
+<!-- Profile selection stays above the editor so fields retain their full width. -->
 <template name="profile-preferences">
-  <row grow="1" padding="24">
-    <column width="180" gap="8">
-      <row height="28" padding="4" cross="center">
-        <text size="sm" foreground="disabled" grow="1"><span scale="0.91" weight="medium">PROFILES</span></text>
-        <button width="24" height="24" size="icon" variant="ghost" icon="refresh-cw" on-press="reload_profiles" label="Reload profiles" disabled="{profile_edit.busy}" />
-        <button width="24" height="24" size="icon" variant="ghost" icon="plus" on-press="new_profile" label="New profile" disabled="{profileControlsDisabled}"></button>
-      </row>
-      <scroll grow="1" label="Agent profiles">
-        <column gap="1">
+  <column grow="1" padding="24" gap="16">
+    <row height="32" gap="8" cross="center">
+      <scroll grow="1" height="32" axis="horizontal" min-width="0" label="Agent profiles">
+        <row gap="4">
           <for each="profileRows" key="key" as="profile">
-            <list-item height="28" padding="6" gap="6" cross="center" selected="{profile.selected}" on-press="select_profile:{profile.id}" label="{profile.name}">
-              <if test="{profile.selected}"><text size="lg" foreground="accent" grow="1" wrap="false" overflow="ellipsis">{profile.name}</text></if>
-              <else><text size="lg" grow="1" wrap="false" overflow="ellipsis">{profile.name}</text></else>
-              <if test="{profile.is_default}"><badge size="sm" variant="outline" foreground="disabled" border-color="surface_subtle" radius="sm">DEFAULT</badge></if>
-              <if test="{profile.can_delete}"><button width="20" height="20" size="icon" variant="ghost" icon="trash" on-press="request_delete_profile:{profile.id}" label="Delete profile"></button></if>
+            <list-item height="32" width="148" padding="8" gap="6" cross="center" selected="{profile.selected}" on-press="select_profile:{profile.id}" label="{profile.name}">
+              <text size="lg" grow="1" wrap="false" overflow="ellipsis">{profile.name}</text>
+              <if test="{profile.is_default}"><icon name="check" width="14" height="14" foreground="text_muted" /></if>
+              <if test="{profile.can_delete}"><button width="20" height="20" size="icon" variant="ghost" icon="trash" on-press="request_delete_profile:{profile.id}" label="Delete profile" /></if>
             </list-item>
           </for>
-        </column>
+        </row>
       </scroll>
-    </column>
-    <separator width="1" />
-    <spacer width="20" />
-
+      <button width="28" height="28" size="icon" variant="ghost" icon="refresh-cw" on-press="reload_profiles" label="Reload profiles" disabled="{profile_edit.busy}" />
+      <button width="28" height="28" size="icon" variant="ghost" icon="plus" on-press="new_profile" label="New profile" disabled="{profileControlsDisabled}" />
+    </row>
+    <separator />
     <column grow="1">
-      <row height="52" gap="12" cross="end">
-        <column grow="1" gap="4"><text size="sm" foreground="disabled"><span scale="0.91" weight="medium">PROFILE NAME</span></text><text-field disabled="{profileControlsDisabled}" size="lg" height="33" text="{profileNameText}" placeholder="Profile name" on-input="edit_profile_name" label="Profile name" /></column>
+      <row height="56" gap="12" cross="end">
+        <column grow="1" gap="4"><text foreground="text_muted"><span weight="medium">Profile name</span></text><text-field disabled="{profileControlsDisabled}" size="lg" height="32" text="{profileNameText}" placeholder="Profile name" on-input="edit_profile_name" label="Profile name" /></column>
         <if test="{profile_edit.dirty}"><text size="sm" foreground="warning">Unsaved changes</text></if>
-        <button height="28" variant="secondary" on-press="save_profile" disabled="{profileSaveDisabled}">{profileSaveLabel}</button>
+        <button height="32" variant="secondary" on-press="save_profile" disabled="{profileSaveDisabled}">{profileSaveLabel}</button>
       </row>
-      <separator />
       <spacer height="20" />
 
       <scroll grow="1" label="Profile settings">
         <if test="{preferencesClaudeSelected}">
-          <column gap="8">
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">MODEL & BEHAVIOR</span></text>
-            <text size="sm" foreground="text_muted">Configure the Claude model and autonomy used by this profile.</text>
+          <column gap="12">
+            <text foreground="text_muted"><span weight="medium">Model & behavior</span></text>
+            <text foreground="text_muted">Configure the Claude model and autonomy used by this profile.</text>
             <text size="lg">Model</text>
-            <text size="sm" foreground="text_muted">Short name such as sonnet, opus, or haiku, or a full model ID.</text>
-            <text-field disabled="{profileControlsDisabled}" size="lg" height="33" text="{profileModelText}" placeholder="sonnet, opus, haiku, or model ID" on-input="edit_profile_model" label="Claude model" />
+            <text foreground="text_muted">Short name such as sonnet, opus, or haiku, or a full model ID.</text>
+            <text-field disabled="{profileControlsDisabled}" size="lg" height="32" text="{profileModelText}" placeholder="sonnet, opus, haiku, or model ID" on-input="edit_profile_model" label="Claude model" />
             <separator />
-            <row gap="24" cross="center"><text size="lg" grow="1">Permission mode</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="33" text="{profilePermissionValue}" placeholder="Default" on-input="edit_profile_permission_mode" label="Claude permission mode" /></row>
-            <text size="sm" foreground="text_muted">Plan is read-only; Auto enables full autonomy.</text>
+            <row gap="24" cross="center"><text size="lg" grow="1">Permission mode</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="32" text="{profilePermissionValue}" placeholder="Default" on-input="edit_profile_permission_mode" label="Claude permission mode" /></row>
+            <text foreground="text_muted">Plan is read-only; Auto enables full autonomy.</text>
             <separator />
-            <row gap="24" cross="center"><text size="lg" grow="1">Effort level</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="33" text="{profileEffortValue}" placeholder="Default" on-input="edit_profile_effort_level" label="Claude effort level" /></row>
-            <text size="sm" foreground="text_muted">Higher effort is more thorough but slower.</text>
+            <row gap="24" cross="center"><text size="lg" grow="1">Effort level</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="32" text="{profileEffortValue}" placeholder="Default" on-input="edit_profile_effort_level" label="Claude effort level" /></row>
+            <text foreground="text_muted">Higher effort is more thorough but slower.</text>
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">API & PROVIDER</span></text>
-            <text size="sm" foreground="text_muted">Use the CLI login or inherited API key; secrets never enter the UI model.</text>
+            <text foreground="text_muted"><span weight="medium">API & provider</span></text>
+            <text foreground="text_muted">Use the CLI login or inherited API key; secrets never enter the UI model.</text>
             <text size="lg">Base URL</text>
-            <text-field disabled="{profileControlsDisabled}" size="lg" height="33" text="{profileBaseUrlText}" placeholder="https://api.anthropic.com" on-input="edit_profile_base_url" label="Claude base URL" />
+            <text-field disabled="{profileControlsDisabled}" size="lg" height="32" text="{profileBaseUrlText}" placeholder="https://api.anthropic.com" on-input="edit_profile_base_url" label="Claude base URL" />
             <separator />
-            <row gap="24" cross="center"><text size="lg" grow="1">Provider</text><text-field disabled="{profileControlsDisabled}" size="lg" width="220" height="33" text="{profileProviderValue}" placeholder="Default (Anthropic)" on-input="edit_profile_provider" label="Claude provider" /></row>
+            <row gap="24" cross="center"><text size="lg" grow="1">Provider</text><text-field disabled="{profileControlsDisabled}" size="lg" width="220" height="32" text="{profileProviderValue}" placeholder="Default (Anthropic)" on-input="edit_profile_provider" label="Claude provider" /></row>
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">SYSTEM PROMPT</span></text>
+            <text foreground="text_muted"><span weight="medium">System prompt</span></text>
             <text size="lg">Append to system prompt</text>
             <textarea disabled="{profileControlsDisabled}" size="lg" text="{profileAppendPromptText}" height="72" placeholder="Additional instructions" on-input="edit_profile_append_prompt" label="Append to system prompt" />
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">ENVIRONMENT VARIABLES</span></text>
-            <text size="sm" foreground="text_muted">Stored as plaintext JSON; unsafe process variables are filtered before launch.</text>
+            <text foreground="text_muted"><span weight="medium">Environment variables</span></text>
+            <text foreground="text_muted">Stored as plaintext JSON; unsafe process variables are filtered before launch.</text>
             <textarea disabled="{profileControlsDisabled}" text="{profileCustomEnvText}" height="82" placeholder="JSON environment object" on-input="edit_profile_custom_env" label="Claude custom environment JSON" />
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">ADVANCED</span></text>
-            <text size="sm" foreground="text_muted">Settings JSON is merged into the Claude session.</text>
+            <text foreground="text_muted"><span weight="medium">Advanced</span></text>
+            <text foreground="text_muted">Settings JSON is merged into the Claude session.</text>
             <textarea disabled="{profileControlsDisabled}" text="{profileSettingsJsonText}" height="96" placeholder="JSON settings object" on-input="edit_profile_settings_json" label="Claude settings JSON override" />
           </column>
         </if>
 
         <if test="{preferencesCodexSelected}">
-          <column gap="8">
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">MODEL & BEHAVIOR</span></text>
-            <text size="sm" foreground="text_muted">Configure the Codex model, approvals, and sandbox used by this profile.</text>
+          <column gap="12">
+            <text foreground="text_muted"><span weight="medium">Model & behavior</span></text>
+            <text foreground="text_muted">Configure the Codex model, approvals, and sandbox used by this profile.</text>
             <text size="lg">Model</text>
-            <text-field disabled="{profileControlsDisabled}" size="lg" height="33" text="{profileModelText}" placeholder="Default" on-input="edit_profile_model" label="Codex model" />
+            <text-field disabled="{profileControlsDisabled}" size="lg" height="32" text="{profileModelText}" placeholder="Default" on-input="edit_profile_model" label="Codex model" />
             <separator />
-            <row gap="24" cross="center"><text size="lg" grow="1">Approval mode</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="33" text="{profileApprovalValue}" placeholder="Default" on-input="edit_profile_approval_mode" label="Codex approval mode" /></row>
-            <text size="sm" foreground="text_muted">Controls when Codex pauses for human approval.</text>
+            <row gap="24" cross="center"><text size="lg" grow="1">Approval mode</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="32" text="{profileApprovalValue}" placeholder="Default" on-input="edit_profile_approval_mode" label="Codex approval mode" /></row>
+            <text foreground="text_muted">Controls when Codex pauses for human approval.</text>
             <separator />
-            <row gap="24" cross="center"><text size="lg" grow="1">Sandbox</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="33" text="{profileSandboxValue}" placeholder="Default" on-input="edit_profile_sandbox" label="Codex sandbox" /></row>
-            <text size="sm" foreground="text_muted">Command execution policy for the session.</text>
+            <row gap="24" cross="center"><text size="lg" grow="1">Sandbox</text><text-field disabled="{profileControlsDisabled}" size="lg" width="200" height="32" text="{profileSandboxValue}" placeholder="Default" on-input="edit_profile_sandbox" label="Codex sandbox" /></row>
+            <text foreground="text_muted">Command execution policy for the session.</text>
             <separator />
             <row gap="24" cross="center"><text size="lg" grow="1">Full auto</text><switch disabled="{profileControlsDisabled}" selected="{profileFullAuto}" on-toggle="toggle_profile_full_auto" label="Codex full auto" /></row>
-            <text size="sm" foreground="text_muted">Workspace-write sandbox with on-request approvals.</text>
+            <text foreground="text_muted">Workspace-write sandbox with on-request approvals.</text>
             <separator />
             <row gap="24" cross="center"><text size="lg" grow="1">Bypass approvals and sandbox</text><switch disabled="{profileControlsDisabled}" selected="{profileDangerousBypass}" on-toggle="toggle_profile_dangerous_bypass" label="Bypass Codex approvals and sandbox" /></row>
-            <text size="sm" foreground="text_muted">Run without approval prompts or sandbox restrictions.</text>
+            <text foreground="text_muted">Run without approval prompts or sandbox restrictions.</text>
             <separator />
             <text size="lg">Profile</text>
-            <text size="sm" foreground="text_muted">Configuration profile from config.toml.</text>
-            <text-field disabled="{profileControlsDisabled}" size="lg" height="33" text="{profileCodexConfigProfileText}" placeholder="Default" on-input="edit_profile_codex_profile" label="Codex configuration profile" />
+            <text foreground="text_muted">Configuration profile from config.toml.</text>
+            <text-field disabled="{profileControlsDisabled}" size="lg" height="32" text="{profileCodexConfigProfileText}" placeholder="Default" on-input="edit_profile_codex_profile" label="Codex configuration profile" />
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">API</span></text>
-            <text size="sm" foreground="text_muted">Use the CLI login or inherited API key; secrets never enter the UI model.</text>
+            <text foreground="text_muted"><span weight="medium">API</span></text>
+            <text foreground="text_muted">Use the CLI login or inherited API key; secrets never enter the UI model.</text>
             <text size="lg">Base URL</text>
-            <text-field disabled="{profileControlsDisabled}" size="lg" height="33" text="{profileBaseUrlText}" placeholder="https://api.openai.com" on-input="edit_profile_base_url" label="Codex base URL" />
+            <text-field disabled="{profileControlsDisabled}" size="lg" height="32" text="{profileBaseUrlText}" placeholder="https://api.openai.com" on-input="edit_profile_base_url" label="Codex base URL" />
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">ENVIRONMENT VARIABLES</span></text>
-            <text size="sm" foreground="text_muted">Stored as plaintext JSON; unsafe process variables are filtered before launch.</text>
+            <text foreground="text_muted"><span weight="medium">Environment variables</span></text>
+            <text foreground="text_muted">Stored as plaintext JSON; unsafe process variables are filtered before launch.</text>
             <textarea disabled="{profileControlsDisabled}" text="{profileCustomEnvText}" height="82" placeholder="JSON environment object" on-input="edit_profile_custom_env" label="Codex custom environment JSON" />
             <spacer height="20" />
-            <text size="sm" foreground="disabled"><span scale="0.91" weight="medium">ADVANCED</span></text>
-            <text size="sm" foreground="text_muted">Stored compatibly for the Codex hooks integration.</text>
+            <text foreground="text_muted"><span weight="medium">Advanced</span></text>
+            <text foreground="text_muted">Stored compatibly for the Codex hooks integration.</text>
             <textarea disabled="{profileControlsDisabled}" text="{profileSettingsJsonText}" height="96" placeholder="JSON settings object" on-input="edit_profile_settings_json" label="Codex settings JSON override" />
           </column>
         </if>
       </scroll>
     </column>
-  </row>
+  </column>
 </template>

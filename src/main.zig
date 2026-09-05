@@ -66,6 +66,7 @@ const app_markup_sources = [_]canvas.ui_markup.SourceFile{
     .{ .path = "components/project-sidebar.native", .source = @embedFile("components/project-sidebar.native") },
     .{ .path = "components/tools-sidebar.native", .source = @embedFile("components/tools-sidebar.native") },
     .{ .path = "components/terminal-workspace.native", .source = @embedFile("components/terminal-workspace.native") },
+    .{ .path = "components/status-footer.native", .source = @embedFile("components/status-footer.native") },
     .{ .path = "components/empty-state.native", .source = @embedFile("components/empty-state.native") },
     .{ .path = "components/dialogs.native", .source = @embedFile("components/dialogs.native") },
     .{ .path = "components/preferences.native", .source = @embedFile("components/preferences.native") },
@@ -141,6 +142,7 @@ fn appOptions(io: std.Io) CanopyApp.Options {
         .tokens_fn = canopyTokens,
         .on_appearance = onAppearance,
         .view = CompiledCanopyView.build,
+        .decorate_view = decorateCanopyView,
         .markup = if (builtin.mode == .Debug)
             .{ .source = app_markup, .sources = &app_markup_sources, .watch_path = "src/app.native", .io = io }
         else
@@ -150,10 +152,23 @@ fn appOptions(io: std.Io) CanopyApp.Options {
     };
 }
 
+pub fn buildCanopyView(ui: *AppUi, model: *const Model) AppUi.Node {
+    return decorateCanopyView(ui, model, CompiledCanopyView.build(ui, model));
+}
+fn decorateCanopyView(ui: *AppUi, model: *const Model, node: AppUi.Node) AppUi.Node {
+    const visible = @import("sidebar_virtualization.zig").window(Msg, ui, node);
+    return @import("ui_motion.zig").decorate(Msg, ui, visible, &model.ui_motion);
+}
+
 const CanopyHost = struct {
+    motion_host: @import("ui_motion.zig").Host = .{},
+    trace_motion_active: bool = false,
+    trace_last_frame: u64 = 0,
+    trace_start_generation: u64 = 0,
+    agent_hooks: @import("agent_hook_host.zig").Host = .{},
     git: @import("git_service.zig").Service(@import("git_host.zig").Host) = .{},
     chrome_install: canvas_host.InstallGate = .{},
-    sidebar_controller: @import("sidebar_controller.zig").Controller = .{},
+    sidebar_controller: @import("sidebar_controller.zig").Controller = .{ .retained_motion = true },
     menu: @import("app_menu.zig").Host = .{},
     terminals: @import("ghostty_host.zig").Host = .{},
     ui_app: *CanopyApp,
@@ -180,6 +195,7 @@ const CanopyHost = struct {
         const ui_app = try CanopyApp.create(allocator, appOptions(io));
         ui_app.model = initialModel(tab_store, project_store, profile_store);
         ui_app.model.use_ghostty = builtin.os.tag == .macos;
+        ui_app.model.use_agent_hooks = true;
         ui_app.model.setStorePath(store_path);
         _ = ui_app.model.preferences_db_path.set(preferences_db_path);
         _ = ui_app.model.default_worktrees_base.set(default_worktrees_base);
@@ -189,6 +205,7 @@ const CanopyHost = struct {
     }
 
     fn destroy(host: *CanopyHost, allocator: std.mem.Allocator) void {
+        host.agent_hooks.deinit();
         host.git.deinit();
         host.menu.deinit();
         host.terminals.deinit();
@@ -213,10 +230,51 @@ const CanopyHost = struct {
 
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
+        if (app_config.profile_motion and event_value == .command and std.mem.eql(u8, event_value.command.name, "profile-focus")) {
+            _ = try runtime.focusWindow(canvas_host.window_id);
+            return;
+        }
+        const is_frame = event_value == .gpu_surface_frame and std.mem.eql(u8, event_value.gpu_surface_frame.label, canvas_label);
+        if (app_config.profile_motion and is_frame) host.trace_last_frame = event_value.gpu_surface_frame.frame_index;
+        const old_grip = host.ui_app.model.sidebar.grip.value;
+        const moved = if (is_frame) host.ui_app.model.ui_motion.advance(event_value.gpu_surface_frame.timestamp_ns, host.ui_app.model.appearance.reduce_motion) else false;
+        var batched = is_frame;
+        if (batched) runtime.beginCanvasWidgetDisplayListRefreshBatch();
+        defer if (batched) runtime.cancelCanvasWidgetDisplayListRefreshBatch();
         if (try host.sidebar_controller.prepareEvent(runtime, host.ui_app, event_value, update)) return;
+        if (is_frame and host.ui_app.installed) {
+            if (!host.ui_app.model.sidebar.animating() and host.ui_app.model.syncTabStrip()) try host.ui_app.rebuild(runtime, canvas_host.window_id);
+            if (moved) _ = try host.motion_host.apply(runtime, host.ui_app);
+            try host.presentSidebar(runtime);
+            if (old_grip != host.ui_app.model.sidebar.grip.value) _ = try runtime.setCanvasWidgetDesignTokens(1, canvas_label, canopyTokens(&host.ui_app.model));
+        }
+        if (batched) {
+            try runtime.endCanvasWidgetDisplayListRefreshBatch();
+            batched = false;
+        }
         try host.ui_app.app().event(runtime, event_value);
+        // A click can rebuild directly at the destination layout. Restore its
+        // current presentation before the runtime flushes that input's frame.
+        if (!is_frame and host.ui_app.installed) try host.presentSidebar(runtime);
         try host.synchronizeNativeState(runtime);
         try host.sidebar_controller.finishEvent(runtime, host.ui_app);
+        if (host.ui_app.model.ui_motion.active()) try canvas_host.requestFrame(runtime);
+        if (app_config.profile_motion) {
+            const active = host.ui_app.model.ui_motion.active() or host.ui_app.model.sidebar.needsFrame();
+            if (active != host.trace_motion_active) {
+                if (active) host.trace_start_generation = host.ui_app.build_generation;
+                std.debug.print("motion-profile {s} frame={d} rebuilds={d}\n", .{ if (active) "begin" else "end", host.trace_last_frame, host.ui_app.build_generation - host.trace_start_generation });
+                host.trace_motion_active = active;
+            }
+        }
+    }
+
+    fn presentSidebar(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
+        const model = &host.ui_app.model;
+        const dock = std.math.clamp(model.sidebar_width * model.sidebar.dock.value / @max(1, model.canvas_width - model_mod.sidebar_divider_width), 0, 1);
+        const overlay = std.math.clamp(model.sidebarOverlayWidth() / @max(1, model.canvas_width - 1), 0, 1);
+        _ = try runtime.setCanvasWidgetSplitPresentation(1, canvas_label, canvas.globalWidgetId(.split, .{ .str = "sidebar-dock" }), dock);
+        _ = try runtime.setCanvasWidgetSplitPresentation(1, canvas_label, canvas.globalWidgetId(.split, .{ .str = "sidebar-overlay" }), overlay);
     }
 
     fn synchronizeNativeState(host: *CanopyHost, runtime: *native_sdk.Runtime) !void {
@@ -224,7 +282,9 @@ const CanopyHost = struct {
         try host.ensureWorktreesBase(runtime);
         try host.presentPendingFolderDialog(runtime);
         try host.git.drain(runtime, host.ui_app);
+        try host.agent_hooks.reconcile(runtime, host.ui_app);
         if (builtin.os.tag == .macos and !host.sidebar_controller.hasPendingGeometry()) try host.terminals.reconcile(runtime, host.ui_app, host.ghostty_config.?);
+        host.agent_hooks.prune(host.ui_app.model.tab_store.items.items);
         try host.git.submit(runtime, host.ui_app);
         try host.menu.sync(runtime, host.ui_app.model.canCloseActiveTab());
         // AppKit can synchronously emit resizes when its toolbar style changes.
@@ -248,6 +308,7 @@ const CanopyHost = struct {
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const host: *CanopyHost = @ptrCast(@alignCast(context));
+        host.agent_hooks.deinit();
         host.git.deinit();
         host.sidebar_controller.flushPending(host.ui_app, update);
         host.menu.deinit();
@@ -303,6 +364,15 @@ pub fn main(init: std.process.Init) !void {
     try ghostty_config.loadEnvironment(init.io, init.environ_map);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     for (args[1..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--dump-agent-hooks=")) {
+            const agent = std.meta.stringToEnum(profiles_mod.AgentType, arg["--dump-agent-hooks=".len..]) orelse return error.UnknownAgent;
+            const value = try @import("agent_hook_config.zig").build(init.arena.allocator(), agent, "{}");
+            var buffer: [4096]u8 = undefined;
+            var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+            try stdout.interface.writeAll(value);
+            try stdout.interface.flush();
+            return;
+        }
         if (std.mem.eql(u8, arg, "--inspect-ghostty-config")) {
             var buffer: [4096]u8 = undefined;
             var stdout = std.Io.File.stdout().writer(init.io, &buffer);

@@ -41,6 +41,10 @@ pub fn tokens(appearance: native_sdk.Appearance) canvas.DesignTokens {
         .reduce_motion = appearance.reduce_motion,
     });
 
+    if (!appearance.reduce_motion) {
+        out.motion.fast_ms = @import("ui_motion.zig").quick_ms;
+        out.motion.normal_ms = @import("ui_motion.zig").surface_ms;
+    }
     out.radius = .{ .sm = 3, .md = 4, .lg = 6, .xl = 8 };
     out.spacing = .{ .xs = 4, .sm = 8, .md = 12, .lg = 16, .xl = 20 };
     out.typography.font_id = canvas.default_sans_font_id;
@@ -95,7 +99,7 @@ pub const light_colors = canvas.ColorTokens{
     .surface_subtle = Color.rgba8(0, 0, 0, 15),
     .surface_pressed = Color.rgba8(0, 0, 0, 20),
     .text = Color.rgb8(24, 24, 27),
-    .text_muted = Color.rgba8(24, 24, 27, 102),
+    .text_muted = Color.rgba8(24, 24, 27, 170),
     .syntax_plain = Color.rgb8(39, 39, 42),
     .syntax_comment = Color.rgb8(113, 113, 122),
     .syntax_keyword = Color.rgb8(147, 51, 234),
@@ -128,7 +132,7 @@ pub const dark_colors = canvas.ColorTokens{
     .surface_subtle = Color.rgba8(255, 255, 255, 15),
     .surface_pressed = Color.rgba8(255, 255, 255, 20),
     .text = Color.rgba8(224, 224, 224, 219),
-    .text_muted = Color.rgba8(224, 224, 224, 102),
+    .text_muted = Color.rgba8(224, 224, 224, 166),
     .syntax_plain = Color.rgb8(224, 224, 224),
     .syntax_comment = Color.rgba8(224, 224, 224, 115),
     .syntax_keyword = Color.rgb8(218, 119, 242),

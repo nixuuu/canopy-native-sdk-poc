@@ -9,15 +9,16 @@ const posix_bootstrap = "cd -- \"$1\" && shift && exec \"$@\"";
 const fish_bootstrap = "cd -- $argv[1]; and exec $argv[2..-1]";
 
 const blocked_environment = [_][]const u8{
-    "PATH",                "HOME",                         "USER",                "SHELL",                 "TERM",
-    "LD_PRELOAD",          "LD_LIBRARY_PATH",              "LD_AUDIT",            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH", "NODE_OPTIONS",                 "NODE_EXTRA_CA_CERTS", "ELECTRON_RUN_AS_NODE",  "PYTHONPATH",
-    "PYTHONHOME",          "RUBYLIB",                      "PERL5LIB",            "CLASSPATH",             "JAVA_TOOL_OPTIONS",
-    "_JAVA_OPTIONS",       "GIT_SSH_COMMAND",              "GIT_ASKPASS",         "SSH_AUTH_SOCK",         "EDITOR",
-    "VISUAL",              "HTTP_PROXY",                   "HTTPS_PROXY",         "ALL_PROXY",             "FTP_PROXY",
-    "NO_PROXY",            "SSL_CERT_FILE",                "SSL_CERT_DIR",        "REQUESTS_CA_BUNDLE",    "CURL_CA_BUNDLE",
-    "GIT_SSL_CAINFO",      "NODE_TLS_REJECT_UNAUTHORIZED", "CC",                  "CXX",                   "LDFLAGS",
-    "CFLAGS",              "CANOPY_HOOK_PORT",             "CANOPY_HOOK_PATH",    "CANOPY_HOOK_TOKEN",
+    "PATH",                  "HOME",                         "USER",                "SHELL",                 "TERM",
+    "LD_PRELOAD",            "LD_LIBRARY_PATH",              "LD_AUDIT",            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",   "NODE_OPTIONS",                 "NODE_EXTRA_CA_CERTS", "ELECTRON_RUN_AS_NODE",  "PYTHONPATH",
+    "PYTHONHOME",            "RUBYLIB",                      "PERL5LIB",            "CLASSPATH",             "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",         "GIT_SSH_COMMAND",              "GIT_ASKPASS",         "SSH_AUTH_SOCK",         "EDITOR",
+    "VISUAL",                "HTTP_PROXY",                   "HTTPS_PROXY",         "ALL_PROXY",             "FTP_PROXY",
+    "NO_PROXY",              "SSL_CERT_FILE",                "SSL_CERT_DIR",        "REQUESTS_CA_BUNDLE",    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",        "NODE_TLS_REJECT_UNAUTHORIZED", "CC",                  "CXX",                   "LDFLAGS",
+    "CFLAGS",                "CANOPY_HOOK_PORT",             "CANOPY_HOOK_PATH",    "CANOPY_HOOK_TOKEN",     "CANOPY_HOOK_COMMAND",
+    "CANOPY_STATUS_COMMAND",
 };
 
 pub const Spec = struct {
@@ -33,6 +34,17 @@ pub const Spec = struct {
         executable: []const u8,
         profile: *const profiles.Profile,
     ) ?Spec {
+        return buildTracked(arena, shell, workspace_path, executable, profile, false);
+    }
+
+    pub fn buildTracked(
+        arena: std.mem.Allocator,
+        shell: []const u8,
+        workspace_path: []const u8,
+        executable: []const u8,
+        profile: *const profiles.Profile,
+        tracked: bool,
+    ) ?Spec {
         if (shell.len == 0 or workspace_path.len == 0 or executable.len == 0) return null;
         var spec: Spec = .{};
         if (!spec.putEnv("SHELL", shell) or !spec.putEnv("COLORTERM", "truecolor")) return null;
@@ -45,7 +57,8 @@ pub const Spec = struct {
         const prefs = &profile.prefs;
         switch (profile.agent_type) {
             .claude => {
-                if (!spec.appendPair("--settings", prefs.settings_json.slice())) return null;
+                const settings = if (tracked) @import("agent_hook_config.zig").build(arena, .claude, prefs.settings_json.slice()) catch return null else prefs.settings_json.slice();
+                if (!spec.appendPair("--settings", settings)) return null;
                 if (!spec.appendPair("--model", prefs.model.slice())) return null;
                 if (!spec.appendPair("--permission-mode", prefs.permission_mode.slice())) return null;
                 if (!spec.appendPair("--effort", prefs.effort_level.slice())) return null;
@@ -57,6 +70,10 @@ pub const Spec = struct {
             },
             .codex => {
                 if (!spec.appendArgs(&.{ "--enable", "hooks" })) return null;
+                if (tracked) {
+                    const settings = @import("agent_hook_config.zig").build(arena, .codex, prefs.settings_json.slice()) catch return null;
+                    if (!spec.appendPair("--config", settings)) return null;
+                }
                 if (!spec.appendPair("--model", prefs.model.slice())) return null;
                 if (prefs.dangerously_bypass_approvals_and_sandbox) {
                     if (!spec.appendArg("--dangerously-bypass-approvals-and-sandbox")) return null;
@@ -70,6 +87,7 @@ pub const Spec = struct {
             },
         }
         if (!spec.appendCustomEnv(arena, prefs.custom_env.slice())) return null;
+        if (tracked and spec.env_len + 5 > spec.env_items.len) return null;
         return spec;
     }
 

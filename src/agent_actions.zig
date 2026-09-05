@@ -62,12 +62,13 @@ pub fn spawnProfileTool(model: *Model, fx: *Effects, profile: *const profiles_mo
 
     var env_arena = std.heap.ArenaAllocator.init(model.tab_store.allocator);
     defer env_arena.deinit();
-    const launch = tool_launch.Spec.build(
+    const launch = tool_launch.Spec.buildTracked(
         env_arena.allocator(),
         model.userShell(),
         workspace.path.slice(),
         model.toolExecutable(tool),
         profile,
+        model.use_agent_hooks,
     ) orelse {
         model.status_text = "Agent launch settings are invalid or exceed host limits";
         return;
@@ -102,8 +103,51 @@ pub fn handleToolCheckResult(model: *Model, exit: native_sdk.EffectExit) void {
     _ = model.tools.completeDiscovery(exit.key, resolved);
 }
 
+pub fn viewed(model: *const Model, tab: *const terminal_tabs.Tab) bool {
+    return model.active_workspace_id == tab.workspace_id and model.activeTabId(tab.workspace_id) == tab.id and !model.terminalActionsBlocked();
+}
+
+pub fn acknowledge(model: *Model) void {
+    for (model.tab_store.items.items) |*tab| if (viewed(model, tab)) {
+        tab.agent.unread = false;
+    };
+}
+
+fn hookEvent(model: *Model, event: native_sdk.EffectChannelEvent) void {
+    // The SDK reports loss for the shared channel, without the lost tab IDs.
+    // Conservatively mark every live registration, even if this packet is stale.
+    if (event.dropped_pending > 0) trackingGap(model, event.dropped_pending);
+    if (event.kind != .data) return;
+    const parsed = @import("agent_events.zig").decode(std.heap.page_allocator, event.bytes) catch return;
+    for (model.tab_store.items.items) |*tab| {
+        if (tab.id != parsed.tab or tab.tool == .shell or !tab.agent.registered or tab.phase == .closing or tab.phase == .failed or tab.phase == .exited) continue;
+        tab.agent.receive(parsed, viewed(model, tab), 0);
+        return;
+    }
+}
+
+fn trackingGap(model: *Model, count: u32) void {
+    for (model.tab_store.items.items) |*tab| if (tab.agent.registered and
+        tab.phase != .closing and tab.phase != .failed and tab.phase != .exited)
+    {
+        tab.agent.lost_events +|= count;
+    };
+}
+
 pub fn handle(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
+        .agent_hook_event => |event| hookEvent(model, event),
+        .agent_tracking_failed => {
+            trackingGap(model, 1);
+            model.status_text = "Agent tracking unavailable; restart affected agent tabs";
+        },
+        .agent_setup_failed => |id| {
+            for (model.tab_store.items.items) |tab| if (tab.id == id) {
+                terminal_actions.handleTerminalEvent(model, fx, .{ .key = tab.pty, .kind = .exit, .reason = .spawn_failed });
+                break;
+            };
+            model.status_text = "Agent hook setup failed; see application diagnostics";
+        },
         .tool_check_done => |exit| handleToolCheckResult(model, exit),
         .toggle_agent_profiles => |agent| model.tools.toggle(agent),
         .launch_agent => |agent| {

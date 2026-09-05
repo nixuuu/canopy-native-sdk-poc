@@ -15,7 +15,7 @@ const git_workflow = @import("git_workflow.zig");
 
 pub const window_width: f32 = 1180;
 pub const sidebar_divider_width: f32 = 3;
-const max_rendered_tab_buttons: usize = 12;
+const max_rendered_tab_buttons = @import("tab_strip.zig").limit;
 pub const fallback_user_shell = "/bin/zsh";
 
 pub const TerminalTool = terminal_tabs.Tool;
@@ -24,7 +24,10 @@ pub const TabStore = terminal_tabs.Store;
 pub const PreferencesSection = preferences_editor.Section;
 
 pub const Model = struct {
+    tab_scroll_state: @import("tab_strip.zig").State = .{},
+    ui_motion: @import("ui_motion.zig").State = .{},
     use_ghostty: bool = false,
+    use_agent_hooks: bool = false,
     project_store: *workspaces.Store = undefined,
     profile_store: *profiles_mod.Store = undefined,
     active_workspace_id: u64 = 0,
@@ -54,6 +57,7 @@ pub const Model = struct {
         "sidebar_persistence",
         "window_chrome",
         "sidebar_width",
+        "sidebarOverlayWidth",
         "canvas_width",
         "sidebar",
         "terminalActionsBlocked",
@@ -63,6 +67,9 @@ pub const Model = struct {
         "profile_store",
         "tab_store",
         "terminal_state",
+        "tab_scroll_state",
+        "ui_motion",
+        "use_agent_hooks",
         "appearance",
         "picker_serial",
         "git",
@@ -138,7 +145,7 @@ pub const Model = struct {
     }
 
     pub fn sidebarFraction(model: *const Model) f32 {
-        return @max(0.000001, model.sidebar_width * model.sidebar.dock.value / @max(1, model.canvas_width - sidebar_divider_width));
+        return @max(0.000001, (if (!model.sidebar.compact and !model.sidebar.collapsed) model.sidebar_width else @as(f32, 0)) / @max(1, model.canvas_width - sidebar_divider_width));
     }
 
     pub fn sidebarDividerWidth(_: *const Model) f32 {
@@ -146,11 +153,11 @@ pub const Model = struct {
     }
 
     pub fn sidebarDockVisible(model: *const Model) bool {
-        return model.sidebar.dock.value > 0;
+        return model.sidebar.dock.value > 0 or (!model.sidebar.compact and !model.sidebar.collapsed);
     }
 
     pub fn sidebarDockMinimum(model: *const Model) f32 {
-        return if (!model.sidebar.compact and !model.sidebar.collapsed and !model.sidebar.animating()) 210 else 0;
+        return if (!model.sidebar.compact and !model.sidebar.collapsed and model.sidebar.dock.value == 1) 210 else 0;
     }
 
     pub fn sidebarOverlayVisible(model: *const Model) bool {
@@ -166,7 +173,7 @@ pub const Model = struct {
     }
 
     pub fn sidebarOverlayFraction(model: *const Model) f32 {
-        return @max(0.000001, model.sidebarOverlayWidth() / @max(1, model.canvas_width - 1));
+        return @max(0.000001, (if (model.sidebar.overlay_open) model.sidebarOverlayFullWidth() else @as(f32, 0)) / @max(1, model.canvas_width - 1));
     }
 
     pub fn sidebarToggleLabel(model: *const Model) []const u8 {
@@ -174,15 +181,91 @@ pub const Model = struct {
     }
 
     pub fn sidebarRows(model: *const Model, arena: std.mem.Allocator) []const workspaces.SidebarRow {
-        return model.project_store.sidebarRows(arena, model.active_workspace_id);
+        const rows = model.project_store.sidebarRows(arena, model.active_workspace_id);
+        const Summary = struct { status: @import("agent_state.zig").Status, label: []const u8, attention: bool };
+        var summaries = std.AutoHashMap(u64, Summary).init(arena);
+        for (model.tab_store.items.items) |*tab| {
+            if (tab.tool == .shell) continue;
+            const result = summaries.getOrPut(tab.workspace_id) catch continue;
+            const attention = tab.agent.unread or tab.agent.status == .permission or tab.agent.status == .failed or tab.agent.lost_events > 0;
+            const status: @import("agent_state.zig").Status = if (tab.agent.lost_events > 0 and tab.agent.status != .ended) .failed else tab.agent.status;
+            if (!result.found_existing) result.value_ptr.* = .{ .status = status, .label = tab.agent.label(), .attention = attention } else {
+                if (status.priority() > result.value_ptr.status.priority()) {
+                    result.value_ptr.status = status;
+                    result.value_ptr.label = tab.agent.label();
+                }
+                result.value_ptr.attention = result.value_ptr.attention or attention;
+            }
+        }
+        for (rows) |*row| if (row.kind == .worktree) {
+            if (summaries.get(row.workspace_id)) |summary| {
+                row.agent_status = summary.label;
+                row.agent_icon = switch (summary.status) {
+                    .starting => "clock",
+                    .idle, .ended => "check-circle",
+                    .thinking => "ellipsis",
+                    .tool => "wrench",
+                    .permission => "pause",
+                    .compacting => "refresh-cw",
+                    .failed => "alert",
+                };
+                row.agent_color = if (summary.status == .failed) "destructive" else if (summary.attention) "warning" else switch (summary.status) {
+                    .thinking, .tool, .compacting => "accent",
+                    .idle => "success",
+                    .starting, .ended => "text_muted",
+                    .permission => "warning",
+                    .failed => unreachable,
+                };
+            }
+        };
+        return rows;
+    }
+
+    pub fn tabStripLayout(model: *const Model) @import("tab_strip.zig").Geometry {
+        var count: usize = 0;
+        var selected: usize = 0;
+        for (model.tab_store.items.items) |*tab| if (tab.workspace_id == model.active_workspace_id) {
+            if (tab.id == model.activeTabId(model.active_workspace_id)) selected = count;
+            count += 1;
+        };
+        const width = if (model.sidebarDockVisible()) @max(520, model.canvas_width - @max(model.sidebarDockMinimum(), model.sidebar_width * model.sidebar.dock.value) - sidebar_divider_width) else model.canvas_width;
+        return @import("tab_strip.zig").geometry(width, count, selected);
+    }
+    pub fn tabsOverflow(model: *const Model) bool {
+        return model.tabStripLayout().overflow;
+    }
+    pub fn tabScrollOffset(model: *const Model) f32 {
+        return model.tab_scroll_state.offset;
+    }
+    pub fn syncTabStrip(model: *Model) bool {
+        return model.tab_scroll_state.sync(model.active_workspace_id, model.activeTabId(model.active_workspace_id), model.tabStripLayout());
+    }
+    pub fn observeUiMotion(model: *Model) void {
+        const switched_workspace = model.tab_scroll_state.workspace != model.active_workspace_id;
+        const scrolled = model.syncTabStrip();
+        var ids: [max_rendered_tab_buttons]u64 = undefined;
+        var count: usize = 0;
+        var ordinal: usize = 0;
+        const first = model.tabStripLayout().first_index;
+        for (model.tab_store.items.items) |*tab| if (tab.workspace_id == model.active_workspace_id) {
+            if (ordinal >= first and count < ids.len) {
+                ids[count] = tab.id;
+                count += 1;
+            }
+            ordinal += 1;
+        };
+        model.ui_motion.observeTabs(ids[0..count], switched_workspace or scrolled, model.appearance.reduce_motion);
+        const modal: u8 = @as(u8, @intFromBool(model.preferences_open())) |
+            (@as(u8, @intFromBool(model.create_dialog_open())) << 1) |
+            (@as(u8, @intFromBool(model.remove_dialog_open())) << 2) |
+            (@as(u8, @intFromBool(model.detach_dialog_open())) << 3) |
+            (@as(u8, @intFromBool(model.profileSwitchDialogOpen())) << 4) |
+            (@as(u8, @intFromBool(model.profileDeleteDialogOpen())) << 5);
+        model.ui_motion.observe(model.activeTabId(model.active_workspace_id), modal, @intFromEnum(model.preferences_edit.section), model.appearance.reduce_motion);
     }
 
     pub fn tabs(model: *const Model, arena: std.mem.Allocator) []const TerminalTabRow {
         return model.tab_store.rows(arena, model.active_workspace_id, model.activeTabId(model.active_workspace_id), max_rendered_tab_buttons);
-    }
-
-    pub fn activeWorkspaceTerminalCount(model: *const Model) usize {
-        return model.tab_store.countForWorkspace(model.active_workspace_id);
     }
 
     pub fn hasTabs(model: *const Model) bool {

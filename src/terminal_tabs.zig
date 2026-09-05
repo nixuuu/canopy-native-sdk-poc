@@ -8,6 +8,7 @@ pub const Phase = enum { starting, running, closing, exited, failed };
 pub const Tool = enum { shell, claude, codex };
 
 pub const Tab = struct {
+    agent: @import("agent_state.zig").State = .{},
     pending_launch: ?*@import("terminal_launch.zig").Pending = null,
     id: u64 = 0,
     workspace_id: u64 = 0,
@@ -31,6 +32,15 @@ pub const Row = struct {
     phase: Phase,
     exit_code: i32,
     selected: bool,
+    indicator: enum { attention, working, running, stopped } = .stopped,
+    agent_status: []const u8 = "",
+    agent_tone: enum { muted, working, ready, attention, failed } = .muted,
+    agent_model: []const u8 = "",
+    agent_tool: []const u8 = "",
+    agent_tools: []const u8 = "",
+    agent_summary: []const u8 = "",
+    agent_context: []const u8 = "",
+    agent_cost: []const u8 = "",
 };
 
 pub const Store = struct {
@@ -112,6 +122,19 @@ pub const Store = struct {
                 .phase = tab.phase,
                 .exit_code = tab.exit_code,
                 .selected = tab.id == active_id,
+                .indicator = if (tab.tool != .shell and (tab.agent.unread or tab.agent.status == .permission or tab.agent.status == .failed or tab.agent.lost_events > 0)) .attention else if (tab.tool != .shell and (tab.agent.status == .thinking or tab.agent.status == .tool or tab.agent.status == .compacting)) .working else if (tab.phase == .running) .running else .stopped,
+                .agent_status = if (tab.tool == .shell) "" else tab.agent.label(),
+                .agent_tone = if (tab.agent.status == .failed) .failed else if (tab.agent.lost_events > 0 or tab.agent.status == .permission) .attention else switch (tab.agent.status) {
+                    .thinking, .tool, .compacting => .working,
+                    .idle => .ready,
+                    else => .muted,
+                },
+                .agent_model = tab.agent.model.slice(),
+                .agent_tool = tab.agent.tool.slice(),
+                .agent_tools = if (tab.agent.tool_count > 0) std.fmt.allocPrint(arena, "{d} tools", .{tab.agent.tool_count}) catch "" else "",
+                .agent_summary = if (tab.tool == .shell) "" else tab.agent.summary(arena),
+                .agent_context = if (tab.agent.context_percent) |v| std.fmt.allocPrint(arena, "Context {d:.0}%", .{v}) catch "" else "",
+                .agent_cost = if (tab.agent.cost_usd) |v| std.fmt.allocPrint(arena, "Cost ${d:.4}", .{v}) catch "" else "",
             };
             count += 1;
         }

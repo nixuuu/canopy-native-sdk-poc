@@ -1,6 +1,6 @@
 //! Disjoint SDK effect identities. UI/entity IDs never share this namespace.
 const std = @import("std");
-pub const Domain = enum(u5) { git = 1, projects, pty, preferences, profiles, sidebar, tools };
+pub const Domain = enum(u5) { git = 1, projects, pty, preferences, profiles, sidebar, tools, agent_hooks };
 const mask: u64 = (1 << 48) - 1;
 
 pub fn key(domain: Domain, serial: u48) u64 {
